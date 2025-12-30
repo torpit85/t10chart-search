@@ -1,0 +1,30 @@
+[importer] 2025-12-28 v4 (ties supported via pos; upsert on week_ending,pos; stable ordering)
+ZIP: /home/torrey/Documents/Top 25 Shows/Top 10 Shows of the Week Charts/T10Chart_Convert/T-10 Charts Reformatted/T-10 Chart reformatted clean.zip
+DB : /home/torrey/Documents/Top 25 Shows/Top 10 Shows of the Week Charts/t10_search_engine/t10.sqlite
+IMPORTANT: Backup your DB before importing.
+
+Found 11 spreadsheet(s) to parse.
+  parsed weeknum: T-10 Chart (201-300) reformatted_clean.xlsx -> 1253 rows
+  parsed weeknum: T-10 Chart (301-400) reformatted_clean.xlsx -> 1147 rows
+  parsed weeknum: T-10 Chart (1001-1100) reformatted_clean.xlsx -> 170 rows
+  parsed weeknum: T-10 Chart (901-1000) reformatted_clean.xlsx -> 1051 rows
+  parsed weeknum: T-10 Chart (401-500) reformatted_clean.xlsx -> 1103 rows
+  parsed weeknum: T-10 Chart (601-700) reformatted_clean.xlsx -> 1128 rows
+  parsed weeknum: T-10 Charts (1-100) reformatted_clean.xlsx -> 859 rows
+  parsed weeknum: T-10 Chart (101-200) reformatted_clean.xlsx -> 1060 rows
+  parsed weeknum: T-10 Chart (501-600) reformatted_clean.xlsx -> 1236 rows
+  parsed weeknum: T-10 Chart (801-900) reformatted_clean.xlsx -> 1038 rows
+  parsed weeknum: T-10 Chart (701-800) reformatted_clean.xlsx -> 1091 rows
+
+Parsed rows : 11136
+Unique weeks: 1001
+Max rank    : 17
+Max pos     : 17
+Deleted existing rows for 1001 week_ending value(s).
+✅ Import complete.
+
+Summary:
+  Parsed rows : 11136
+  Unique weeks: 1001
+  Max rank    : 17
+  Max pos     : 17

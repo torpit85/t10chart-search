@@ -1,0 +1,384 @@
+#!/usr/bin/env python3
+import sqlite3
+from pathlib import Path
+import pandas as pd
+import numpy as np
+import streamlit as st
+import matplotlib.pyplot as plt
+
+DB_PATH = Path(__file__).with_name("t10.sqlite")
+
+def get_con():
+    con = sqlite3.connect(DB_PATH)
+    con.execute("PRAGMA foreign_keys = ON;")
+    return con
+
+@st.cache_data(show_spinner=False)
+def load_distinct_lists():
+    con = get_con()
+    shows = pd.read_sql("SELECT show_id, canonical_title FROM show ORDER BY canonical_title", con)
+    companies = pd.read_sql("""
+        SELECT DISTINCT COALESCE(imprint_1,'(Unknown)') AS company
+        FROM t10_entry
+        ORDER BY company
+    """, con)
+    con.close()
+    return shows, companies
+
+def run_query(sql, params=()):
+    con = get_con()
+    df = pd.read_sql(sql, con, params=params)
+    con.close()
+    return df
+
+def run_exec(sql, params=()):
+    con = get_con()
+    cur = con.cursor()
+    cur.execute("BEGIN;")
+    cur.execute(sql, params)
+    con.commit()
+    con.close()
+
+def run_exec_many(sql, seq_params):
+    con = get_con()
+    cur = con.cursor()
+    cur.execute("BEGIN;")
+    cur.executemany(sql, seq_params)
+    con.commit()
+    con.close()
+
+def title():
+    st.set_page_config(page_title="T-10 Chart Search", layout="wide")
+    st.title("T-10 Chart Search Engine")
+    st.caption("Search + analytics over your chart history (SQLite + FTS).")
+
+def tab_search():
+    st.subheader("Search")
+    with st.sidebar:
+        st.header("Search filters")
+        q = st.text_input("Full-text search", placeholder="e.g. Nickelodeon AND (school OR kids)")
+        date_min = st.text_input("Start date (YYYY-MM-DD)", value="")
+        date_max = st.text_input("End date (YYYY-MM-DD)", value="")
+        rank_min, rank_max = st.slider("Rank range", 1, 50, (1, 10))
+        limit = st.slider("Max results", 50, 5000, 500, step=50)
+
+    params = []
+    base = """
+    SELECT e.week_ending, e.week_number, e.rank, e.last_week,
+           s.canonical_title, e.raw_title, e.imprint_1, e.imprint_2, e.gross_millions
+    FROM t10_entry e
+    JOIN show s ON s.show_id = e.show_id
+    """
+    where = []
+    if q.strip():
+        base = """
+        SELECT e.week_ending, e.week_number, e.rank, e.last_week,
+               s.canonical_title, e.raw_title, e.imprint_1, e.imprint_2, e.gross_millions
+        FROM t10_fts f
+        JOIN t10_entry e ON e.id = f.rowid
+        JOIN show s ON s.show_id = e.show_id
+        """
+        where.append("t10_fts MATCH ?")
+        params.append(q.strip())
+    if date_min.strip():
+        where.append("e.week_ending >= ?")
+        params.append(date_min.strip())
+    if date_max.strip():
+        where.append("e.week_ending <= ?")
+        params.append(date_max.strip())
+    where.append("e.rank BETWEEN ? AND ?")
+    params.extend([rank_min, rank_max])
+
+    sql = base
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += " ORDER BY e.week_ending DESC, e.rank ASC LIMIT ?"
+    params.append(int(limit))
+
+    df = run_query(sql, tuple(params))
+    st.write(f"Results: **{len(df)}**")
+    st.dataframe(df, use_container_width=True)
+
+    if not df.empty:
+        st.markdown("### Quick stats (current results)")
+        gross = df["gross_millions"].dropna()
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Chart dates", int(df["week_ending"].nunique()))
+        c2.metric("Shows", int(df["canonical_title"].nunique()))
+        c3.metric("Avg rank", float(df["rank"].mean()))
+        c4.metric("Gross rows", int(gross.shape[0]))
+        if not gross.empty:
+            st.write({
+                "min gross (M)": float(gross.min()),
+                "max gross (M)": float(gross.max()),
+                "sum gross (M)": float(gross.sum()),
+                "avg gross (M)": float(gross.mean()),
+            })
+
+def tab_show_detail():
+    st.subheader("Show detail")
+    shows, _ = load_distinct_lists()
+    show_name = st.selectbox("Pick a show (canonical)", shows["canonical_title"].tolist())
+    show_id = int(shows.loc[shows["canonical_title"] == show_name, "show_id"].iloc[0])
+
+    stats = run_query("SELECT * FROM v_show_stats WHERE show_id = ?", (show_id,))
+    if not stats.empty:
+        s = stats.iloc[0].to_dict()
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Weeks on chart", int(s["weeks_on_chart"]))
+        c2.metric("Peak rank", int(s["peak_rank"]))
+        c3.metric("First appearance", str(s["first_appearance"]))
+        c4.metric("Last appearance", str(s["last_appearance"]))
+        st.write({
+            "Total gross (M)": float(s["total_gross_millions"]),
+            "Average gross (M)": (None if pd.isna(s["avg_gross_millions"]) else float(s["avg_gross_millions"])),
+            "Average rank": float(s["avg_rank"]),
+        })
+
+    df = run_query("""
+        SELECT week_ending, week_number, rank, last_week, raw_title, imprint_1, imprint_2, gross_millions
+        FROM t10_entry
+        WHERE show_id = ?
+        ORDER BY week_number ASC
+    """, (show_id,))
+    st.dataframe(df, use_container_width=True)
+
+    if not df.empty:
+        st.markdown("### Rank trajectory")
+        fig = plt.figure()
+        x = pd.to_datetime(df["week_ending"])
+        y = df["rank"].astype(float)
+        plt.plot(x, y)
+        plt.gca().invert_yaxis()  # rank 1 at top
+        plt.xlabel("Week Ending")
+        plt.ylabel("Rank")
+        plt.tight_layout()
+        st.pyplot(fig)
+        plt.close(fig)
+
+        st.markdown("### Gross over time")
+        dg = df.dropna(subset=["gross_millions"]).copy()
+        if not dg.empty:
+            fig = plt.figure()
+            plt.plot(pd.to_datetime(dg["week_ending"]), dg["gross_millions"].astype(float))
+            plt.xlabel("Week Ending")
+            plt.ylabel("Gross (Millions)")
+            plt.tight_layout()
+            st.pyplot(fig)
+            plt.close(fig)
+        else:
+            st.info("No gross values recorded for this show in the selected rows.")
+
+def tab_companies():
+    st.subheader("Company view (Imprint 1)")
+    _, companies = load_distinct_lists()
+    company = st.selectbox("Pick company", companies["company"].tolist())
+    df_stats = run_query("SELECT * FROM v_company_stats WHERE company = ?", (company,))
+    if not df_stats.empty:
+        s = df_stats.iloc[0].to_dict()
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Entries", int(s["entries"]))
+        c2.metric("Unique shows", int(s["unique_shows"]))
+        c3.metric("Total gross (M)", float(s["total_gross_millions"]))
+        c4.metric("Avg gross (M)", None if pd.isna(s["avg_gross_millions"]) else float(s["avg_gross_millions"]))
+
+    df = run_query("""
+        SELECT e.week_ending, e.rank, s.canonical_title, e.raw_title, e.imprint_1, e.imprint_2, e.gross_millions
+        FROM t10_entry e
+        JOIN show s ON s.show_id = e.show_id
+        WHERE COALESCE(e.imprint_1,'(Unknown)') = ?
+        ORDER BY e.week_ending DESC, e.rank ASC
+        LIMIT 2000
+    """, (company,))
+    st.dataframe(df, use_container_width=True)
+
+def tab_analytics():
+    st.subheader("Grossing analytics")
+    st.caption("All charts are computed from stored rows (no precomputed “total weeks”).")
+
+    with st.sidebar:
+        st.header("Analytics filters")
+        rank_min, rank_max = st.slider("Rank range for analytics", 1, 50, (1, 10))
+        date_min = st.text_input("Start date (YYYY-MM-DD) ", value="")
+        date_max = st.text_input("End date (YYYY-MM-DD)  ", value="")
+
+    where = ["e.rank BETWEEN ? AND ?"]
+    params = [rank_min, rank_max]
+    if date_min.strip():
+        where.append("e.week_ending >= ?")
+        params.append(date_min.strip())
+    if date_max.strip():
+        where.append("e.week_ending <= ?")
+        params.append(date_max.strip())
+
+    df = run_query(f"""
+        SELECT e.week_ending, e.rank, e.gross_millions, e.imprint_1, s.canonical_title
+        FROM t10_entry e
+        JOIN show s ON s.show_id = e.show_id
+        WHERE {' AND '.join(where)}
+    """, tuple(params))
+
+    dg = df.dropna(subset=["gross_millions"]).copy()
+    if dg.empty:
+        st.warning("No gross data in the selected range.")
+        return
+
+    dg["week_ending"] = pd.to_datetime(dg["week_ending"])
+    dg["year"] = dg["week_ending"].dt.year
+
+    # Total gross over time (weekly sum)
+    st.markdown("### Total gross over time (weekly sum)")
+    weekly = dg.groupby("week_ending", as_index=False)["gross_millions"].sum().sort_values("week_ending")
+    fig = plt.figure()
+    plt.plot(weekly["week_ending"], weekly["gross_millions"])
+    plt.xlabel("Week Ending")
+    plt.ylabel("Total Gross (Millions)")
+    plt.tight_layout()
+    st.pyplot(fig)
+    plt.close(fig)
+
+    # Rolling average
+    st.markdown("### Rolling average total gross")
+    win = st.slider("Rolling window (weeks)", 2, 52, 13)
+    w2 = weekly.copy()
+    w2["roll"] = w2["gross_millions"].rolling(win, min_periods=max(1, win//3)).mean()
+    fig = plt.figure()
+    plt.plot(w2["week_ending"], w2["roll"])
+    plt.xlabel("Week Ending")
+    plt.ylabel(f"{win}-week avg gross (Millions)")
+    plt.tight_layout()
+    st.pyplot(fig)
+    plt.close(fig)
+
+    # Top shows by total gross
+    st.markdown("### Top shows by total gross")
+    top_n = st.slider("How many shows", 5, 50, 15)
+    top_shows = dg.groupby("canonical_title", as_index=False)["gross_millions"].sum().sort_values("gross_millions", ascending=False).head(top_n)
+    st.dataframe(top_shows, use_container_width=True)
+
+    fig = plt.figure()
+    plt.barh(top_shows["canonical_title"][::-1], top_shows["gross_millions"][::-1])
+    plt.xlabel("Total Gross (Millions)")
+    plt.ylabel("Show")
+    plt.tight_layout()
+    st.pyplot(fig)
+    plt.close(fig)
+
+    # Top companies by total gross
+    st.markdown("### Top companies (Imprint 1) by total gross")
+    top_companies = dg.copy()
+    top_companies["company"] = top_companies["imprint_1"].fillna("(Unknown)")
+    top_c = top_companies.groupby("company", as_index=False)["gross_millions"].sum().sort_values("gross_millions", ascending=False).head(top_n)
+    st.dataframe(top_c, use_container_width=True)
+
+    fig = plt.figure()
+    plt.barh(top_c["company"][::-1], top_c["gross_millions"][::-1])
+    plt.xlabel("Total Gross (Millions)")
+    plt.ylabel("Company")
+    plt.tight_layout()
+    st.pyplot(fig)
+    plt.close(fig)
+
+    # Gross distribution
+    st.markdown("### Gross distribution")
+    fig = plt.figure()
+    plt.hist(dg["gross_millions"].astype(float), bins=30)
+    plt.xlabel("Gross (Millions)")
+    plt.ylabel("Count")
+    plt.tight_layout()
+    st.pyplot(fig)
+    plt.close(fig)
+
+    # Yearly totals
+    st.markdown("### Yearly gross totals")
+    yearly = dg.groupby("year", as_index=False)["gross_millions"].sum().sort_values("year")
+    st.dataframe(yearly, use_container_width=True)
+    fig = plt.figure()
+    plt.plot(yearly["year"], yearly["gross_millions"])
+    plt.xlabel("Year")
+    plt.ylabel("Total Gross (Millions)")
+    plt.tight_layout()
+    st.pyplot(fig)
+    plt.close(fig)
+
+def tab_admin():
+    st.subheader("Admin: normalize titles (merge + aliases)")
+    st.warning("This edits the database. If you're experimenting, copy the DB first.")
+    shows, _ = load_distinct_lists()
+    titles = shows["canonical_title"].tolist()
+
+    st.markdown("### Add alias (map a raw title to a canonical show)")
+    col1, col2 = st.columns(2)
+    with col1:
+        canonical = st.selectbox("Canonical show", titles, key="alias_canonical")
+    with col2:
+        alias = st.text_input("Alias title (exact)", key="alias_title")
+    if st.button("Add alias mapping"):
+        if alias.strip():
+            con = get_con()
+            cur = con.cursor()
+            show_id = int(shows.loc[shows["canonical_title"] == canonical, "show_id"].iloc[0])
+            cur.execute("BEGIN;")
+            cur.execute("INSERT OR REPLACE INTO show_alias(alias_title, show_id) VALUES (?, ?)", (alias.strip(), show_id))
+            con.commit()
+            con.close()
+            st.cache_data.clear()
+            st.success("Alias added. Future imports and lookups will map this title to the canonical show.")
+        else:
+            st.error("Alias title can't be blank.")
+
+    st.markdown("### Merge shows (combine two canonicals into one)")
+    c1, c2 = st.columns(2)
+    with c1:
+        keep = st.selectbox("Keep (target canonical)", titles, key="merge_keep")
+    with c2:
+        merge = st.selectbox("Merge (source canonical)", titles, key="merge_src")
+
+    if st.button("Merge these shows"):
+        if keep == merge:
+            st.error("Pick two different shows.")
+        else:
+            con = get_con()
+            cur = con.cursor()
+            keep_id = int(shows.loc[shows["canonical_title"] == keep, "show_id"].iloc[0])
+            src_id = int(shows.loc[shows["canonical_title"] == merge, "show_id"].iloc[0])
+
+            cur.execute("BEGIN;")
+
+            # Move entries
+            cur.execute("UPDATE t10_entry SET show_id = ? WHERE show_id = ?", (keep_id, src_id))
+
+            # Move aliases (if conflict, keep existing)
+            cur.execute("""
+                INSERT OR IGNORE INTO show_alias(alias_title, show_id)
+                SELECT alias_title, ? FROM show_alias WHERE show_id = ?
+            """, (keep_id, src_id))
+
+            # Ensure the old canonical title becomes an alias too
+            cur.execute("INSERT OR IGNORE INTO show_alias(alias_title, show_id) VALUES (?, ?)", (merge, keep_id))
+
+            # Delete source show (aliases cascade)
+            cur.execute("DELETE FROM show WHERE show_id = ?", (src_id,))
+
+            con.commit()
+            con.close()
+            st.cache_data.clear()
+            st.success(f"Merged '{merge}' into '{keep}'.")
+
+    st.markdown("### Search aliases for a show")
+    show_for_aliases = st.selectbox("Show", titles, key="alias_list_show")
+    show_id = int(shows.loc[shows["canonical_title"] == show_for_aliases, "show_id"].iloc[0])
+    alias_df = run_query("SELECT alias_title FROM show_alias WHERE show_id = ? ORDER BY alias_title", (show_id,))
+    st.dataframe(alias_df, use_container_width=True)
+
+def main():
+    title()
+    tabs = st.tabs(["Search", "Show Detail", "Companies", "Analytics", "Admin"])
+    with tabs[0]: tab_search()
+    with tabs[1]: tab_show_detail()
+    with tabs[2]: tab_companies()
+    with tabs[3]: tab_analytics()
+    with tabs[4]: tab_admin()
+
+if __name__ == "__main__":
+    main()
