@@ -4,7 +4,9 @@ from __future__ import annotations
 import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Optional, Callable
+
+from datetime import date, timedelta
 
 import numpy as np
 import pandas as pd
@@ -19,6 +21,9 @@ from charts import chart_top_gross_weeks
 # ----------------------------
 APP_TITLE = "T-10 Chart Search Engine"
 DB_PATH = Path(__file__).with_name("t10.sqlite")
+
+# For streaks when week_number is missing/spotty
+CONSECUTIVE_DAY_TOLERANCE = (6, 8)  # inclusive
 
 
 # ----------------------------
@@ -244,6 +249,156 @@ def plot_scatter(x: pd.Series, y: pd.Series, xlabel: str, ylabel: str):
     plt.tight_layout()
     st.pyplot(fig)
     plt.close(fig)
+
+
+# ----------------------------
+# New: Streaks + Holidays helpers
+# ----------------------------
+def _consecutive_by_week_number(wn: pd.Series) -> pd.Series:
+    """Boolean series: True where current row continues a streak from prior row."""
+    d = wn.diff()
+    return d.eq(1)
+
+def _consecutive_by_date(week_ending_str: pd.Series) -> pd.Series:
+    """Boolean series: True where current row continues a streak from prior row (by ~7 day spacing)."""
+    dt = pd.to_datetime(week_ending_str, errors="coerce")
+    dd = dt.diff().dt.days
+    lo, hi = CONSECUTIVE_DAY_TOLERANCE
+    return dd.between(lo, hi)
+
+def compute_longest_streaks(rows: pd.DataFrame) -> pd.DataFrame:
+    """
+    Compute longest consecutive-week streak per (show_id, rank).
+    Uses week_number when available; otherwise falls back to ~7-day date spacing.
+    Returns: show_id, canonical_title, rank, streak_len, start_week_ending, end_week_ending
+    """
+    if rows.empty:
+        return pd.DataFrame(columns=[
+            "show_id", "canonical_title", "rank", "streak_len", "start_week_ending", "end_week_ending"
+        ])
+
+    df = rows.copy()
+    df["week_ending"] = _as_date_str(df["week_ending"])
+    df["week_number"] = pd.to_numeric(df["week_number"], errors="coerce")
+
+    out_rows = []
+    for (sid, rnk), g in df.groupby(["show_id", "rank"], dropna=False):
+        g = g.sort_values(["week_number", "week_ending"]).reset_index(drop=True)
+        title = g["canonical_title"].iloc[0] if "canonical_title" in g.columns else None
+
+        # Decide consecutive logic
+        if g["week_number"].notna().all():
+            cont = _consecutive_by_week_number(g["week_number"])
+        else:
+            cont = _consecutive_by_date(g["week_ending"])
+
+        # Walk streaks
+        best_len = 0
+        best_start = None
+        best_end = None
+
+        cur_len = 1
+        cur_start = g.loc[0, "week_ending"]
+        cur_end = g.loc[0, "week_ending"]
+
+        for i in range(1, len(g)):
+            if bool(cont.iloc[i]):
+                cur_len += 1
+                cur_end = g.loc[i, "week_ending"]
+            else:
+                if cur_len > best_len:
+                    best_len = cur_len
+                    best_start = cur_start
+                    best_end = cur_end
+                cur_len = 1
+                cur_start = g.loc[i, "week_ending"]
+                cur_end = g.loc[i, "week_ending"]
+
+        if cur_len > best_len:
+            best_len = cur_len
+            best_start = cur_start
+            best_end = cur_end
+
+        out_rows.append({
+            "show_id": int(sid) if pd.notna(sid) else sid,
+            "canonical_title": title,
+            "rank": int(rnk) if pd.notna(rnk) else rnk,
+            "streak_len": int(best_len),
+            "start_week_ending": best_start,
+            "end_week_ending": best_end,
+        })
+
+    out = pd.DataFrame(out_rows)
+    out = out.sort_values(["rank", "streak_len", "canonical_title"], ascending=[True, False, True]).reset_index(drop=True)
+    return out
+
+@st.cache_data(show_spinner=False)
+def fetch_week_endings_distinct() -> list[date]:
+    df = sql_df("SELECT DISTINCT week_ending FROM t10_entry ORDER BY week_ending")
+    if df.empty:
+        return []
+    df["week_ending"] = _as_date_str(df["week_ending"])
+    dt = pd.to_datetime(df["week_ending"], errors="coerce")
+    d = dt.dt.date.dropna().tolist()
+    return sorted(d)
+
+def nth_weekday_of_month(year: int, month: int, weekday: int, n: int) -> date:
+    d = date(year, month, 1)
+    shift = (weekday - d.weekday()) % 7
+    d = d + timedelta(days=shift)
+    return d + timedelta(weeks=n - 1)
+
+def last_weekday_of_month(year: int, month: int, weekday: int) -> date:
+    if month == 12:
+        d = date(year, 12, 31)
+    else:
+        d = date(year, month + 1, 1) - timedelta(days=1)
+    while d.weekday() != weekday:
+        d -= timedelta(days=1)
+    return d
+
+def easter_date(year: int) -> date:
+    # Anonymous Gregorian algorithm (computus)
+    a = year % 19
+    b = year // 100
+    c = year % 100
+    d = b // 4
+    e = b % 4
+    f = (b + 8) // 25
+    g = (b - f + 1) // 3
+    h = (19 * a + b - d - g + 15) % 30
+    i = c // 4
+    k = c % 4
+    l = (32 + 2 * e + 2 * i - h - k) % 7
+    m = (a + 11 * h + 22 * l) // 451
+    month = (h + l - 7 * m + 114) // 31
+    day = ((h + l - 7 * m + 114) % 31) + 1
+    return date(year, month, day)
+
+HOLIDAYS: dict[str, Callable[[int], date]] = {
+    "New Year's Day (Jan 1)": lambda y: date(y, 1, 1),
+    "Valentine's Day (Feb 14)": lambda y: date(y, 2, 14),
+    "Easter (variable)": easter_date,
+    "Memorial Day (last Mon in May)": lambda y: last_weekday_of_month(y, 5, 0),
+    "Independence Day (Jul 4)": lambda y: date(y, 7, 4),
+    "Labor Day (1st Mon in Sep)": lambda y: nth_weekday_of_month(y, 9, 0, 1),
+    "Halloween (Oct 31)": lambda y: date(y, 10, 31),
+    "Thanksgiving (4th Thu in Nov)": lambda y: nth_weekday_of_month(y, 11, 3, 4),
+    "Christmas Day (Dec 25)": lambda y: date(y, 12, 25),
+}
+
+def holiday_week_ending_for_date(all_week_endings: list[date], holiday_dt: date) -> Optional[date]:
+    """
+    Choose the week_ending such that holiday_dt is within the 7-day window ending on week_ending:
+      week_start = week_ending - 6 days
+    """
+    if not all_week_endings:
+        return None
+    weeks = sorted(all_week_endings)
+    for we in weeks:
+        if we >= holiday_dt and (we - holiday_dt).days <= 6:
+            return we
+    return min(weeks, key=lambda we: abs((we - holiday_dt).days))
 
 
 # ----------------------------
@@ -587,6 +742,172 @@ def tab_analytics():
     plt.close(fig)
 
 
+# ----------------------------
+# New tab: Streak Analytics
+# ----------------------------
+def tab_streak_analytics():
+    st.subheader("Streak Analytics")
+    st.caption("Longest consecutive-week streaks for a show at a given rank. (Uses week_number when available.)")
+
+    shows, _ = load_lists()
+
+    with st.sidebar:
+        st.header("Streak filters")
+        date_min = st.text_input("Start date (YYYY-MM-DD)      ", value="")
+        date_max = st.text_input("End date (YYYY-MM-DD)        ", value="")
+        rank_min, rank_max = st.slider("Rank range (streaks)", 1, 50, (1, 10))
+        top_n = st.slider("Top N (streaks)", 5, 200, 25)
+
+    filters = FilterSpec(date_min.strip() or None, date_max.strip() or None, int(rank_min), int(rank_max))
+    where, params = build_where(filters, "e")
+
+    rows = sql_df(f"""
+        SELECT
+          e.week_ending,
+          e.week_number,
+          e.rank,
+          e.pos,
+          e.show_id,
+          s.canonical_title
+        FROM t10_entry e
+        JOIN show s ON s.show_id = e.show_id
+        WHERE {where}
+        ORDER BY e.week_number ASC, e.rank ASC, e.pos ASC
+    """, tuple(params))
+
+    if rows.empty:
+        st.info("No rows match your filters.")
+        return
+
+    streaks = compute_longest_streaks(rows)
+    if streaks.empty:
+        st.info("Not enough data to compute streaks.")
+        return
+
+    st.markdown("### Longest streaks by rank")
+    ranks = sorted(streaks["rank"].dropna().unique().tolist())
+    rank_pick = st.selectbox("Rank", ranks, index=0)
+
+    block = streaks[streaks["rank"] == rank_pick].head(int(top_n)).copy()
+    st.dataframe(block, use_container_width=True)
+
+    st.divider()
+    st.markdown("### Per-show streak breakdown")
+    title_pick = st.selectbox("Show (canonical)", shows["canonical_title"].tolist(), key="streak_show_pick")
+    show_id = int(shows.loc[shows["canonical_title"] == title_pick, "show_id"].iloc[0])
+
+    show_block = streaks[streaks["show_id"] == show_id].sort_values(["rank"]).copy()
+    if show_block.empty:
+        st.info("No streak data for this show in the selected filters.")
+        return
+
+    st.dataframe(show_block, use_container_width=True)
+
+    st.markdown("### Quick peek: raw weeks for this show (filtered)")
+    # Useful for validating consecutive week_number behavior
+    show_rows = rows[rows["show_id"] == show_id].copy()
+    show_rows["week_ending"] = _as_date_str(show_rows["week_ending"])
+    st.dataframe(show_rows.sort_values(["week_number", "rank", "pos"]), use_container_width=True)
+
+
+# ----------------------------
+# New tab: Holidays
+# ----------------------------
+def tab_holidays():
+    st.subheader("Holidays: #1 show by year")
+    st.caption("Pick a holiday and see the #1 show(s) for the holiday week, by year. (Ties supported.)")
+
+    week_endings = fetch_week_endings_distinct()
+    if not week_endings:
+        st.info("No week endings found in the database.")
+        return
+
+    min_year = min(d.year for d in week_endings)
+    max_year = max(d.year for d in week_endings)
+
+    holiday_name = st.selectbox("Holiday", list(HOLIDAYS.keys()))
+    maker = HOLIDAYS[holiday_name]
+
+    c1, c2 = st.columns(2)
+    with c1:
+        year_start = st.number_input("Start year", min_value=min_year, max_value=max_year, value=min_year, step=1)
+    with c2:
+        year_end = st.number_input("End year", min_value=min_year, max_value=max_year, value=max_year, step=1)
+
+    if year_start > year_end:
+        year_start, year_end = year_end, year_start
+
+    rows_out: list[dict[str, Any]] = []
+    for y in range(int(year_start), int(year_end) + 1):
+        hdt = maker(y)
+        we = holiday_week_ending_for_date(week_endings, hdt)
+        if we is None:
+            continue
+
+        we_str = we.isoformat()
+
+        # date(e.week_ending)=? handles cases where week_ending has a time component
+        top = sql_df("""
+            SELECT
+              s.canonical_title,
+              e.pos,
+              e.imprint_1,
+              e.imprint_2,
+              e.gross_millions
+            FROM t10_entry e
+            JOIN show s ON s.show_id = e.show_id
+            WHERE date(e.week_ending) = ?
+              AND e.rank = 1
+            ORDER BY e.pos ASC, s.canonical_title ASC
+        """, (we_str,))
+
+        if top.empty:
+            rows_out.append({
+                "year": y,
+                "holiday_date": hdt.isoformat(),
+                "week_ending": we_str,
+                "#1_show(s)": None,
+                "imprint_1": None,
+                "imprint_2": None,
+                "gross_millions_sum": None,
+            })
+            continue
+
+        # If ties: join titles
+        titles = top["canonical_title"].astype(str).tolist()
+        im1 = top["imprint_1"].astype("string").fillna("").replace("", pd.NA).dropna().unique().tolist()
+        im2 = top["imprint_2"].astype("string").fillna("").replace("", pd.NA).dropna().unique().tolist()
+
+        gross = pd.to_numeric(top["gross_millions"], errors="coerce").dropna()
+        gross_sum = float(gross.sum()) if len(gross) else None
+
+        rows_out.append({
+            "year": y,
+            "holiday_date": hdt.isoformat(),
+            "week_ending": we_str,
+            "#1_show(s)": " / ".join(titles),
+            "imprint_1": " / ".join(im1) if im1 else None,
+            "imprint_2": " / ".join(im2) if im2 else None,
+            "gross_millions_sum": gross_sum,
+        })
+
+    out = pd.DataFrame(rows_out).sort_values("year")
+    st.dataframe(out, use_container_width=True)
+
+    miss = out["#1_show(s)"].isna().sum() if not out.empty else 0
+    if miss:
+        st.warning(
+            f"{miss} year(s) had no #1 record for the computed holiday-week. "
+            "This usually means your database doesn’t have that week, or rank=1 is missing for that week."
+        )
+
+    with st.expander("How the holiday week is chosen"):
+        st.write(
+            "- The holiday is assigned to the chart week whose Week Ending is the first date on/after the holiday, within 6 days.\n"
+            "- If no such week exists, the closest Week Ending date is used."
+        )
+
+
 def tab_admin():
     st.subheader("Admin (Normalize titles: aliases + merges)")
     st.warning("This edits the database. If you're experimenting, copy t10.sqlite first.")
@@ -662,7 +983,8 @@ def main():
     st.title(APP_TITLE)
     st.caption("SQLite + FTS search, per-show analytics, company analytics, and movement/grossing charts. (Ties supported.)")
 
-    tabs = st.tabs(["Search", "Show Detail", "Compare Two Shows", "Companies", "Analytics", "Admin"])
+    # Original tabs + 2 new tabs inserted before Admin (so Admin stays last)
+    tabs = st.tabs(["Search", "Show Detail", "Compare Two Shows", "Companies", "Analytics", "Streak Analytics", "Holidays", "Admin"])
     with tabs[0]:
         tab_search()
     with tabs[1]:
@@ -674,9 +996,12 @@ def main():
     with tabs[4]:
         tab_analytics()
     with tabs[5]:
+        tab_streak_analytics()
+    with tabs[6]:
+        tab_holidays()
+    with tabs[7]:
         tab_admin()
 
 
 if __name__ == "__main__":
     main()
-
