@@ -68,16 +68,60 @@ def _to_int(x: Any) -> Optional[int]:
 
 def split_imprint_pipe(s: Any) -> tuple[Optional[str], Optional[str]]:
     """
-    Split 'Imprint|Network' into (imprint_1, imprint_2).
-    If no pipe exists, imprint_2 is None.
+    Legacy helper (name kept for compatibility).
+
+    Your current business rule is:
+      - Ignore everything after a '|' (it is treated as network/notes, not a second imprint).
+
+    So this returns (imprint_before_pipe, None).
     """
     t = _clean_text(s)
     if not t:
         return None, None
     if "|" in t:
-        a, b = t.split("|", 1)
-        return _clean_text(a), _clean_text(b)
-    return t, None
+        t = t.split("|", 1)[0]
+    t = _clean_text(t)
+    return (t, None) if t else (None, None)
+
+
+def _imprint_tokens(s: Optional[str]) -> list[str]:
+    """Convert an imprint cell into normalized company tokens."""
+    if s is None:
+        return []
+    t = _clean_text(s)
+    if not t:
+        return []
+    # ignore everything after '|'
+    if "|" in t:
+        t = t.split("|", 1)[0].strip()
+    # split on '/'
+    parts = [p.strip() for p in t.split("/") if p.strip()]
+    return parts
+
+
+def normalize_imprints(im1: Optional[str], im2: Optional[str]) -> tuple[Optional[str], Optional[str]]:
+    """
+    Apply imprint normalization rules:
+      - strip anything after '|'
+      - split on '/' across both imprint columns
+      - de-dupe (case-insensitive), preserve order
+      - keep at most two tokens (imprint_1, imprint_2)
+    """
+    tokens = _imprint_tokens(im1) + _imprint_tokens(im2)
+
+    seen: set[str] = set()
+    uniq: list[str] = []
+    for t in tokens:
+        k = t.casefold()
+        if k not in seen:
+            seen.add(k)
+            uniq.append(t)
+
+    if not uniq:
+        return None, None
+    if len(uniq) == 1:
+        return uniq[0], None
+    return uniq[0], uniq[1]
 
 
 def chunked(seq: list[Any], n: int) -> Iterable[list[Any]]:
@@ -282,8 +326,10 @@ def parse_quarter_workbook(xlsx_path: Path, seq_base: int) -> tuple[pd.DataFrame
             if (imprint_as_float is not None) and (gross_as_float is None):
                 gross_m = imprint_as_float
                 im1, im2 = split_imprint_pipe(gross_cell)
+                im1, im2 = normalize_imprints(im1, im2)
             else:
                 im1, im2 = split_imprint_pipe(imprint_cell)
+                im1, im2 = normalize_imprints(im1, im2)
                 gross_m = gross_as_float
 
             rows.append(
@@ -343,6 +389,7 @@ def parse_2025_workbook(xlsx_path: Path, seq_base: int) -> tuple[pd.DataFrame, i
             continue
 
         im1, im2 = split_imprint_pipe(r.iloc[4] if len(r) > 4 else None)
+        im1, im2 = normalize_imprints(im1, im2)
         gross_m = _to_float(r.iloc[5] if len(r) > 5 else None)
 
         rows.append(
