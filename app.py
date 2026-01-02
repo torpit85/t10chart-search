@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import os
 import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
@@ -400,6 +401,201 @@ def holiday_week_ending_for_date(all_week_endings: list[date], holiday_dt: date)
             return we
     return min(weeks, key=lambda we: abs((we - holiday_dt).days))
 
+
+# ----------------------------
+# New tab: Grossing Milestones
+# ----------------------------
+@st.cache_data(show_spinner=False)
+def _load_milestone_base(db_path: str, db_mtime: float) -> pd.DataFrame:
+    """Load minimal data for milestone calculations. db_mtime busts cache on DB updates."""
+    con = sqlite3.connect(db_path)
+    try:
+        df = pd.read_sql_query(
+            """
+            SELECT
+              e.week_ending,
+              e.show_id,
+              s.canonical_title AS canonical_title,
+              COALESCE(e.gross_millions, 0) AS gross_millions
+            FROM t10_entry e
+            JOIN show s ON s.show_id = e.show_id
+            """,
+            con,
+        )
+    finally:
+        con.close()
+
+    if df.empty:
+        return df
+
+    df["week_ending"] = _as_date_str(df["week_ending"])
+    df["week_ending_dt"] = pd.to_datetime(df["week_ending"], errors="coerce")
+    df = df.dropna(subset=["week_ending_dt", "show_id", "canonical_title"]).copy()
+    df["gross_millions"] = pd.to_numeric(df["gross_millions"], errors="coerce").fillna(0.0)
+
+    # If ties/duplicates ever create multiple rows for a show/week, collapse to weekly sum first
+    df = (
+        df.groupby(["show_id", "canonical_title", "week_ending"], as_index=False)["gross_millions"]
+        .sum()
+        .sort_values(["show_id", "week_ending"])
+        .reset_index(drop=True)
+    )
+    df["week_ending_dt"] = pd.to_datetime(df["week_ending"], errors="coerce")
+    return df
+
+
+def _compute_milestones_1k(df_base: pd.DataFrame, step: int = 1000) -> pd.DataFrame:
+    """
+    Compute first week each show reaches each step milestone in cumulative gross_millions.
+    Returns one row per (show, milestone).
+    """
+    if df_base.empty:
+        return pd.DataFrame(
+            columns=[
+                "canonical_title",
+                "show_id",
+                "milestone",
+                "week_ending",
+                "cumulative_gross_millions",
+                "week_gross_millions",
+            ]
+        )
+
+    work = df_base.copy()
+    work = work.sort_values(["show_id", "week_ending_dt"]).reset_index(drop=True)
+    work["cumulative_gross_millions"] = work.groupby("show_id")["gross_millions"].cumsum()
+
+    out_rows: list[dict[str, Any]] = []
+    for sid, g in work.groupby("show_id", sort=False):
+        g = g.sort_values("week_ending_dt")
+        title = g["canonical_title"].iloc[0]
+        cum = g["cumulative_gross_millions"].to_numpy()
+
+        max_cum = float(cum.max()) if len(cum) else 0.0
+        if max_cum < step:
+            continue
+
+        top = int(max_cum // step) * step
+        milestones = range(step, top + step, step)
+
+        for m in milestones:
+            idxs = (cum >= m).nonzero()[0]
+            if len(idxs) == 0:
+                continue
+            i = int(idxs[0])
+            row = g.iloc[i]
+            out_rows.append(
+                {
+                    "canonical_title": title,
+                    "show_id": int(sid),
+                    "milestone": int(m),
+                    "week_ending": str(row["week_ending"]),
+                    "cumulative_gross_millions": float(row["cumulative_gross_millions"]),
+                    "week_gross_millions": float(row["gross_millions"]),
+                }
+            )
+
+    out = pd.DataFrame(out_rows)
+    if out.empty:
+        return out
+
+    out["week_ending_dt"] = pd.to_datetime(out["week_ending"], errors="coerce")
+    out = out.sort_values(["canonical_title", "milestone"]).reset_index(drop=True)
+    return out
+
+
+def tab_grossing_milestones():
+    st.subheader("Grossing milestones")
+    st.caption("Milestones are based on cumulative sum of gross_millions over time (no currency formatting).")
+
+    if not DB_PATH.exists():
+        st.error(f"Database not found at {DB_PATH}.")
+        return
+
+    # Cache-buster so this tab refreshes after DB updates/redeploys
+    db_mtime = DB_PATH.stat().st_mtime
+    base = _load_milestone_base(str(DB_PATH), db_mtime)
+
+    df_m = _compute_milestones_1k(base, step=1000)
+    if df_m.empty:
+        st.info("No shows have reached 1,000 gross_millions yet.")
+        return
+
+    def fmt_int(x: int) -> str:
+        return f"{int(x):,}"
+
+    # -------------------------
+    # Section 1: Show → milestones (1k increments)
+    # -------------------------
+    st.markdown("### Show → milestones (1k increments)")
+    shows = sorted(df_m["canonical_title"].unique().tolist())
+    pick_show = st.selectbox("Show", shows, key="ms_show_pick")
+
+    one = df_m[df_m["canonical_title"] == pick_show].copy()
+    one = one.sort_values("milestone").reset_index(drop=True)
+
+    st.dataframe(
+        one[["milestone", "week_ending", "cumulative_gross_millions", "week_gross_millions"]],
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    if not one.empty:
+        pick_m = st.selectbox(
+            "Jump to a milestone for this show",
+            options=one["milestone"].tolist(),
+            format_func=fmt_int,
+            key="ms_show_jump",
+        )
+        r = one[one["milestone"] == pick_m].iloc[0]
+        st.success(
+            f"**{pick_show}** first reached **{fmt_int(pick_m)}** on **{r['week_ending']}** "
+            f"(cumulative: **{r['cumulative_gross_millions']:.1f}**, that week: **{r['week_gross_millions']:.1f}**)."
+        )
+
+    st.divider()
+
+    # -------------------------
+    # Section 2: Big milestone → shows (10k/20k/30k club)
+    # -------------------------
+    st.markdown("### Big milestone → shows (10k club)")
+    big_milestones = sorted([m for m in df_m["milestone"].unique().tolist() if int(m) % 10000 == 0])
+    if not big_milestones:
+        st.info("No shows have reached 10,000 gross_millions yet.")
+        return
+
+    pick_big = st.selectbox(
+        "Big milestone",
+        options=big_milestones,
+        format_func=fmt_int,
+        key="ms_big_pick",
+    )
+
+    hit = df_m[df_m["milestone"] == pick_big].copy()
+    hit["week_ending_dt"] = pd.to_datetime(hit["week_ending"], errors="coerce")
+    hit = hit.sort_values(["week_ending_dt", "canonical_title"]).reset_index(drop=True)
+
+    st.caption(f"Shows that first reached {fmt_int(pick_big)} gross_millions (earliest first).")
+    st.dataframe(
+        hit[["canonical_title", "week_ending", "cumulative_gross_millions", "week_gross_millions"]],
+        use_container_width=True,
+        hide_index=True,
+    )
+    st.write(f"Count: **{len(hit):,}**")
+
+    st.markdown("#### Top 20 earliest to reach this milestone")
+    top20 = hit.head(20).copy()
+    st.dataframe(
+        top20[["canonical_title", "week_ending", "cumulative_gross_millions", "week_gross_millions"]],
+        use_container_width=True,
+        hide_index=True,
+    )
+    if not top20.empty:
+        w = top20.iloc[0]
+        st.success(
+            f"Earliest: **{w['canonical_title']}** reached **{fmt_int(pick_big)}** on **{w['week_ending']}** "
+            f"(cumulative: **{w['cumulative_gross_millions']:.1f}**)."
+        )
 
 # ----------------------------
 # UI Tabs
@@ -984,7 +1180,7 @@ def main():
     st.caption("SQLite + FTS search, per-show analytics, company analytics, and movement/grossing charts. (Ties supported.)")
 
     # Original tabs + 2 new tabs inserted before Admin (so Admin stays last)
-    tabs = st.tabs(["Search", "Show Detail", "Compare Two Shows", "Companies", "Analytics", "Streak Analytics", "Holidays", "Admin"])
+    tabs = st.tabs(["Search", "Show Detail", "Compare Two Shows", "Companies", "Analytics", "Grossing Milestones", "Streak Analytics", "Holidays", "Admin"])
     with tabs[0]:
         tab_search()
     with tabs[1]:
@@ -996,10 +1192,12 @@ def main():
     with tabs[4]:
         tab_analytics()
     with tabs[5]:
-        tab_streak_analytics()
+        tab_grossing_milestones()
     with tabs[6]:
-        tab_holidays()
+        tab_streak_analytics()
     with tabs[7]:
+        tab_holidays()
+    with tabs[8]:
         tab_admin()
 
 
