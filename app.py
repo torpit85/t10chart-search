@@ -23,6 +23,9 @@ from charts import chart_top_gross_weeks
 APP_TITLE = "T-10 Chart Search Engine"
 DB_PATH = Path(__file__).with_name("t10.sqlite")
 
+# Gross tracking starts the week ending March 17, 2001
+GROSS_TRACKING_START = date(2001, 3, 17)
+
 # For streaks when week_number is missing/spotty
 CONSECUTIVE_DAY_TOLERANCE = (6, 8)  # inclusive
 
@@ -1105,6 +1108,12 @@ def tab_gross_races():
         return
 
     base["week_ending_dt"] = pd.to_datetime(base["week_ending"], errors="coerce")
+    # Exclude pre-gross-tracking years (you started tracking grosses the week ending 2001-03-17)
+    base = base[base["week_ending_dt"] >= pd.Timestamp(GROSS_TRACKING_START)].copy()
+    if base.empty:
+        st.info("No gross rows found on/after the gross-tracking start date (2001-03-17).")
+        return
+
     latest_dt = pd.to_datetime(base["week_ending_dt"].max())
     latest_date = latest_dt.date()
 
@@ -1113,6 +1122,7 @@ def tab_gross_races():
     # -------------------------
     st.markdown("### All-Time Gross Races Chart")
     all_time = base.groupby("canonical_title", as_index=False)["gross_millions"].sum()
+    all_time = all_time[all_time["gross_millions"] > 0].copy()
     all_time = all_time.sort_values("gross_millions", ascending=False).reset_index(drop=True)
     all_time.insert(0, "rank", np.arange(1, len(all_time) + 1))
 
@@ -1132,7 +1142,13 @@ def tab_gross_races():
     st.markdown("### Annual Gross Races")
     st.caption("Cumulative grosses reset at the start of each year.")
 
-    pick_dt = st.date_input("As-of date (pick any date to view that year's race)", value=latest_date, key="annual_race_date")
+    pick_dt = st.date_input(
+        "As-of date (pick any date to view that year's race)",
+        value=latest_date,
+        min_value=GROSS_TRACKING_START,
+        max_value=latest_date,
+        key="annual_race_date"
+    )
     pick_ts = pd.to_datetime(pick_dt)
 
     ydf, weeks = _year_cumulative(base, int(pick_dt.year), pick_ts)
