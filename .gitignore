@@ -23,3 +23,12 @@ venv/
 # Local DB backups + logs
 backups/
 logs/
+
+# Local DB + app backups
+*.bak
+*.bak.*
+*.sqlite.bak.*
+app.py.bak.*
+.~lock.*
+*.zip
+*.docx
