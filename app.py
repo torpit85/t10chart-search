@@ -122,9 +122,16 @@ def fetch_entries(filters: FilterSpec, fts_query: str | None = None, limit: int 
           e.raw_title,
           e.imprint_1,
           e.imprint_2,
-          e.gross_millions
+          e.gross_millions AS base_gross_millions,
+          COALESCE(gb.bonus_millions, 0) AS bonus_millions,
+          (e.gross_millions + COALESCE(gb.bonus_millions, 0)) AS gross_millions
         FROM t10_fts f
         JOIN t10_entry e ON e.id = f.rowid
+        LEFT JOIN (
+          SELECT show_id, week_ending, SUM(bonus_millions) AS bonus_millions
+          FROM gross_bonus
+          GROUP BY show_id, week_ending
+        ) gb ON gb.show_id = e.show_id AND gb.week_ending = e.week_ending
         JOIN show s ON s.show_id = e.show_id
         WHERE t10_fts MATCH ?
           AND {where}
@@ -144,8 +151,15 @@ def fetch_entries(filters: FilterSpec, fts_query: str | None = None, limit: int 
           e.raw_title,
           e.imprint_1,
           e.imprint_2,
-          e.gross_millions
+          e.gross_millions AS base_gross_millions,
+          COALESCE(gb.bonus_millions, 0) AS bonus_millions,
+          (e.gross_millions + COALESCE(gb.bonus_millions, 0)) AS gross_millions
         FROM t10_entry e
+        LEFT JOIN (
+          SELECT show_id, week_ending, SUM(bonus_millions) AS bonus_millions
+          FROM gross_bonus
+          GROUP BY show_id, week_ending
+        ) gb ON gb.show_id = e.show_id AND gb.week_ending = e.week_ending
         JOIN show s ON s.show_id = e.show_id
         WHERE {where}
         ORDER BY e.week_ending DESC, e.rank ASC, e.pos ASC
@@ -170,8 +184,15 @@ def fetch_show_entries(show_id: int, filters: FilterSpec) -> pd.DataFrame:
       e.raw_title,
       e.imprint_1,
       e.imprint_2,
-      e.gross_millions
+      e.gross_millions AS base_gross_millions,
+      COALESCE(gb.bonus_millions, 0) AS bonus_millions,
+      (e.gross_millions + COALESCE(gb.bonus_millions, 0)) AS gross_millions
     FROM t10_entry e
+    LEFT JOIN (
+      SELECT show_id, week_ending, SUM(bonus_millions) AS bonus_millions
+      FROM gross_bonus
+      GROUP BY show_id, week_ending
+    ) gb ON gb.show_id = e.show_id AND gb.week_ending = e.week_ending
     WHERE e.show_id = ?
       AND {where}
     ORDER BY e.week_number ASC, e.rank ASC, e.pos ASC
@@ -196,8 +217,15 @@ def fetch_company_entries(company: str, filters: FilterSpec, limit: int = 2000) 
       e.raw_title,
       e.imprint_1,
       e.imprint_2,
-      e.gross_millions
+      e.gross_millions AS base_gross_millions,
+      COALESCE(gb.bonus_millions, 0) AS bonus_millions,
+      (e.gross_millions + COALESCE(gb.bonus_millions, 0)) AS gross_millions
     FROM t10_entry e
+    LEFT JOIN (
+      SELECT show_id, week_ending, SUM(bonus_millions) AS bonus_millions
+      FROM gross_bonus
+      GROUP BY show_id, week_ending
+    ) gb ON gb.show_id = e.show_id AND gb.week_ending = e.week_ending
     JOIN show s ON s.show_id = e.show_id
     WHERE COALESCE(e.imprint_1,'(Unknown)') = ?
       AND {where}
@@ -416,8 +444,15 @@ def _load_milestone_base(db_path: str, db_mtime: float) -> pd.DataFrame:
               e.week_ending,
               e.show_id,
               s.canonical_title AS canonical_title,
-              COALESCE(e.gross_millions, 0) AS gross_millions
+              COALESCE(e.gross_millions, 0) AS base_gross_millions,
+              COALESCE(gb.bonus_millions, 0) AS bonus_millions,
+              (COALESCE(e.gross_millions, 0) + COALESCE(gb.bonus_millions, 0)) AS gross_millions
             FROM t10_entry e
+            LEFT JOIN (
+              SELECT show_id, week_ending, SUM(bonus_millions) AS bonus_millions
+              FROM gross_bonus
+              GROUP BY show_id, week_ending
+            ) gb ON gb.show_id = e.show_id AND gb.week_ending = e.week_ending
             JOIN show s ON s.show_id = e.show_id
             """,
             con,
@@ -870,10 +905,17 @@ def tab_analytics():
           e.rank,
           e.pos,
           e.last_week,
-          e.gross_millions,
+          e.gross_millions AS base_gross_millions,
+          COALESCE(gb.bonus_millions, 0) AS bonus_millions,
+          (e.gross_millions + COALESCE(gb.bonus_millions, 0)) AS gross_millions,
           COALESCE(e.imprint_1,'(Unknown)') AS company,
           s.canonical_title
         FROM t10_entry e
+        LEFT JOIN (
+          SELECT show_id, week_ending, SUM(bonus_millions) AS bonus_millions
+          FROM gross_bonus
+          GROUP BY show_id, week_ending
+        ) gb ON gb.show_id = e.show_id AND gb.week_ending = e.week_ending
         JOIN show s ON s.show_id = e.show_id
         WHERE {where}
         ORDER BY e.week_ending ASC, e.rank ASC, e.pos ASC
@@ -888,14 +930,36 @@ def tab_analytics():
     df["year"] = df["week_ending_dt"].dt.year
 
     dg = df.dropna(subset=["gross_millions"]).copy()
-    dg["gross_millions"] = pd.to_numeric(dg["gross_millions"], errors="coerce")
+    for col in ["gross_millions", "base_gross_millions", "bonus_millions"]:
+        if col in dg.columns:
+            dg[col] = pd.to_numeric(dg[col], errors="coerce")
 
+    ignore_bonus = st.checkbox(
+        "Ignore gross bonuses in most analytics (Top shows/companies + yearly totals still include bonuses)",
+        value=False,
+    )
+    gross_col = "base_gross_millions" if ignore_bonus else "gross_millions"
+    gross_label = "Base gross (millions)" if gross_col == "base_gross_millions" else "Gross + bonuses (millions)"
+    if ignore_bonus:
+        st.caption(
+            "Bonuses are excluded from most charts/totals below, except Top shows, Top companies, and Yearly gross totals (those always include bonuses)."
+        )
     st.markdown("### Total gross over time (weekly sum)")
     if dg.empty:
         st.warning("No gross values in the selected range.")
         return
 
-    weekly = dg.groupby("week_ending", as_index=False)["gross_millions"].sum().sort_values("week_ending")
+    weekly = (
+
+        dg.groupby("week_ending", as_index=False)[gross_col]
+
+        .sum()
+
+        .rename(columns={gross_col: "gross_millions"})
+
+        .sort_values("week_ending")
+
+    )
     plot_line_dates(weekly["week_ending"], weekly["gross_millions"], "Week Ending", "Total Gross (Millions)")
 
     # Keep this INSIDE the tab so 'weekly' is defined
@@ -909,7 +973,7 @@ def tab_analytics():
     plot_line_dates(w2["week_ending"], w2["roll"], "Week Ending", f"{win}-week avg gross (Millions)")
 
     st.markdown("### Rank vs Gross (scatter)")
-    plot_scatter(dg["rank"].astype(float), dg["gross_millions"].astype(float), "Rank", "Gross (Millions)")
+    plot_scatter(dg["rank"].astype(float), dg[gross_col].astype(float), "Rank", gross_label)
 
     st.markdown("### Top shows by total gross")
     top_shows = dg.groupby("canonical_title", as_index=False)["gross_millions"].sum()
@@ -924,7 +988,7 @@ def tab_analytics():
     plot_barh(top_comp["company"][::-1], top_comp["gross_millions"][::-1], "Total Gross (Millions)", "Company")
 
     st.markdown("### Gross distribution")
-    plot_hist(dg["gross_millions"].astype(float), bins=30, xlabel="Gross (Millions)", ylabel="Count")
+    plot_hist(dg[gross_col].astype(float), bins=30, xlabel=gross_label, ylabel="Count")
 
     st.markdown("### Yearly gross totals")
     yearly = dg.groupby("year", as_index=False)["gross_millions"].sum().sort_values("year")
@@ -1049,8 +1113,15 @@ def tab_holidays():
               e.pos,
               e.imprint_1,
               e.imprint_2,
-              e.gross_millions
+              e.gross_millions AS base_gross_millions,
+              COALESCE(gb.bonus_millions, 0) AS bonus_millions,
+              (e.gross_millions + COALESCE(gb.bonus_millions, 0)) AS gross_millions
             FROM t10_entry e
+            LEFT JOIN (
+              SELECT show_id, week_ending, SUM(bonus_millions) AS bonus_millions
+              FROM gross_bonus
+              GROUP BY show_id, week_ending
+            ) gb ON gb.show_id = e.show_id AND gb.week_ending = e.week_ending
             JOIN show s ON s.show_id = e.show_id
             WHERE date(e.week_ending) = ?
               AND e.rank = 1
