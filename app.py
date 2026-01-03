@@ -975,12 +975,6 @@ def tab_analytics():
     st.markdown("### Rank vs Gross (scatter)")
     plot_scatter(dg["rank"].astype(float), dg[gross_col].astype(float), "Rank", gross_label)
 
-    st.markdown("### Top shows by total gross")
-    top_shows = dg.groupby("canonical_title", as_index=False)["gross_millions"].sum()
-    top_shows = top_shows.sort_values("gross_millions", ascending=False).head(int(top_n))
-    st.dataframe(top_shows, use_container_width=True)
-    plot_barh(top_shows["canonical_title"][::-1], top_shows["gross_millions"][::-1], "Total Gross (Millions)", "Show")
-
     st.markdown("### Top companies by total gross")
     top_comp = dg.groupby("company", as_index=False)["gross_millions"].sum()
     top_comp = top_comp.sort_values("gross_millions", ascending=False).head(int(top_n))
@@ -1000,6 +994,252 @@ def tab_analytics():
     plt.tight_layout()
     st.pyplot(fig)
     plt.close(fig)
+
+
+
+# ----------------------------
+# New tab: Gross Races
+# ----------------------------
+@st.cache_data(show_spinner=False)
+def _load_gross_races_base(db_path: str, db_mtime: float) -> pd.DataFrame:
+    """Weekly gross (including all bonuses) per show. db_mtime busts cache on DB updates."""
+    con = sqlite3.connect(db_path)
+    try:
+        df = pd.read_sql_query(
+            """
+            SELECT
+              e.week_ending,
+              e.show_id,
+              s.canonical_title AS canonical_title,
+              COALESCE(e.gross_millions, 0) AS base_gross_millions,
+              COALESCE(gb.bonus_millions, 0) AS bonus_millions,
+              (COALESCE(e.gross_millions, 0) + COALESCE(gb.bonus_millions, 0)) AS gross_millions
+            FROM t10_entry e
+            LEFT JOIN (
+              SELECT show_id, week_ending, SUM(bonus_millions) AS bonus_millions
+              FROM gross_bonus
+              GROUP BY show_id, week_ending
+            ) gb ON gb.show_id = e.show_id AND gb.week_ending = e.week_ending
+            JOIN show s ON s.show_id = e.show_id
+            """,
+            con,
+        )
+    finally:
+        con.close()
+
+    if df.empty:
+        return df
+
+    df["week_ending"] = _as_date_str(df["week_ending"])
+    df["week_ending_dt"] = pd.to_datetime(df["week_ending"], errors="coerce")
+    df = df.dropna(subset=["week_ending_dt", "show_id", "canonical_title"]).copy()
+    df["gross_millions"] = pd.to_numeric(df["gross_millions"], errors="coerce").fillna(0.0)
+
+    # If ties/duplicates ever create multiple rows for a show/week, collapse to weekly sum first
+    df = (
+        df.groupby(["show_id", "canonical_title", "week_ending"], as_index=False)["gross_millions"]
+        .sum()
+        .sort_values(["show_id", "week_ending"])
+        .reset_index(drop=True)
+    )
+    df["week_ending_dt"] = pd.to_datetime(df["week_ending"], errors="coerce")
+    return df
+
+
+def _plot_multi_line(dates: list[pd.Timestamp], series_by_label: dict[str, pd.Series], xlabel: str, ylabel: str):
+    fig = plt.figure()
+    for label, y in series_by_label.items():
+        plt.plot(dates, y, label=label)
+    plt.xlabel(xlabel)
+    plt.ylabel(ylabel)
+    plt.legend()
+    plt.tight_layout()
+    st.pyplot(fig)
+    plt.close(fig)
+
+
+def _year_cumulative(base: pd.DataFrame, year: int, through_dt: pd.Timestamp) -> tuple[pd.DataFrame, list[pd.Timestamp]]:
+    ydf = base[base["week_ending_dt"].dt.year == year].copy()
+    ydf = ydf[ydf["week_ending_dt"] <= through_dt].copy()
+    if ydf.empty:
+        return ydf, []
+
+    ydf = ydf.sort_values(["show_id", "week_ending_dt"]).reset_index(drop=True)
+    ydf["cum_gross_millions"] = ydf.groupby("show_id")["gross_millions"].cumsum()
+
+    weeks = sorted(ydf["week_ending_dt"].dropna().unique().tolist())
+    return ydf, weeks
+
+
+def _quarter_cumulative(base: pd.DataFrame, year: int, quarter: int, through_week_dt: pd.Timestamp) -> tuple[pd.DataFrame, list[pd.Timestamp]]:
+    q = int(quarter)
+    start_month = (q - 1) * 3 + 1
+    end_month = start_month + 2
+
+    qdf = base[(base["week_ending_dt"].dt.year == year)].copy()
+    qdf = qdf[(qdf["week_ending_dt"].dt.month >= start_month) & (qdf["week_ending_dt"].dt.month <= end_month)].copy()
+    qdf = qdf[qdf["week_ending_dt"] <= through_week_dt].copy()
+
+    if qdf.empty:
+        return qdf, []
+
+    qdf = qdf.sort_values(["show_id", "week_ending_dt"]).reset_index(drop=True)
+    qdf["cum_gross_millions"] = qdf.groupby("show_id")["gross_millions"].cumsum()
+
+    weeks = sorted(qdf["week_ending_dt"].dropna().unique().tolist())
+    return qdf, weeks
+
+
+def tab_gross_races():
+    st.subheader("Gross Races")
+    st.caption("All charts on this page include weekly gross **plus all gross bonuses** (annual + quarter bonuses included via gross_bonus).")
+
+    if not DB_PATH.exists():
+        st.error(f"Database not found at {DB_PATH}.")
+        return
+
+    db_mtime = DB_PATH.stat().st_mtime
+    base = _load_gross_races_base(str(DB_PATH), db_mtime)
+    if base.empty:
+        st.info("No gross data found.")
+        return
+
+    base["week_ending_dt"] = pd.to_datetime(base["week_ending"], errors="coerce")
+    latest_dt = pd.to_datetime(base["week_ending_dt"].max())
+    latest_date = latest_dt.date()
+
+    # -------------------------
+    # 1) All-Time Gross Races Chart (unlimited rank)
+    # -------------------------
+    st.markdown("### All-Time Gross Races Chart")
+    all_time = base.groupby("canonical_title", as_index=False)["gross_millions"].sum()
+    all_time = all_time.sort_values("gross_millions", ascending=False).reset_index(drop=True)
+    all_time.insert(0, "rank", np.arange(1, len(all_time) + 1))
+
+    st.caption("Unlimited rank: every show with any gross is included.")
+    st.dataframe(all_time, use_container_width=True, hide_index=True)
+
+    with st.expander("Optional: visualize the leaders (bar chart)"):
+        top_plot = st.slider("How many shows to display in the bar chart", 5, min(200, int(len(all_time))), min(50, int(len(all_time))))
+        top_block = all_time.head(int(top_plot)).copy()
+        plot_barh(top_block["canonical_title"][::-1], top_block["gross_millions"][::-1], "Total Gross (Millions)", "Show")
+
+    st.divider()
+
+    # -------------------------
+    # 2) Annual Gross Races
+    # -------------------------
+    st.markdown("### Annual Gross Races")
+    st.caption("Cumulative grosses reset at the start of each year.")
+
+    pick_dt = st.date_input("As-of date (pick any date to view that year's race)", value=latest_date, key="annual_race_date")
+    pick_ts = pd.to_datetime(pick_dt)
+
+    ydf, weeks = _year_cumulative(base, int(pick_dt.year), pick_ts)
+    if ydf.empty:
+        st.info("No gross rows found for that year (through the selected date).")
+    else:
+        # Leaderboard as-of date
+        last = ydf.sort_values(["show_id", "week_ending_dt"]).groupby(["show_id", "canonical_title"], as_index=False).tail(1)
+        leaders = last[["canonical_title", "cum_gross_millions"]].copy()
+        leaders = leaders.sort_values("cum_gross_millions", ascending=False).reset_index(drop=True)
+        leaders.insert(0, "rank", np.arange(1, len(leaders) + 1))
+
+        st.caption(f"Leaderboard for **{pick_dt.year}** (through **{pick_dt.isoformat()}**)")
+        st.dataframe(leaders, use_container_width=True, hide_index=True)
+
+        # Line chart for top K at the selected date
+        top_k = st.slider("Shows to plot (annual)", 2, min(50, int(len(leaders))), min(10, int(len(leaders))))
+        top_titles = leaders.head(int(top_k))["canonical_title"].tolist()
+
+        piv = ydf[ydf["canonical_title"].isin(top_titles)].copy()
+        piv = piv.pivot_table(index="week_ending_dt", columns="canonical_title", values="cum_gross_millions", aggfunc="max").sort_index()
+        piv = piv.reindex(pd.to_datetime(weeks)).ffill()
+
+        series_by_label = {c: piv[c] for c in piv.columns}
+        _plot_multi_line(list(piv.index), series_by_label, "Week Ending", "Cumulative Gross (Millions)")
+
+    st.divider()
+
+    # -------------------------
+    # 3) Quarter Gross Races
+    # -------------------------
+    st.markdown("### Quarter Gross Races")
+    st.caption("Cumulative grosses reset at the start of each quarter.")
+
+    # Default to the current quarter/year based on latest week ending
+    cur_year = int(latest_dt.year)
+    cur_quarter = int(((latest_dt.month - 1) // 3) + 1)
+
+    q1, q2, q3 = st.columns([1, 2, 2])
+    with q1:
+        quarter = st.selectbox("Quarter", options=[1, 2, 3, 4], index=cur_quarter - 1, key="q_race_quarter")
+    with q2:
+        # Years available for this quarter
+        start_month = (int(quarter) - 1) * 3 + 1
+        end_month = start_month + 2
+        years_avail = (
+            base[(base["week_ending_dt"].dt.month >= start_month) & (base["week_ending_dt"].dt.month <= end_month)]["week_ending_dt"]
+            .dt.year.dropna().astype(int).unique().tolist()
+        )
+        years_avail = sorted(set(years_avail))
+        if not years_avail:
+            years_avail = [cur_year]
+        year_pick = st.selectbox("Year", options=years_avail, index=years_avail.index(cur_year) if cur_year in years_avail else len(years_avail) - 1, key="q_race_year")
+
+    # Week dropdown depends on quarter/year selection
+    start_month = (int(quarter) - 1) * 3 + 1
+    end_month = start_month + 2
+    q_weeks = base[(base["week_ending_dt"].dt.year == int(year_pick))].copy()
+    q_weeks = q_weeks[(q_weeks["week_ending_dt"].dt.month >= start_month) & (q_weeks["week_ending_dt"].dt.month <= end_month)].copy()
+    q_week_list = sorted(pd.to_datetime(q_weeks["week_ending_dt"].dropna().unique()))
+    q_week_list = [pd.to_datetime(x).normalize() for x in q_week_list]
+
+    if not q_week_list:
+        st.info("No weeks found for that quarter/year.")
+        return
+
+    latest_norm = pd.to_datetime(latest_dt).normalize()
+
+    # Default week: latest week if it's in this quarter/year, else last week of that quarter
+    default_week_idx = len(q_week_list) - 1
+    if (latest_norm.year == int(year_pick)) and (latest_norm in q_week_list):
+        default_week_idx = q_week_list.index(latest_norm)
+
+    with q3:
+        wk_num = st.selectbox(
+            "Week",
+            options=list(range(1, len(q_week_list) + 1)),
+            index=default_week_idx,
+            format_func=lambda i: f"Week {i}",
+            key="q_race_week",
+        )
+
+    wk_dt = pd.to_datetime(q_week_list[int(wk_num) - 1])
+    st.caption(f"Selected week ending: **{wk_dt.date().isoformat()}**")
+
+    qdf, qweeks = _quarter_cumulative(base, int(year_pick), int(quarter), wk_dt)
+    if qdf.empty:
+        st.info("No gross rows found for that quarter (through the selected week).")
+        return
+
+    lastq = qdf.sort_values(["show_id", "week_ending_dt"]).groupby(["show_id", "canonical_title"], as_index=False).tail(1)
+    leaders_q = lastq[["canonical_title", "cum_gross_millions"]].copy()
+    leaders_q = leaders_q.sort_values("cum_gross_millions", ascending=False).reset_index(drop=True)
+    leaders_q.insert(0, "rank", np.arange(1, len(leaders_q) + 1))
+
+    st.caption(f"Leaderboard for **Q{int(quarter)} {int(year_pick)}** (through **{wk_dt.date().isoformat()}**)")
+    st.dataframe(leaders_q, use_container_width=True, hide_index=True)
+
+    top_kq = st.slider("Shows to plot (quarter)", 2, min(50, int(len(leaders_q))), min(10, int(len(leaders_q))), key="q_race_topk")
+    top_titles_q = leaders_q.head(int(top_kq))["canonical_title"].tolist()
+
+    pivq = qdf[qdf["canonical_title"].isin(top_titles_q)].copy()
+    pivq = pivq.pivot_table(index="week_ending_dt", columns="canonical_title", values="cum_gross_millions", aggfunc="max").sort_index()
+    pivq = pivq.reindex(pd.to_datetime(qweeks)).ffill()
+
+    series_by_label_q = {c: pivq[c] for c in pivq.columns}
+    _plot_multi_line(list(pivq.index), series_by_label_q, "Week Ending", "Cumulative Gross (Millions)")
 
 
 # ----------------------------
@@ -1251,7 +1491,7 @@ def main():
     st.caption("SQLite + FTS search, per-show analytics, company analytics, and movement/grossing charts. (Ties supported.)")
 
     # Original tabs + 2 new tabs inserted before Admin (so Admin stays last)
-    tabs = st.tabs(["Search", "Show Detail", "Compare Two Shows", "Companies", "Analytics", "Grossing Milestones", "Streak Analytics", "Holidays", "Admin"])
+    tabs = st.tabs(["Search", "Show Detail", "Compare Two Shows", "Companies", "Analytics", "Gross Races", "Grossing Milestones", "Streak Analytics", "Holidays", "Admin"])
     with tabs[0]:
         tab_search()
     with tabs[1]:
@@ -1263,13 +1503,16 @@ def main():
     with tabs[4]:
         tab_analytics()
     with tabs[5]:
-        tab_grossing_milestones()
+        tab_gross_races()
     with tabs[6]:
-        tab_streak_analytics()
+        tab_grossing_milestones()
     with tabs[7]:
-        tab_holidays()
+        tab_streak_analytics()
     with tabs[8]:
+        tab_holidays()
+    with tabs[9]:
         tab_admin()
+
 
 
 if __name__ == "__main__":

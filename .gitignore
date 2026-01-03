@@ -19,3 +19,7 @@ venv/
 *.swp
 .idea/
 .vscode/
+
+# Local DB backups + logs
+backups/
+logs/
