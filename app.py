@@ -206,38 +206,48 @@ def fetch_show_entries(show_id: int, filters: FilterSpec) -> pd.DataFrame:
     return df
 
 def fetch_show_stats(show_id: int) -> pd.DataFrame:
-    # Stats computed from rows + gross_bonus, so they match gross races / analytics totals.
+    """Show-level summary stats.
+
+    Notes:
+      - weeks_on_chart / peak_rank / first/last appearance are based on actual chart rows (t10_entry).
+      - total_gross_millions includes *all* gross bonuses from gross_bonus, even if a bonus lands on a week
+        where the show is not on the chart (no t10_entry row for that week).
+      - avg_gross_millions is computed as total_gross_millions / weeks_on_chart (when weeks_on_chart > 0).
+    """
     return sql_df(
         """
-        WITH gb AS (
-          SELECT show_id, week_ending, SUM(bonus_millions) AS bonus_millions
-          FROM gross_bonus
-          GROUP BY show_id, week_ending
-        ),
-        rows AS (
-          SELECT
-            e.week_ending,
-            e.rank,
-            (COALESCE(e.gross_millions, 0) + COALESCE(gb.bonus_millions, 0)) AS gross_millions
-          FROM t10_entry e
-          LEFT JOIN gb
-            ON gb.show_id = e.show_id
-           AND gb.week_ending = e.week_ending
-          WHERE e.show_id = ?
-        )
+        WITH
+          chart AS (
+            SELECT date(week_ending) AS we, rank
+            FROM t10_entry
+            WHERE show_id = ?
+          ),
+          base AS (
+            SELECT COALESCE(SUM(COALESCE(gross_millions, 0.0)), 0.0) AS base_gross
+            FROM t10_entry
+            WHERE show_id = ?
+          ),
+          bon AS (
+            SELECT COALESCE(SUM(COALESCE(bonus_millions, 0.0)), 0.0) AS bonus_gross
+            FROM gross_bonus
+            WHERE show_id = ?
+          )
         SELECT
-          COUNT(DISTINCT date(week_ending)) AS weeks_on_chart,
-          MIN(rank) AS peak_rank,
-          MIN(date(week_ending)) AS first_appearance,
-          MAX(date(week_ending)) AS last_appearance,
-          SUM(gross_millions) AS total_gross_millions,
-          AVG(gross_millions) AS avg_gross_millions,
-          AVG(rank) AS avg_rank
-        FROM rows
+          (SELECT COUNT(DISTINCT we) FROM chart) AS weeks_on_chart,
+          (SELECT MIN(rank) FROM chart) AS peak_rank,
+          (SELECT MIN(we) FROM chart) AS first_appearance,
+          (SELECT MAX(we) FROM chart) AS last_appearance,
+          ((SELECT base_gross FROM base) + (SELECT bonus_gross FROM bon)) AS total_gross_millions,
+          CASE
+            WHEN (SELECT COUNT(DISTINCT we) FROM chart) > 0
+            THEN ((SELECT base_gross FROM base) + (SELECT bonus_gross FROM bon)) * 1.0
+                 / (SELECT COUNT(DISTINCT we) FROM chart)
+            ELSE NULL
+          END AS avg_gross_millions,
+          (SELECT AVG(rank) FROM t10_entry WHERE show_id = ?) AS avg_rank
         """,
-        (show_id,),
+        (show_id, show_id, show_id, show_id),
     )
-
 def fetch_company_entries(company: str, filters: FilterSpec, limit: int = 2000) -> pd.DataFrame:
     where, params = build_where(filters, "e")
     sql = f"""
@@ -728,15 +738,26 @@ def tab_show_detail():
     stats = fetch_show_stats(show_id)
     if not stats.empty:
         s = stats.iloc[0].to_dict()
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Weeks on chart", int(s["weeks_on_chart"]))
-        c2.metric("Peak rank", int(s["peak_rank"]))
-        c3.metric("First appearance", str(s["first_appearance"]))
-        c4.metric("Last appearance", str(s["last_appearance"]))
+                c1, c2, c3, c4 = st.columns(4)
+
+        weeks_on = s.get("weeks_on_chart")
+        peak_rank = s.get("peak_rank")
+        first_app = s.get("first_appearance")
+        last_app = s.get("last_appearance")
+
+        c1.metric("Weeks on chart", 0 if pd.isna(weeks_on) else int(weeks_on))
+        c2.metric("Peak rank", "—" if pd.isna(peak_rank) else int(peak_rank))
+        c3.metric("First appearance", "—" if pd.isna(first_app) else str(first_app))
+        c4.metric("Last appearance", "—" if pd.isna(last_app) else str(last_app))
+
+        total_gross = s.get("total_gross_millions")
+        avg_gross = s.get("avg_gross_millions")
+        avg_rank = s.get("avg_rank")
+
         st.write({
-            "Total gross (M)": float(s["total_gross_millions"]),
-            "Avg gross (M)": None if pd.isna(s["avg_gross_millions"]) else float(s["avg_gross_millions"]),
-            "Avg rank": float(s["avg_rank"]),
+            "Total gross (M)": 0.0 if pd.isna(total_gross) else float(total_gross),
+            "Avg gross (M)": None if pd.isna(avg_gross) else float(avg_gross),
+            "Avg rank": None if pd.isna(avg_rank) else float(avg_rank),
         })
 
     df = fetch_show_entries(show_id, filters)
