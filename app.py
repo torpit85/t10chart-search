@@ -1005,25 +1005,43 @@ def tab_analytics():
 # ----------------------------
 @st.cache_data(show_spinner=False)
 def _load_gross_races_base(db_path: str, db_mtime: float) -> pd.DataFrame:
-    """Weekly gross (including all bonuses) per show. db_mtime busts cache on DB updates."""
+    """Weekly gross (including annual+quarter bonuses) per show. db_mtime busts cache on DB updates."""
     con = sqlite3.connect(db_path)
     try:
         df = pd.read_sql_query(
             """
+            WITH combined AS (
+              -- Base weekly gross rows
+              SELECT
+                date(e.week_ending) AS week_ending,
+                e.show_id AS show_id,
+                COALESCE(e.gross_millions, 0.0) AS base_gross_millions,
+                0.0 AS bonus_millions
+              FROM t10_entry e
+              WHERE e.gross_millions IS NOT NULL
+
+              UNION ALL
+
+              -- Bonus rows (include even if show wasn't on chart that week)
+              SELECT
+                date(gb.week_ending) AS week_ending,
+                gb.show_id AS show_id,
+                0.0 AS base_gross_millions,
+                COALESCE(gb.bonus_millions, 0.0) AS bonus_millions
+              FROM gross_bonus gb
+              WHERE gb.bonus_type IN ('annual', 'quarter')
+            )
             SELECT
-              e.week_ending,
-              e.show_id,
+              c.week_ending,
+              c.show_id,
               s.canonical_title AS canonical_title,
-              COALESCE(e.gross_millions, 0) AS base_gross_millions,
-              COALESCE(gb.bonus_millions, 0) AS bonus_millions,
-              (COALESCE(e.gross_millions, 0) + COALESCE(gb.bonus_millions, 0)) AS gross_millions
-            FROM t10_entry e
-            LEFT JOIN (
-              SELECT show_id, week_ending, SUM(bonus_millions) AS bonus_millions
-              FROM gross_bonus
-              GROUP BY show_id, week_ending
-            ) gb ON gb.show_id = e.show_id AND gb.week_ending = e.week_ending
-            JOIN show s ON s.show_id = e.show_id
+              SUM(c.base_gross_millions) AS base_gross_millions,
+              SUM(c.bonus_millions) AS bonus_millions,
+              SUM(c.base_gross_millions + c.bonus_millions) AS gross_millions
+            FROM combined c
+            JOIN show s ON s.show_id = c.show_id
+            GROUP BY c.week_ending, c.show_id, s.canonical_title
+            ORDER BY c.show_id, c.week_ending
             """,
             con,
         )
@@ -1036,18 +1054,22 @@ def _load_gross_races_base(db_path: str, db_mtime: float) -> pd.DataFrame:
     df["week_ending"] = _as_date_str(df["week_ending"])
     df["week_ending_dt"] = pd.to_datetime(df["week_ending"], errors="coerce")
     df = df.dropna(subset=["week_ending_dt", "show_id", "canonical_title"]).copy()
-    df["gross_millions"] = pd.to_numeric(df["gross_millions"], errors="coerce").fillna(0.0)
 
-    # If ties/duplicates ever create multiple rows for a show/week, collapse to weekly sum first
+    # Ensure numeric
+    for col in ("base_gross_millions", "bonus_millions", "gross_millions"):
+        df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
+
+    # If anything still duplicates (shouldn't), collapse safely
     df = (
-        df.groupby(["show_id", "canonical_title", "week_ending"], as_index=False)["gross_millions"]
+        df.groupby(["show_id", "canonical_title", "week_ending"], as_index=False)[
+            ["base_gross_millions", "bonus_millions", "gross_millions"]
+        ]
         .sum()
         .sort_values(["show_id", "week_ending"])
         .reset_index(drop=True)
     )
     df["week_ending_dt"] = pd.to_datetime(df["week_ending"], errors="coerce")
     return df
-
 
 def _plot_multi_line(dates: list[pd.Timestamp], series_by_label: dict[str, pd.Series], xlabel: str, ylabel: str):
     fig = plt.figure()
