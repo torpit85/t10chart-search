@@ -206,7 +206,37 @@ def fetch_show_entries(show_id: int, filters: FilterSpec) -> pd.DataFrame:
     return df
 
 def fetch_show_stats(show_id: int) -> pd.DataFrame:
-    return sql_df("SELECT * FROM v_show_stats WHERE show_id = ?", (show_id,))
+    # Stats computed from rows + gross_bonus, so they match gross races / analytics totals.
+    return sql_df(
+        """
+        WITH gb AS (
+          SELECT show_id, week_ending, SUM(bonus_millions) AS bonus_millions
+          FROM gross_bonus
+          GROUP BY show_id, week_ending
+        ),
+        rows AS (
+          SELECT
+            e.week_ending,
+            e.rank,
+            (COALESCE(e.gross_millions, 0) + COALESCE(gb.bonus_millions, 0)) AS gross_millions
+          FROM t10_entry e
+          LEFT JOIN gb
+            ON gb.show_id = e.show_id
+           AND gb.week_ending = e.week_ending
+          WHERE e.show_id = ?
+        )
+        SELECT
+          COUNT(DISTINCT date(week_ending)) AS weeks_on_chart,
+          MIN(rank) AS peak_rank,
+          MIN(date(week_ending)) AS first_appearance,
+          MAX(date(week_ending)) AS last_appearance,
+          SUM(gross_millions) AS total_gross_millions,
+          AVG(gross_millions) AS avg_gross_millions,
+          AVG(rank) AS avg_rank
+        FROM rows
+        """,
+        (show_id,),
+    )
 
 def fetch_company_entries(company: str, filters: FilterSpec, limit: int = 2000) -> pd.DataFrame:
     where, params = build_where(filters, "e")
