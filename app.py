@@ -738,7 +738,7 @@ def tab_show_detail():
     stats = fetch_show_stats(show_id)
     if not stats.empty:
         s = stats.iloc[0].to_dict()
-                c1, c2, c3, c4 = st.columns(4)
+        c1, c2, c3, c4 = st.columns(4)
 
         weeks_on = s.get("weeks_on_chart")
         peak_rank = s.get("peak_rank")
