@@ -15,6 +15,7 @@ import streamlit as st
 import matplotlib.pyplot as plt
 
 from charts import chart_top_gross_weeks
+from bisect import bisect_left
 
 
 # ----------------------------
@@ -502,16 +503,24 @@ HOLIDAYS: dict[str, Callable[[int], date]] = {
 
 def holiday_week_ending_for_date(all_week_endings: list[date], holiday_dt: date) -> Optional[date]:
     """
-    Choose the week_ending such that holiday_dt is within the 7-day window ending on week_ending:
-      week_start = week_ending - 6 days
+    Use the most recent chart that existed *as of the holiday date*:
+    return the latest week_ending strictly BEFORE holiday_dt.
     """
     if not all_week_endings:
         return None
+
     weeks = sorted(all_week_endings)
+
+    # Find the last week_ending < holiday_dt
+    prev = None
     for we in weeks:
-        if we >= holiday_dt and (we - holiday_dt).days <= 6:
-            return we
-    return min(weeks, key=lambda we: abs((we - holiday_dt).days))
+        if we < holiday_dt:
+            prev = we
+        else:
+            break
+
+    # If holiday is before the first chart we have, fall back to first available
+    return prev if prev is not None else weeks[0]
 
 
 # ----------------------------
