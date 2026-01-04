@@ -248,6 +248,47 @@ def fetch_show_stats(show_id: int) -> pd.DataFrame:
         """,
         (show_id, show_id, show_id, show_id),
     )
+
+
+def fetch_show_weekly_ledger(show_id: int) -> pd.DataFrame:
+    """Weekly ledger for a show that includes bonus-only weeks.
+
+    This is a *time series* view (not just chart appearances): it unions t10_entry gross rows
+    with gross_bonus rows and collapses to one row per week_ending.
+    """
+    return sql_df(
+        """
+        WITH combined AS (
+          SELECT
+            date(week_ending) AS week_ending,
+            COALESCE(gross_millions, 0.0) AS base_gross_millions,
+            0.0 AS bonus_millions
+          FROM t10_entry
+          WHERE show_id = ?
+
+          UNION ALL
+
+          SELECT
+            date(week_ending) AS week_ending,
+            0.0 AS base_gross_millions,
+            COALESCE(bonus_millions, 0.0) AS bonus_millions
+          FROM gross_bonus
+          WHERE show_id = ?
+        )
+        SELECT
+          week_ending,
+          SUM(base_gross_millions) AS base_gross_millions,
+          SUM(bonus_millions) AS bonus_millions,
+          SUM(base_gross_millions + bonus_millions) AS gross_millions
+        FROM combined
+        GROUP BY week_ending
+        ORDER BY date(week_ending) ASC;
+        """,
+        (show_id, show_id),
+    )
+
+
+
 def fetch_company_entries(company: str, filters: FilterSpec, limit: int = 2000) -> pd.DataFrame:
     where, params = build_where(filters, "e")
     sql = f"""
@@ -759,6 +800,14 @@ def tab_show_detail():
             "Avg gross (M)": None if pd.isna(avg_gross) else float(avg_gross),
             "Avg rank": None if pd.isna(avg_rank) else float(avg_rank),
         })
+
+
+    with st.expander("Weekly ledger (includes bonus-only weeks)"):
+        led = fetch_show_weekly_ledger(show_id)
+        if led.empty:
+            st.caption("No ledger rows found for this show.")
+        else:
+            st.dataframe(led, use_container_width=True, hide_index=True)
 
     df = fetch_show_entries(show_id, filters)
     st.dataframe(df, use_container_width=True)
