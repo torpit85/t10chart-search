@@ -15,7 +15,6 @@ import streamlit as st
 import matplotlib.pyplot as plt
 
 from charts import chart_top_gross_weeks
-from bisect import bisect_left
 
 
 # ----------------------------
@@ -207,88 +206,37 @@ def fetch_show_entries(show_id: int, filters: FilterSpec) -> pd.DataFrame:
     return df
 
 def fetch_show_stats(show_id: int) -> pd.DataFrame:
-    """Show-level summary stats.
-
-    Notes:
-      - weeks_on_chart / peak_rank / first/last appearance are based on actual chart rows (t10_entry).
-      - total_gross_millions includes *all* gross bonuses from gross_bonus, even if a bonus lands on a week
-        where the show is not on the chart (no t10_entry row for that week).
-      - avg_gross_millions is computed as total_gross_millions / weeks_on_chart (when weeks_on_chart > 0).
-    """
+    # Stats computed from rows + gross_bonus, so they match gross races / analytics totals.
     return sql_df(
         """
-        WITH
-          chart AS (
-            SELECT date(week_ending) AS we, rank
-            FROM t10_entry
-            WHERE show_id = ?
-          ),
-          base AS (
-            SELECT COALESCE(SUM(COALESCE(gross_millions, 0.0)), 0.0) AS base_gross
-            FROM t10_entry
-            WHERE show_id = ?
-          ),
-          bon AS (
-            SELECT COALESCE(SUM(COALESCE(bonus_millions, 0.0)), 0.0) AS bonus_gross
-            FROM gross_bonus
-            WHERE show_id = ?
-          )
-        SELECT
-          (SELECT COUNT(DISTINCT we) FROM chart) AS weeks_on_chart,
-          (SELECT MIN(rank) FROM chart) AS peak_rank,
-          (SELECT MIN(we) FROM chart) AS first_appearance,
-          (SELECT MAX(we) FROM chart) AS last_appearance,
-          ((SELECT base_gross FROM base) + (SELECT bonus_gross FROM bon)) AS total_gross_millions,
-          CASE
-            WHEN (SELECT COUNT(DISTINCT we) FROM chart) > 0
-            THEN ((SELECT base_gross FROM base) + (SELECT bonus_gross FROM bon)) * 1.0
-                 / (SELECT COUNT(DISTINCT we) FROM chart)
-            ELSE NULL
-          END AS avg_gross_millions,
-          (SELECT AVG(rank) FROM t10_entry WHERE show_id = ?) AS avg_rank
-        """,
-        (show_id, show_id, show_id, show_id),
-    )
-
-
-def fetch_show_weekly_ledger(show_id: int) -> pd.DataFrame:
-    """Weekly ledger for a show that includes bonus-only weeks.
-
-    This is a *time series* view (not just chart appearances): it unions t10_entry gross rows
-    with gross_bonus rows and collapses to one row per week_ending.
-    """
-    return sql_df(
-        """
-        WITH combined AS (
-          SELECT
-            date(week_ending) AS week_ending,
-            COALESCE(gross_millions, 0.0) AS base_gross_millions,
-            0.0 AS bonus_millions
-          FROM t10_entry
-          WHERE show_id = ?
-
-          UNION ALL
-
-          SELECT
-            date(week_ending) AS week_ending,
-            0.0 AS base_gross_millions,
-            COALESCE(bonus_millions, 0.0) AS bonus_millions
+        WITH gb AS (
+          SELECT show_id, week_ending, SUM(bonus_millions) AS bonus_millions
           FROM gross_bonus
-          WHERE show_id = ?
+          GROUP BY show_id, week_ending
+        ),
+        rows AS (
+          SELECT
+            e.week_ending,
+            e.rank,
+            (COALESCE(e.gross_millions, 0) + COALESCE(gb.bonus_millions, 0)) AS gross_millions
+          FROM t10_entry e
+          LEFT JOIN gb
+            ON gb.show_id = e.show_id
+           AND gb.week_ending = e.week_ending
+          WHERE e.show_id = ?
         )
         SELECT
-          week_ending,
-          SUM(base_gross_millions) AS base_gross_millions,
-          SUM(bonus_millions) AS bonus_millions,
-          SUM(base_gross_millions + bonus_millions) AS gross_millions
-        FROM combined
-        GROUP BY week_ending
-        ORDER BY date(week_ending) ASC;
+          COUNT(DISTINCT date(week_ending)) AS weeks_on_chart,
+          MIN(rank) AS peak_rank,
+          MIN(date(week_ending)) AS first_appearance,
+          MAX(date(week_ending)) AS last_appearance,
+          SUM(gross_millions) AS total_gross_millions,
+          AVG(gross_millions) AS avg_gross_millions,
+          AVG(rank) AS avg_rank
+        FROM rows
         """,
-        (show_id, show_id),
+        (show_id,),
     )
-
-
 
 def fetch_company_entries(company: str, filters: FilterSpec, limit: int = 2000) -> pd.DataFrame:
     where, params = build_where(filters, "e")
@@ -491,6 +439,8 @@ def easter_date(year: int) -> date:
 
 HOLIDAYS: dict[str, Callable[[int], date]] = {
     "New Year's Day (Jan 1)": lambda y: date(y, 1, 1),
+    "Martin Luther King Jr. Day (3rd Mon in Jan)": lambda y: nth_weekday_of_month(y, 1, 0, 3),
+    "Presidents Day (3rd Mon in Feb)": lambda y: nth_weekday_of_month(y, 2, 0, 3),
     "Valentine's Day (Feb 14)": lambda y: date(y, 2, 14),
     "Easter (variable)": easter_date,
     "Memorial Day (last Mon in May)": lambda y: last_weekday_of_month(y, 5, 0),
@@ -503,16 +453,20 @@ HOLIDAYS: dict[str, Callable[[int], date]] = {
 
 def holiday_week_ending_for_date(all_week_endings: list[date], holiday_dt: date, holiday_name: str) -> Optional[date]:
     """
+    Choose which chart week_ending to use for a holiday.
+
     Rules:
-    - Fixed-date holidays (New Year's, Valentine's, Independence Day, Halloween, Christmas):
-        * Sun/Mon/Tue/Wed -> previous weekend (Sat before)
-        * Thu/Fri/Sat     -> following weekend (Sat on/after)
-      Example: Jul 4 on Thursday -> use week_ending Jul 6.
-    - Thanksgiving: always use the following week_ending date (the Saturday after Thanksgiving).
-      Example: Thanksgiving 11-23 -> use 11-25.
-    - Weekend/Monday holidays (Easter, Memorial Day, Labor Day): use the weekend that is part of it
-      (the Saturday immediately before the holiday date).
-      Example: Easter 04-17 (Sun) -> use 04-16.
+      - Fixed-date holidays (New Year's, Valentine's, Independence Day, Halloween, Christmas):
+          * If holiday is Sun/Mon/Tue/Wed -> use the previous weekend (Saturday strictly before holiday_dt)
+          * If holiday is Thu/Fri/Sat     -> use the following weekend (first Saturday on/after holiday_dt)
+        Example: Independence Day 07-04 on Thursday -> use the 07-06 chart.
+
+      - Thanksgiving: use the following week_ending date (first Saturday on/after Thanksgiving).
+        Example: Thanksgiving 11-23 -> use the 11-25 chart.
+
+      - Weekend/Monday holidays (Easter, Memorial Day, Labor Day, MLK Day, Presidents Day):
+        use the weekend that the holiday is part of (Saturday strictly before holiday_dt).
+        Example: Easter 04-17 (Sun) -> use the 04-16 chart.
     """
     if not all_week_endings:
         return None
@@ -536,15 +490,18 @@ def holiday_week_ending_for_date(all_week_endings: list[date], holiday_dt: date,
 
     name = (holiday_name or "").strip()
 
-    # Thanksgiving: always the following chart/week_ending
     if name.startswith("Thanksgiving"):
         return next_week_ending(holiday_dt)
 
-    # Weekend/Monday holidays: keep the weekend the holiday is part of (Sat immediately before)
-    if name.startswith("Easter") or name.startswith("Memorial Day") or name.startswith("Labor Day"):
+    if (
+        name.startswith("Easter")
+        or name.startswith("Memorial Day")
+        or name.startswith("Labor Day")
+        or name.startswith("Martin Luther King")
+        or name.startswith("Presidents Day")
+    ):
         return prev_week_ending(holiday_dt)
 
-    # Fixed-date holidays: previous vs following weekend depends on weekday
     fixed = (
         name.startswith("New Year's Day")
         or name.startswith("Valentine's Day")
@@ -554,13 +511,16 @@ def holiday_week_ending_for_date(all_week_endings: list[date], holiday_dt: date,
     )
     if fixed:
         wd = holiday_dt.weekday()  # Mon=0 ... Sun=6
-        if wd in (6, 0, 1, 2):     # Sun/Mon/Tue/Wed
+        if wd in (6, 0, 1, 2):  # Sun/Mon/Tue/Wed
             return prev_week_ending(holiday_dt)
-        else:                      # Thu/Fri/Sat
+        else:  # Thu/Fri/Sat
             return next_week_ending(holiday_dt)
 
-    # Default fallback: previous chart as-of holiday date
+    # Default: previous chart as-of holiday date
     return prev_week_ending(holiday_dt)
+
+
+
 
 # ----------------------------
 # New tab: Grossing Milestones
@@ -828,34 +788,15 @@ def tab_show_detail():
     if not stats.empty:
         s = stats.iloc[0].to_dict()
         c1, c2, c3, c4 = st.columns(4)
-
-        weeks_on = s.get("weeks_on_chart")
-        peak_rank = s.get("peak_rank")
-        first_app = s.get("first_appearance")
-        last_app = s.get("last_appearance")
-
-        c1.metric("Weeks on chart", 0 if pd.isna(weeks_on) else int(weeks_on))
-        c2.metric("Peak rank", "—" if pd.isna(peak_rank) else int(peak_rank))
-        c3.metric("First appearance", "—" if pd.isna(first_app) else str(first_app))
-        c4.metric("Last appearance", "—" if pd.isna(last_app) else str(last_app))
-
-        total_gross = s.get("total_gross_millions")
-        avg_gross = s.get("avg_gross_millions")
-        avg_rank = s.get("avg_rank")
-
+        c1.metric("Weeks on chart", int(s["weeks_on_chart"]))
+        c2.metric("Peak rank", int(s["peak_rank"]))
+        c3.metric("First appearance", str(s["first_appearance"]))
+        c4.metric("Last appearance", str(s["last_appearance"]))
         st.write({
-            "Total gross (M)": 0.0 if pd.isna(total_gross) else float(total_gross),
-            "Avg gross (M)": None if pd.isna(avg_gross) else float(avg_gross),
-            "Avg rank": None if pd.isna(avg_rank) else float(avg_rank),
+            "Total gross (M)": float(s["total_gross_millions"]),
+            "Avg gross (M)": None if pd.isna(s["avg_gross_millions"]) else float(s["avg_gross_millions"]),
+            "Avg rank": float(s["avg_rank"]),
         })
-
-
-    with st.expander("Weekly ledger (includes bonus-only weeks)"):
-        led = fetch_show_weekly_ledger(show_id)
-        if led.empty:
-            st.caption("No ledger rows found for this show.")
-        else:
-            st.dataframe(led, use_container_width=True, hide_index=True)
 
     df = fetch_show_entries(show_id, filters)
     st.dataframe(df, use_container_width=True)
@@ -1660,6 +1601,96 @@ def tab_admin():
             sql_df.clear()
             load_lists.clear()
             st.success(f"Merged '{merge}' into '{keep}'.")
+
+
+st.markdown("### Merge/rename an imprint (company)")
+
+imps_df = sql_df(
+    """
+    SELECT imprint FROM (
+      SELECT DISTINCT TRIM(imprint_1) AS imprint
+      FROM t10_entry
+      WHERE imprint_1 IS NOT NULL AND TRIM(imprint_1) != ''
+      UNION
+      SELECT DISTINCT TRIM(imprint_2) AS imprint
+      FROM t10_entry
+      WHERE imprint_2 IS NOT NULL AND TRIM(imprint_2) != ''
+    )
+    WHERE imprint IS NOT NULL AND TRIM(imprint) != ''
+    ORDER BY imprint COLLATE NOCASE
+    """
+)
+
+imprints = imps_df["imprint"].tolist() if not imps_df.empty else []
+if not imprints:
+    st.info("No imprints found in t10_entry.")
+else:
+    c1, c2 = st.columns(2)
+    with c1:
+        imp_from = st.selectbox("From (imprint to merge/rename)", imprints, key="imp_from")
+    with c2:
+        target_mode = st.radio("Target", ["Existing imprint", "New imprint"], horizontal=True, key="imp_target_mode")
+        if target_mode == "Existing imprint":
+            imp_to = st.selectbox("To (target imprint)", imprints, key="imp_to_existing")
+        else:
+            imp_to = st.text_input("To (new imprint name)", key="imp_to_new", placeholder="Type the new imprint name").strip()
+
+    if imp_from:
+        cnt_df = sql_df(
+            "SELECT COUNT(*) AS n FROM t10_entry WHERE imprint_1 = ? OR imprint_2 = ?",
+            (imp_from, imp_from),
+        )
+        n_rows = int(cnt_df["n"].iloc[0]) if not cnt_df.empty else 0
+        st.caption(f"Rows affected (imprint_1 or imprint_2 = '{imp_from}'): {n_rows:,}")
+
+    if st.button("Merge imprint across all entries"):
+        if not imp_from:
+            st.error("Pick a source imprint.")
+        elif not imp_to:
+            st.error("Pick or enter a target imprint.")
+        elif imp_from == imp_to:
+            st.error("Pick two different imprint names.")
+        else:
+            con = get_con()
+            try:
+                cur = con.cursor()
+                cur.execute("BEGIN;")
+
+                cur.execute("UPDATE t10_entry SET imprint_1 = ? WHERE imprint_1 = ?", (imp_to, imp_from))
+                cur.execute("UPDATE t10_entry SET imprint_2 = ? WHERE imprint_2 = ?", (imp_to, imp_from))
+
+                # Clean up blanks
+                cur.execute("UPDATE t10_entry SET imprint_1 = NULL WHERE imprint_1 IS NOT NULL AND TRIM(imprint_1) = ''")
+                cur.execute("UPDATE t10_entry SET imprint_2 = NULL WHERE imprint_2 IS NOT NULL AND TRIM(imprint_2) = ''")
+
+                # If both imprints are identical after merge, drop imprint_2
+                cur.execute(
+                    """
+                    UPDATE t10_entry
+                    SET imprint_2 = NULL
+                    WHERE imprint_1 IS NOT NULL AND imprint_2 IS NOT NULL
+                      AND TRIM(imprint_1) = TRIM(imprint_2)
+                    """
+                )
+
+                # If imprint_1 is empty but imprint_2 is present, shift up
+                cur.execute(
+                    """
+                    UPDATE t10_entry
+                    SET imprint_1 = imprint_2, imprint_2 = NULL
+                    WHERE (imprint_1 IS NULL OR TRIM(imprint_1) = '')
+                      AND imprint_2 IS NOT NULL AND TRIM(imprint_2) != ''
+                    """
+                )
+
+                con.commit()
+            finally:
+                con.close()
+
+            sql_df.clear()
+            load_lists.clear()
+            st.success(f"Merged imprint '{imp_from}' -> '{imp_to}'.")
+
 
     st.markdown("### View aliases for a show")
     show_for_aliases = st.selectbox("Show", titles, key="alias_list_show")
