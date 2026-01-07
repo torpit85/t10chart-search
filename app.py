@@ -1692,6 +1692,13 @@ else:
             st.success(f"Merged imprint '{imp_from}' -> '{imp_to}'.")
 
 
+    # Safety: (re)build titles list here so it is always defined for the alias viewer
+    titles = (
+        shows["canonical_title"].astype(str).tolist()
+        if isinstance(shows, pd.DataFrame) and "canonical_title" in shows.columns
+        else []
+    )
+
     st.markdown("### View aliases for a show")
     show_for_aliases = st.selectbox("Show", titles, key="alias_list_show")
     show_id = int(shows.loc[shows["canonical_title"] == show_for_aliases, "show_id"].iloc[0])
