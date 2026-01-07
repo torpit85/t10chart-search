@@ -1691,20 +1691,20 @@ else:
             load_lists.clear()
             st.success(f"Merged imprint '{imp_from}' -> '{imp_to}'.")
 
-
-    # Safety: (re)build titles list here so it is always defined for the alias viewer
-    titles = (
-        shows["canonical_title"].astype(str).tolist()
-        if isinstance(shows, pd.DataFrame) and "canonical_title" in shows.columns
-        else []
-    )
-
-    st.markdown("### View aliases for a show")
-    show_for_aliases = st.selectbox("Show", titles, key="alias_list_show")
-    show_id = int(shows.loc[shows["canonical_title"] == show_for_aliases, "show_id"].iloc[0])
-    alias_df = sql_df("SELECT alias_title FROM show_alias WHERE show_id = ? ORDER BY alias_title", (show_id,))
-    st.dataframe(alias_df, use_container_width=True)
-
+    # View aliases for a show
+    # (Re)load the show list here so the alias viewer never depends on outer-scope variables.
+    shows = sql_df("SELECT show_id, canonical_title FROM show ORDER BY canonical_title")
+    if shows.empty:
+        st.info("No shows found in the database.")
+    else:
+        titles = shows["canonical_title"].astype(str).tolist()
+        show_for_aliases = st.selectbox("Show", titles, key="alias_list_show")
+        show_id = int(shows.loc[shows["canonical_title"] == show_for_aliases, "show_id"].iloc[0])
+        alias_df = sql_df(
+            "SELECT alias_title FROM show_alias WHERE show_id = ? ORDER BY alias_title",
+            (show_id,),
+        )
+        st.dataframe(alias_df, use_container_width=True)
 
 # ----------------------------
 # Main
