@@ -15,7 +15,6 @@ import streamlit as st
 import matplotlib.pyplot as plt
 
 from charts import chart_top_gross_weeks
-from bisect import bisect_left
 
 
 # ----------------------------
@@ -23,9 +22,6 @@ from bisect import bisect_left
 # ----------------------------
 APP_TITLE = "T-10 Chart Search Engine"
 DB_PATH = Path(__file__).with_name("t10.sqlite")
-
-# Gross tracking starts the week ending March 17, 2001
-GROSS_TRACKING_START = date(2001, 3, 17)
 
 # For streaks when week_number is missing/spotty
 CONSECUTIVE_DAY_TOLERANCE = (6, 8)  # inclusive
@@ -207,88 +203,7 @@ def fetch_show_entries(show_id: int, filters: FilterSpec) -> pd.DataFrame:
     return df
 
 def fetch_show_stats(show_id: int) -> pd.DataFrame:
-    """Show-level summary stats.
-
-    Notes:
-      - weeks_on_chart / peak_rank / first/last appearance are based on actual chart rows (t10_entry).
-      - total_gross_millions includes *all* gross bonuses from gross_bonus, even if a bonus lands on a week
-        where the show is not on the chart (no t10_entry row for that week).
-      - avg_gross_millions is computed as total_gross_millions / weeks_on_chart (when weeks_on_chart > 0).
-    """
-    return sql_df(
-        """
-        WITH
-          chart AS (
-            SELECT date(week_ending) AS we, rank
-            FROM t10_entry
-            WHERE show_id = ?
-          ),
-          base AS (
-            SELECT COALESCE(SUM(COALESCE(gross_millions, 0.0)), 0.0) AS base_gross
-            FROM t10_entry
-            WHERE show_id = ?
-          ),
-          bon AS (
-            SELECT COALESCE(SUM(COALESCE(bonus_millions, 0.0)), 0.0) AS bonus_gross
-            FROM gross_bonus
-            WHERE show_id = ?
-          )
-        SELECT
-          (SELECT COUNT(DISTINCT we) FROM chart) AS weeks_on_chart,
-          (SELECT MIN(rank) FROM chart) AS peak_rank,
-          (SELECT MIN(we) FROM chart) AS first_appearance,
-          (SELECT MAX(we) FROM chart) AS last_appearance,
-          ((SELECT base_gross FROM base) + (SELECT bonus_gross FROM bon)) AS total_gross_millions,
-          CASE
-            WHEN (SELECT COUNT(DISTINCT we) FROM chart) > 0
-            THEN ((SELECT base_gross FROM base) + (SELECT bonus_gross FROM bon)) * 1.0
-                 / (SELECT COUNT(DISTINCT we) FROM chart)
-            ELSE NULL
-          END AS avg_gross_millions,
-          (SELECT AVG(rank) FROM t10_entry WHERE show_id = ?) AS avg_rank
-        """,
-        (show_id, show_id, show_id, show_id),
-    )
-
-
-def fetch_show_weekly_ledger(show_id: int) -> pd.DataFrame:
-    """Weekly ledger for a show that includes bonus-only weeks.
-
-    This is a *time series* view (not just chart appearances): it unions t10_entry gross rows
-    with gross_bonus rows and collapses to one row per week_ending.
-    """
-    return sql_df(
-        """
-        WITH combined AS (
-          SELECT
-            date(week_ending) AS week_ending,
-            COALESCE(gross_millions, 0.0) AS base_gross_millions,
-            0.0 AS bonus_millions
-          FROM t10_entry
-          WHERE show_id = ?
-
-          UNION ALL
-
-          SELECT
-            date(week_ending) AS week_ending,
-            0.0 AS base_gross_millions,
-            COALESCE(bonus_millions, 0.0) AS bonus_millions
-          FROM gross_bonus
-          WHERE show_id = ?
-        )
-        SELECT
-          week_ending,
-          SUM(base_gross_millions) AS base_gross_millions,
-          SUM(bonus_millions) AS bonus_millions,
-          SUM(base_gross_millions + bonus_millions) AS gross_millions
-        FROM combined
-        GROUP BY week_ending
-        ORDER BY date(week_ending) ASC;
-        """,
-        (show_id, show_id),
-    )
-
-
+    return sql_df("SELECT * FROM v_show_stats WHERE show_id = ?", (show_id,))
 
 def fetch_company_entries(company: str, filters: FilterSpec, limit: int = 2000) -> pd.DataFrame:
     where, params = build_where(filters, "e")
@@ -491,7 +406,9 @@ def easter_date(year: int) -> date:
 
 HOLIDAYS: dict[str, Callable[[int], date]] = {
     "New Year's Day (Jan 1)": lambda y: date(y, 1, 1),
+    "Martin Luther King Jr. Day (3rd Mon in Jan)": lambda y: nth_weekday_of_month(y, 1, 0, 3),
     "Valentine's Day (Feb 14)": lambda y: date(y, 2, 14),
+    "Presidents Day (3rd Mon in Feb)": lambda y: nth_weekday_of_month(y, 2, 0, 3),
     "Easter (variable)": easter_date,
     "Memorial Day (last Mon in May)": lambda y: last_weekday_of_month(y, 5, 0),
     "Independence Day (Jul 4)": lambda y: date(y, 7, 4),
@@ -503,46 +420,63 @@ HOLIDAYS: dict[str, Callable[[int], date]] = {
 
 def holiday_week_ending_for_date(all_week_endings: list[date], holiday_dt: date, holiday_name: str) -> Optional[date]:
     """
+    Choose which chart week_ending to use for a given holiday.
+
     Rules:
-    - Fixed-date holidays (New Year's, Valentine's, Independence Day, Halloween, Christmas):
-        * Sun/Mon/Tue/Wed -> previous weekend (Sat before)
-        * Thu/Fri/Sat     -> following weekend (Sat on/after)
-      Example: Jul 4 on Thursday -> use week_ending Jul 6.
-    - Thanksgiving: always use the following week_ending date (the Saturday after Thanksgiving).
-      Example: Thanksgiving 11-23 -> use 11-25.
-    - Weekend/Monday holidays (Easter, Memorial Day, Labor Day): use the weekend that is part of it
-      (the Saturday immediately before the holiday date).
-      Example: Easter 04-17 (Sun) -> use 04-16.
+    1) Fixed-date holidays (New Year's, Valentine's, Independence Day, Halloween, Christmas):
+       - If holiday falls on Sunday/Monday/Tuesday/Wednesday -> use previous weekend (Saturday before)
+       - If holiday falls on Thursday/Friday/Saturday -> use following weekend (Saturday on/after)
+       Example: Independence Day (07-04) on Thursday -> use week_ending 07-06.
+
+    2) Thanksgiving:
+       - Use the following week_ending date (Saturday after Thanksgiving).
+       Example: Thanksgiving 11-23 -> use 11-25.
+
+    3) Weekend/Monday holidays (Easter, Memorial Day, Labor Day, MLK Day, Presidents Day):
+       - Use the weekend the holiday is a part of (Saturday before).
+       Example: Easter 04-17 -> use 04-16.
+
+    Fallback: if the computed week_ending isn't present, use the nearest available week_ending date.
     """
     if not all_week_endings:
         return None
 
     weeks = sorted(all_week_endings)
 
-    def prev_week_ending(d: date) -> date:
+    def prev_week_ending(d: date) -> Optional[date]:
         prev = None
         for we in weeks:
             if we < d:
                 prev = we
             else:
                 break
-        return prev if prev is not None else weeks[0]
+        return prev
 
-    def next_week_ending(d: date) -> date:
+    def next_week_ending(d: date) -> Optional[date]:
         for we in weeks:
             if we >= d:
                 return we
-        return weeks[-1]
+        return None
 
     name = (holiday_name or "").strip()
 
-    # Thanksgiving: always the following chart/week_ending
+    # Thanksgiving: always following chart/week ending
     if name.startswith("Thanksgiving"):
-        return next_week_ending(holiday_dt)
+        we = next_week_ending(holiday_dt)
+        if we is not None:
+            return we
 
-    # Weekend/Monday holidays: keep the weekend the holiday is part of (Sat immediately before)
-    if name.startswith("Easter") or name.startswith("Memorial Day") or name.startswith("Labor Day"):
-        return prev_week_ending(holiday_dt)
+    # Weekend/Monday-style holidays: use Saturday before
+    if (
+        name.startswith("Easter")
+        or name.startswith("Memorial Day")
+        or name.startswith("Labor Day")
+        or name.startswith("Martin Luther King")
+        or name.startswith("Presidents Day")
+    ):
+        we = prev_week_ending(holiday_dt)
+        if we is not None:
+            return we
 
     # Fixed-date holidays: previous vs following weekend depends on weekday
     fixed = (
@@ -555,12 +489,22 @@ def holiday_week_ending_for_date(all_week_endings: list[date], holiday_dt: date,
     if fixed:
         wd = holiday_dt.weekday()  # Mon=0 ... Sun=6
         if wd in (6, 0, 1, 2):     # Sun/Mon/Tue/Wed
-            return prev_week_ending(holiday_dt)
-        else:                      # Thu/Fri/Sat
-            return next_week_ending(holiday_dt)
+            we = prev_week_ending(holiday_dt)
+            if we is not None:
+                return we
+        else:                       # Thu/Fri/Sat
+            we = next_week_ending(holiday_dt)
+            if we is not None:
+                return we
 
     # Default fallback: previous chart as-of holiday date
-    return prev_week_ending(holiday_dt)
+    we = prev_week_ending(holiday_dt)
+    if we is not None:
+        return we
+
+    # Final fallback: nearest
+    return min(weeks, key=lambda we: abs((we - holiday_dt).days))
+
 
 # ----------------------------
 # New tab: Grossing Milestones
@@ -828,34 +772,15 @@ def tab_show_detail():
     if not stats.empty:
         s = stats.iloc[0].to_dict()
         c1, c2, c3, c4 = st.columns(4)
-
-        weeks_on = s.get("weeks_on_chart")
-        peak_rank = s.get("peak_rank")
-        first_app = s.get("first_appearance")
-        last_app = s.get("last_appearance")
-
-        c1.metric("Weeks on chart", 0 if pd.isna(weeks_on) else int(weeks_on))
-        c2.metric("Peak rank", "—" if pd.isna(peak_rank) else int(peak_rank))
-        c3.metric("First appearance", "—" if pd.isna(first_app) else str(first_app))
-        c4.metric("Last appearance", "—" if pd.isna(last_app) else str(last_app))
-
-        total_gross = s.get("total_gross_millions")
-        avg_gross = s.get("avg_gross_millions")
-        avg_rank = s.get("avg_rank")
-
+        c1.metric("Weeks on chart", int(s["weeks_on_chart"]))
+        c2.metric("Peak rank", int(s["peak_rank"]))
+        c3.metric("First appearance", str(s["first_appearance"]))
+        c4.metric("Last appearance", str(s["last_appearance"]))
         st.write({
-            "Total gross (M)": 0.0 if pd.isna(total_gross) else float(total_gross),
-            "Avg gross (M)": None if pd.isna(avg_gross) else float(avg_gross),
-            "Avg rank": None if pd.isna(avg_rank) else float(avg_rank),
+            "Total gross (M)": float(s["total_gross_millions"]),
+            "Avg gross (M)": None if pd.isna(s["avg_gross_millions"]) else float(s["avg_gross_millions"]),
+            "Avg rank": float(s["avg_rank"]),
         })
-
-
-    with st.expander("Weekly ledger (includes bonus-only weeks)"):
-        led = fetch_show_weekly_ledger(show_id)
-        if led.empty:
-            st.caption("No ledger rows found for this show.")
-        else:
-            st.dataframe(led, use_container_width=True, hide_index=True)
 
     df = fetch_show_entries(show_id, filters)
     st.dataframe(df, use_container_width=True)
@@ -1126,6 +1051,12 @@ def tab_analytics():
     st.markdown("### Rank vs Gross (scatter)")
     plot_scatter(dg["rank"].astype(float), dg[gross_col].astype(float), "Rank", gross_label)
 
+    st.markdown("### Top shows by total gross")
+    top_shows = dg.groupby("canonical_title", as_index=False)["gross_millions"].sum()
+    top_shows = top_shows.sort_values("gross_millions", ascending=False).head(int(top_n))
+    st.dataframe(top_shows, use_container_width=True)
+    plot_barh(top_shows["canonical_title"][::-1], top_shows["gross_millions"][::-1], "Total Gross (Millions)", "Show")
+
     st.markdown("### Top companies by total gross")
     top_comp = dg.groupby("company", as_index=False)["gross_millions"].sum()
     top_comp = top_comp.sort_values("gross_millions", ascending=False).head(int(top_n))
@@ -1145,287 +1076,6 @@ def tab_analytics():
     plt.tight_layout()
     st.pyplot(fig)
     plt.close(fig)
-
-
-
-# ----------------------------
-# New tab: Gross Races
-# ----------------------------
-@st.cache_data(show_spinner=False)
-def _load_gross_races_base(db_path: str, db_mtime: float) -> pd.DataFrame:
-    """Weekly gross (including annual+quarter bonuses) per show. db_mtime busts cache on DB updates."""
-    con = sqlite3.connect(db_path)
-    try:
-        df = pd.read_sql_query(
-            """
-            WITH combined AS (
-              -- Base weekly gross rows
-              SELECT
-                date(e.week_ending) AS week_ending,
-                e.show_id AS show_id,
-                COALESCE(e.gross_millions, 0.0) AS base_gross_millions,
-                0.0 AS bonus_millions
-              FROM t10_entry e
-              WHERE e.gross_millions IS NOT NULL
-
-              UNION ALL
-
-              -- Bonus rows (include even if show wasn't on chart that week)
-              SELECT
-                date(gb.week_ending) AS week_ending,
-                gb.show_id AS show_id,
-                0.0 AS base_gross_millions,
-                COALESCE(gb.bonus_millions, 0.0) AS bonus_millions
-              FROM gross_bonus gb
-              WHERE gb.bonus_type IN ('annual', 'quarter')
-            )
-            SELECT
-              c.week_ending,
-              c.show_id,
-              s.canonical_title AS canonical_title,
-              SUM(c.base_gross_millions) AS base_gross_millions,
-              SUM(c.bonus_millions) AS bonus_millions,
-              SUM(c.base_gross_millions + c.bonus_millions) AS gross_millions
-            FROM combined c
-            JOIN show s ON s.show_id = c.show_id
-            GROUP BY c.week_ending, c.show_id, s.canonical_title
-            ORDER BY c.show_id, c.week_ending
-            """,
-            con,
-        )
-    finally:
-        con.close()
-
-    if df.empty:
-        return df
-
-    df["week_ending"] = _as_date_str(df["week_ending"])
-    df["week_ending_dt"] = pd.to_datetime(df["week_ending"], errors="coerce")
-    df = df.dropna(subset=["week_ending_dt", "show_id", "canonical_title"]).copy()
-
-    # Ensure numeric
-    for col in ("base_gross_millions", "bonus_millions", "gross_millions"):
-        df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
-
-    # If anything still duplicates (shouldn't), collapse safely
-    df = (
-        df.groupby(["show_id", "canonical_title", "week_ending"], as_index=False)[
-            ["base_gross_millions", "bonus_millions", "gross_millions"]
-        ]
-        .sum()
-        .sort_values(["show_id", "week_ending"])
-        .reset_index(drop=True)
-    )
-    df["week_ending_dt"] = pd.to_datetime(df["week_ending"], errors="coerce")
-    return df
-
-def _plot_multi_line(dates: list[pd.Timestamp], series_by_label: dict[str, pd.Series], xlabel: str, ylabel: str):
-    fig = plt.figure()
-    for label, y in series_by_label.items():
-        plt.plot(dates, y, label=label)
-    plt.xlabel(xlabel)
-    plt.ylabel(ylabel)
-    plt.legend()
-    plt.tight_layout()
-    st.pyplot(fig)
-    plt.close(fig)
-
-
-def _year_cumulative(base: pd.DataFrame, year: int, through_dt: pd.Timestamp) -> tuple[pd.DataFrame, list[pd.Timestamp]]:
-    ydf = base[base["week_ending_dt"].dt.year == year].copy()
-    ydf = ydf[ydf["week_ending_dt"] <= through_dt].copy()
-    if ydf.empty:
-        return ydf, []
-
-    ydf = ydf.sort_values(["show_id", "week_ending_dt"]).reset_index(drop=True)
-    ydf["cum_gross_millions"] = ydf.groupby("show_id")["gross_millions"].cumsum()
-
-    weeks = sorted(ydf["week_ending_dt"].dropna().unique().tolist())
-    return ydf, weeks
-
-
-def _quarter_cumulative(base: pd.DataFrame, year: int, quarter: int, through_week_dt: pd.Timestamp) -> tuple[pd.DataFrame, list[pd.Timestamp]]:
-    q = int(quarter)
-    start_month = (q - 1) * 3 + 1
-    end_month = start_month + 2
-
-    qdf = base[(base["week_ending_dt"].dt.year == year)].copy()
-    qdf = qdf[(qdf["week_ending_dt"].dt.month >= start_month) & (qdf["week_ending_dt"].dt.month <= end_month)].copy()
-    qdf = qdf[qdf["week_ending_dt"] <= through_week_dt].copy()
-
-    if qdf.empty:
-        return qdf, []
-
-    qdf = qdf.sort_values(["show_id", "week_ending_dt"]).reset_index(drop=True)
-    qdf["cum_gross_millions"] = qdf.groupby("show_id")["gross_millions"].cumsum()
-
-    weeks = sorted(qdf["week_ending_dt"].dropna().unique().tolist())
-    return qdf, weeks
-
-
-def tab_gross_races():
-    st.subheader("Gross Races")
-    st.caption("All charts on this page include weekly gross **plus all gross bonuses** (annual + quarter bonuses included via gross_bonus).")
-
-    if not DB_PATH.exists():
-        st.error(f"Database not found at {DB_PATH}.")
-        return
-
-    db_mtime = DB_PATH.stat().st_mtime
-    base = _load_gross_races_base(str(DB_PATH), db_mtime)
-    if base.empty:
-        st.info("No gross data found.")
-        return
-
-    base["week_ending_dt"] = pd.to_datetime(base["week_ending"], errors="coerce")
-    # Exclude pre-gross-tracking years (you started tracking grosses the week ending 2001-03-17)
-    base = base[base["week_ending_dt"] >= pd.Timestamp(GROSS_TRACKING_START)].copy()
-    if base.empty:
-        st.info("No gross rows found on/after the gross-tracking start date (2001-03-17).")
-        return
-
-    latest_dt = pd.to_datetime(base["week_ending_dt"].max())
-    latest_date = latest_dt.date()
-
-    # -------------------------
-    # 1) All-Time Gross Races Chart (unlimited rank)
-    # -------------------------
-    st.markdown("### All-Time Gross Races Chart")
-    all_time = base.groupby("canonical_title", as_index=False)["gross_millions"].sum()
-    all_time = all_time[all_time["gross_millions"] > 0].copy()
-    all_time = all_time.sort_values("gross_millions", ascending=False).reset_index(drop=True)
-    all_time.insert(0, "rank", np.arange(1, len(all_time) + 1))
-
-    st.caption("Unlimited rank: every show with any gross is included.")
-    st.dataframe(all_time, use_container_width=True, hide_index=True)
-
-    with st.expander("Optional: visualize the leaders (bar chart)"):
-        top_plot = st.slider("How many shows to display in the bar chart", 5, min(200, int(len(all_time))), min(50, int(len(all_time))))
-        top_block = all_time.head(int(top_plot)).copy()
-        plot_barh(top_block["canonical_title"][::-1], top_block["gross_millions"][::-1], "Total Gross (Millions)", "Show")
-
-    st.divider()
-
-    # -------------------------
-    # 2) Annual Gross Races
-    # -------------------------
-    st.markdown("### Annual Gross Races")
-    st.caption("Cumulative grosses reset at the start of each year.")
-
-    pick_dt = st.date_input(
-        "As-of date (pick any date to view that year's race)",
-        value=latest_date,
-        min_value=GROSS_TRACKING_START,
-        max_value=latest_date,
-        key="annual_race_date"
-    )
-    pick_ts = pd.to_datetime(pick_dt)
-
-    ydf, weeks = _year_cumulative(base, int(pick_dt.year), pick_ts)
-    if ydf.empty:
-        st.info("No gross rows found for that year (through the selected date).")
-    else:
-        # Leaderboard as-of date
-        last = ydf.sort_values(["show_id", "week_ending_dt"]).groupby(["show_id", "canonical_title"], as_index=False).tail(1)
-        leaders = last[["canonical_title", "cum_gross_millions"]].copy()
-        leaders = leaders.sort_values("cum_gross_millions", ascending=False).reset_index(drop=True)
-        leaders.insert(0, "rank", np.arange(1, len(leaders) + 1))
-
-        st.caption(f"Leaderboard for **{pick_dt.year}** (through **{pick_dt.isoformat()}**)")
-        st.dataframe(leaders, use_container_width=True, hide_index=True)
-
-        # Line chart for top K at the selected date
-        top_k = st.slider("Shows to plot (annual)", 2, min(50, int(len(leaders))), min(10, int(len(leaders))))
-        top_titles = leaders.head(int(top_k))["canonical_title"].tolist()
-
-        piv = ydf[ydf["canonical_title"].isin(top_titles)].copy()
-        piv = piv.pivot_table(index="week_ending_dt", columns="canonical_title", values="cum_gross_millions", aggfunc="max").sort_index()
-        piv = piv.reindex(pd.to_datetime(weeks)).ffill()
-
-        series_by_label = {c: piv[c] for c in piv.columns}
-        _plot_multi_line(list(piv.index), series_by_label, "Week Ending", "Cumulative Gross (Millions)")
-
-    st.divider()
-
-    # -------------------------
-    # 3) Quarter Gross Races
-    # -------------------------
-    st.markdown("### Quarter Gross Races")
-    st.caption("Cumulative grosses reset at the start of each quarter.")
-
-    # Default to the current quarter/year based on latest week ending
-    cur_year = int(latest_dt.year)
-    cur_quarter = int(((latest_dt.month - 1) // 3) + 1)
-
-    q1, q2, q3 = st.columns([1, 2, 2])
-    with q1:
-        quarter = st.selectbox("Quarter", options=[1, 2, 3, 4], index=cur_quarter - 1, key="q_race_quarter")
-    with q2:
-        # Years available for this quarter
-        start_month = (int(quarter) - 1) * 3 + 1
-        end_month = start_month + 2
-        years_avail = (
-            base[(base["week_ending_dt"].dt.month >= start_month) & (base["week_ending_dt"].dt.month <= end_month)]["week_ending_dt"]
-            .dt.year.dropna().astype(int).unique().tolist()
-        )
-        years_avail = sorted(set(years_avail))
-        if not years_avail:
-            years_avail = [cur_year]
-        year_pick = st.selectbox("Year", options=years_avail, index=years_avail.index(cur_year) if cur_year in years_avail else len(years_avail) - 1, key="q_race_year")
-
-    # Week dropdown depends on quarter/year selection
-    start_month = (int(quarter) - 1) * 3 + 1
-    end_month = start_month + 2
-    q_weeks = base[(base["week_ending_dt"].dt.year == int(year_pick))].copy()
-    q_weeks = q_weeks[(q_weeks["week_ending_dt"].dt.month >= start_month) & (q_weeks["week_ending_dt"].dt.month <= end_month)].copy()
-    q_week_list = sorted(pd.to_datetime(q_weeks["week_ending_dt"].dropna().unique()))
-    q_week_list = [pd.to_datetime(x).normalize() for x in q_week_list]
-
-    if not q_week_list:
-        st.info("No weeks found for that quarter/year.")
-        return
-
-    latest_norm = pd.to_datetime(latest_dt).normalize()
-
-    # Default week: latest week if it's in this quarter/year, else last week of that quarter
-    default_week_idx = len(q_week_list) - 1
-    if (latest_norm.year == int(year_pick)) and (latest_norm in q_week_list):
-        default_week_idx = q_week_list.index(latest_norm)
-
-    with q3:
-        wk_num = st.selectbox(
-            "Week",
-            options=list(range(1, len(q_week_list) + 1)),
-            index=default_week_idx,
-            format_func=lambda i: f"Week {i}",
-            key="q_race_week",
-        )
-
-    wk_dt = pd.to_datetime(q_week_list[int(wk_num) - 1])
-    st.caption(f"Selected week ending: **{wk_dt.date().isoformat()}**")
-
-    qdf, qweeks = _quarter_cumulative(base, int(year_pick), int(quarter), wk_dt)
-    if qdf.empty:
-        st.info("No gross rows found for that quarter (through the selected week).")
-        return
-
-    lastq = qdf.sort_values(["show_id", "week_ending_dt"]).groupby(["show_id", "canonical_title"], as_index=False).tail(1)
-    leaders_q = lastq[["canonical_title", "cum_gross_millions"]].copy()
-    leaders_q = leaders_q.sort_values("cum_gross_millions", ascending=False).reset_index(drop=True)
-    leaders_q.insert(0, "rank", np.arange(1, len(leaders_q) + 1))
-
-    st.caption(f"Leaderboard for **Q{int(quarter)} {int(year_pick)}** (through **{wk_dt.date().isoformat()}**)")
-    st.dataframe(leaders_q, use_container_width=True, hide_index=True)
-
-    top_kq = st.slider("Shows to plot (quarter)", 2, min(50, int(len(leaders_q))), min(10, int(len(leaders_q))), key="q_race_topk")
-    top_titles_q = leaders_q.head(int(top_kq))["canonical_title"].tolist()
-
-    pivq = qdf[qdf["canonical_title"].isin(top_titles_q)].copy()
-    pivq = pivq.pivot_table(index="week_ending_dt", columns="canonical_title", values="cum_gross_millions", aggfunc="max").sort_index()
-    pivq = pivq.reindex(pd.to_datetime(qweeks)).ffill()
-
-    series_by_label_q = {c: pivq[c] for c in pivq.columns}
-    _plot_multi_line(list(pivq.index), series_by_label_q, "Week Ending", "Cumulative Gross (Millions)")
 
 
 # ----------------------------
@@ -1532,8 +1182,8 @@ def tab_holidays():
 
         we_str = we.isoformat()
 
-        # date(e.week_ending)=? handles cases where week_ending has a time component
-        top = sql_df("""
+        top = sql_df(
+            """
             SELECT
               s.canonical_title,
               e.pos,
@@ -1552,21 +1202,24 @@ def tab_holidays():
             WHERE date(e.week_ending) = ?
               AND e.rank = 1
             ORDER BY e.pos ASC, s.canonical_title ASC
-        """, (we_str,))
+            """,
+            (we_str,),
+        )
 
         if top.empty:
-            rows_out.append({
-                "year": y,
-                "holiday_date": hdt.isoformat(),
-                "week_ending": we_str,
-                "#1_show(s)": None,
-                "imprint_1": None,
-                "imprint_2": None,
-                "gross_millions_sum": None,
-            })
+            rows_out.append(
+                {
+                    "year": y,
+                    "holiday_date": hdt.isoformat(),
+                    "week_ending": we_str,
+                    "#1_show(s)": None,
+                    "imprint_1": None,
+                    "imprint_2": None,
+                    "gross_millions_sum": None,
+                }
+            )
             continue
 
-        # If ties: join titles
         titles = top["canonical_title"].astype(str).tolist()
         im1 = top["imprint_1"].astype("string").fillna("").replace("", pd.NA).dropna().unique().tolist()
         im2 = top["imprint_2"].astype("string").fillna("").replace("", pd.NA).dropna().unique().tolist()
@@ -1574,15 +1227,17 @@ def tab_holidays():
         gross = pd.to_numeric(top["gross_millions"], errors="coerce").dropna()
         gross_sum = float(gross.sum()) if len(gross) else None
 
-        rows_out.append({
-            "year": y,
-            "holiday_date": hdt.isoformat(),
-            "week_ending": we_str,
-            "#1_show(s)": " / ".join(titles),
-            "imprint_1": " / ".join(im1) if im1 else None,
-            "imprint_2": " / ".join(im2) if im2 else None,
-            "gross_millions_sum": gross_sum,
-        })
+        rows_out.append(
+            {
+                "year": y,
+                "holiday_date": hdt.isoformat(),
+                "week_ending": we_str,
+                "#1_show(s)": " / ".join(titles),
+                "imprint_1": " / ".join(im1) if im1 else None,
+                "imprint_2": " / ".join(im2) if im2 else None,
+                "gross_millions_sum": gross_sum,
+            }
+        )
 
     out = pd.DataFrame(rows_out).sort_values("year")
     st.dataframe(out, use_container_width=True)
@@ -1596,8 +1251,11 @@ def tab_holidays():
 
     with st.expander("How the holiday week is chosen"):
         st.write(
-            "- The holiday is assigned to the chart week whose Week Ending is the first date on/after the holiday, within 6 days.\n"
-            "- If no such week exists, the closest Week Ending date is used."
+            "- Fixed-date holidays (New Year's, Valentine's, Independence Day, Halloween, Christmas):\n"
+            "  - Sun/Mon/Tue/Wed → previous weekend (Saturday before)\n"
+            "  - Thu/Fri/Sat → following weekend (Saturday on/after)\n"
+            "- Thanksgiving → following week ending (Saturday after)\n"
+            "- Easter/Memorial Day/Labor Day/MLK Day/Presidents Day → Saturday before\n"
         )
 
 
@@ -1661,6 +1319,44 @@ def tab_admin():
             load_lists.clear()
             st.success(f"Merged '{merge}' into '{keep}'.")
 
+    st.markdown("### Merge two imprints (relabel imprint_1 / imprint_2)")
+    imprints_df = sql_df("""
+        SELECT imprint FROM (
+            SELECT imprint_1 AS imprint FROM t10_entry WHERE imprint_1 IS NOT NULL AND imprint_1 <> ''
+            UNION
+            SELECT imprint_2 AS imprint FROM t10_entry WHERE imprint_2 IS NOT NULL AND imprint_2 <> ''
+        )
+        ORDER BY imprint
+    """)
+    imprints = imprints_df["imprint"].astype(str).tolist() if not imprints_df.empty else []
+
+    if not imprints:
+        st.info("No imprints found in the database.")
+    else:
+        ic1, ic2 = st.columns(2)
+        with ic1:
+            keep_imp = st.selectbox("Keep imprint (target)", imprints, key="imprint_keep")
+        with ic2:
+            src_imp = st.selectbox("Merge imprint (source)", imprints, key="imprint_src")
+
+        if st.button("Merge these imprints"):
+            if keep_imp == src_imp:
+                st.error("Pick two different imprints.")
+            else:
+                con = get_con()
+                try:
+                    cur = con.cursor()
+                    cur.execute("BEGIN;")
+                    cur.execute("UPDATE t10_entry SET imprint_1 = ? WHERE imprint_1 = ?", (keep_imp, src_imp))
+                    cur.execute("UPDATE t10_entry SET imprint_2 = ? WHERE imprint_2 = ?", (keep_imp, src_imp))
+                    con.commit()
+                finally:
+                    con.close()
+
+                # Refresh cached lists / queries
+                st.cache_data.clear()
+                st.success(f"Merged imprint '{src_imp}' into '{keep_imp}'.")
+
     st.markdown("### View aliases for a show")
     show_for_aliases = st.selectbox("Show", titles, key="alias_list_show")
     show_id = int(shows.loc[shows["canonical_title"] == show_for_aliases, "show_id"].iloc[0])
@@ -1677,7 +1373,7 @@ def main():
     st.caption("SQLite + FTS search, per-show analytics, company analytics, and movement/grossing charts. (Ties supported.)")
 
     # Original tabs + 2 new tabs inserted before Admin (so Admin stays last)
-    tabs = st.tabs(["Search", "Show Detail", "Compare Two Shows", "Companies", "Analytics", "Gross Races", "Grossing Milestones", "Streak Analytics", "Holidays", "Admin"])
+    tabs = st.tabs(["Search", "Show Detail", "Compare Two Shows", "Companies", "Analytics", "Grossing Milestones", "Streak Analytics", "Holidays", "Admin"])
     with tabs[0]:
         tab_search()
     with tabs[1]:
@@ -1689,16 +1385,13 @@ def main():
     with tabs[4]:
         tab_analytics()
     with tabs[5]:
-        tab_gross_races()
-    with tabs[6]:
         tab_grossing_milestones()
-    with tabs[7]:
+    with tabs[6]:
         tab_streak_analytics()
-    with tabs[8]:
+    with tabs[7]:
         tab_holidays()
-    with tabs[9]:
+    with tabs[8]:
         tab_admin()
-
 
 
 if __name__ == "__main__":
