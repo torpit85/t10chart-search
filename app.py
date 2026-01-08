@@ -1790,6 +1790,18 @@ with st.expander("Merge/rename an imprint", expanded=False):
                     pass
                 st.rerun()
 
+
+    # Safety: refresh lists here so titles/shows are always defined (and up-to-date)
+    try:
+        shows, _ = load_lists()
+    except Exception:
+        shows = pd.DataFrame(columns=["show_id", "canonical_title"])
+    titles = (
+        shows["canonical_title"].astype(str).tolist()
+        if isinstance(shows, pd.DataFrame) and "canonical_title" in shows.columns
+        else []
+    )
+
     st.markdown("### View aliases for a show")
     show_for_aliases = st.selectbox("Show", titles, key="alias_list_show")
     show_id = int(shows.loc[shows["canonical_title"] == show_for_aliases, "show_id"].iloc[0])
