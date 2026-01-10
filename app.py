@@ -1129,6 +1129,46 @@ def tab_analytics():
     if st.checkbox("Show Top Gross Weeks"):
         chart_top_gross_weeks(weekly, n=20)
 
+    st.markdown("### Weekly average gross over time")
+    weekly_avg = (
+        dg.groupby("week_ending", as_index=False)
+          .agg(
+              total_gross_millions=(gross_col, "sum"),
+              n_shows=(gross_col, "count"),
+          )
+          .sort_values("week_ending")
+    )
+    weekly_avg["avg_gross_millions"] = weekly_avg["total_gross_millions"] / weekly_avg["n_shows"].replace(0, np.nan)
+    plot_line_dates(
+        weekly_avg["week_ending"],
+        weekly_avg["avg_gross_millions"],
+        "Week Ending",
+        "Average Gross per Show (Millions)",
+    )
+
+    if st.checkbox("Show Top Average Gross Weeks"):
+        top_avg = (
+            weekly_avg.dropna(subset=["avg_gross_millions"])
+            .sort_values("avg_gross_millions", ascending=False)
+            .head(20)
+            .copy()
+        )
+        top_avg.insert(0, "#", range(1, len(top_avg) + 1))
+        st.dataframe(
+            top_avg[
+                ["#", "week_ending", "avg_gross_millions", "n_shows", "total_gross_millions"]
+            ].rename(
+                columns={
+                    "week_ending": "Week Ending",
+                    "avg_gross_millions": "Avg Gross (Millions)",
+                    "n_shows": "# Shows",
+                    "total_gross_millions": "Total Gross (Millions)",
+                }
+            ),
+            use_container_width=True,
+        )
+
+
     st.markdown("### Rolling average total gross")
     win = st.slider("Rolling window (weeks)", 2, 52, 13)
     w2 = weekly.copy()
@@ -1273,22 +1313,78 @@ def _month_cumulative(base: pd.DataFrame, year: int, month: int, through_dt: pd.
 
 
 def _quarter_cumulative(base: pd.DataFrame, year: int, quarter: int, through_week_dt: pd.Timestamp) -> tuple[pd.DataFrame, list[pd.Timestamp]]:
+    """Cumulative gross for a calendar quarter through a selected chart week.
+
+    Bonus rows (annual + quarter) are attributed to the *ending period* and applied on the
+    quarter's final chart week. This avoids "missing" bonuses when the bonus week_ending
+    date falls just outside the quarter or when the quarter has fewer chart weeks.
+    """
     q = int(quarter)
     start_month = (q - 1) * 3 + 1
     end_month = start_month + 2
 
-    qdf = base[(base["week_ending_dt"].dt.year == year)].copy()
-    qdf = qdf[(qdf["week_ending_dt"].dt.month >= start_month) & (qdf["week_ending_dt"].dt.month <= end_month)].copy()
-    qdf = qdf[qdf["week_ending_dt"] <= through_week_dt].copy()
+    q_all = base[base["week_ending_dt"].dt.year == year].copy()
+    q_all = q_all[(q_all["week_ending_dt"].dt.month >= start_month) & (q_all["week_ending_dt"].dt.month <= end_month)].copy()
+    if q_all.empty:
+        return q_all, []
 
+    # Chart weeks = weeks where the show had a base gross row (ignore bonus-only rows)
+    chart_weeks = (
+        q_all.loc[q_all["base_gross_millions"].fillna(0.0) > 0.0, "week_ending_dt"]
+        .dropna()
+        .unique()
+        .tolist()
+    )
+    weeks = sorted(pd.to_datetime(chart_weeks))
+    if not weeks:
+        return q_all.head(0).copy(), []
+
+    last_week_dt = pd.to_datetime(max(weeks))
+    through_week_dt = pd.to_datetime(through_week_dt)
+
+    # Through selected week
+    qdf = q_all[q_all["week_ending_dt"] <= through_week_dt].copy()
     if qdf.empty:
-        return qdf, []
+        weeks_through = [pd.to_datetime(x) for x in weeks if pd.to_datetime(x) <= through_week_dt]
+        return qdf, weeks_through
+
+    # Use base gross for within-quarter weeks; bonuses are applied on the quarter's final chart week.
+    qdf["bonus_millions"] = 0.0
+    qdf["gross_millions"] = qdf["base_gross_millions"]
+
+    if through_week_dt >= last_week_dt:
+        bonus = base[base["bonus_millions"] > 0.0].copy()
+        if not bonus.empty:
+            # Attribute bonus to the period that ended one chart-week earlier (handles "spillover" dates).
+            bonus["attrib_dt"] = bonus["week_ending_dt"] - pd.Timedelta(days=7)
+            bonus["attrib_year"] = bonus["attrib_dt"].dt.year
+            bonus["attrib_quarter"] = ((bonus["attrib_dt"].dt.month - 1) // 3) + 1
+            bonus = bonus[(bonus["attrib_year"] == year) & (bonus["attrib_quarter"] == q)].copy()
+
+        if not bonus.empty:
+            bonus_sum = bonus.groupby(["show_id", "canonical_title"], as_index=False)["bonus_millions"].sum()
+            bonus_sum["week_ending_dt"] = last_week_dt
+            bonus_sum["week_ending"] = last_week_dt.date().isoformat()
+            bonus_sum["base_gross_millions"] = 0.0
+            bonus_sum["gross_millions"] = bonus_sum["bonus_millions"]
+
+            # Append and collapse duplicates on the quarter-end week
+            qdf = pd.concat([qdf, bonus_sum], ignore_index=True, sort=False)
+            qdf = (
+                qdf.groupby(["show_id", "canonical_title", "week_ending"], as_index=False)[
+                    ["base_gross_millions", "bonus_millions", "gross_millions"]
+                ]
+                .sum()
+                .sort_values(["show_id", "week_ending"])
+                .reset_index(drop=True)
+            )
+            qdf["week_ending_dt"] = pd.to_datetime(qdf["week_ending"], errors="coerce")
 
     qdf = qdf.sort_values(["show_id", "week_ending_dt"]).reset_index(drop=True)
     qdf["cum_gross_millions"] = qdf.groupby("show_id")["gross_millions"].cumsum()
 
-    weeks = sorted(qdf["week_ending_dt"].dropna().unique().tolist())
-    return qdf, weeks
+    weeks_through = [pd.to_datetime(x) for x in weeks if pd.to_datetime(x) <= through_week_dt]
+    return qdf, weeks_through
 
 
 def tab_gross_races():
@@ -1456,6 +1552,7 @@ def tab_gross_races():
     end_month = start_month + 2
     q_weeks = base[(base["week_ending_dt"].dt.year == int(year_pick))].copy()
     q_weeks = q_weeks[(q_weeks["week_ending_dt"].dt.month >= start_month) & (q_weeks["week_ending_dt"].dt.month <= end_month)].copy()
+    q_weeks = q_weeks[q_weeks["base_gross_millions"] > 0.0].copy()
     q_week_list = sorted(pd.to_datetime(q_weeks["week_ending_dt"].dropna().unique()))
     q_week_list = [pd.to_datetime(x).normalize() for x in q_week_list]
 
