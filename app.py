@@ -1980,7 +1980,7 @@ def tab_records_achievements():
     if n1_gross.empty:
         st.info("No #1 rows found.")
     else:
-        # Precompute weekly lineups for "Perfect" checks
+        # Precompute weekly lineups for "Perfect" checks (only when a full top-10 exists).
         week_lineups: dict[str, tuple] = {}
         try:
             top10 = base[base["rank"].between(1, 10)].copy()
@@ -1988,43 +1988,93 @@ def tab_records_achievements():
                 g = g.sort_values("rank")
                 lineup = tuple(g["show_id"].tolist())
                 if len(lineup) == 10:
-                    week_lineups[wk] = lineup
+                    week_lineups[str(wk)] = lineup
         except Exception:
             week_lineups = {}
 
+        # "Consecutive charts" means consecutive entries in the ordered list of chart weeks
+        # present in the database (ignore date gaps / skipped weeks).
+        n1_week = base[base["rank"].eq(1)].copy()
+        n1_week = n1_week.sort_values(["week_ending_dt", "week_number"], na_position="last")
+
+        week_order = (
+            base[["week_ending", "week_ending_dt"]]
+            .drop_duplicates()
+            .sort_values("week_ending_dt")
+            .reset_index(drop=True)
+        )
+
+        # week -> list of #1 show_ids (ties allowed)
+        week_n1 = (
+            n1_week.groupby("week_ending")["show_id"]
+            .apply(lambda s: sorted({int(x) for x in s.dropna().tolist()}))
+            .rename("show_ids")
+            .reset_index()
+        )
+
+        week_meta = week_order.merge(week_n1, on="week_ending", how="left")
+        week_meta["show_ids"] = week_meta["show_ids"].apply(lambda v: v if isinstance(v, list) else [])
+
+        # show_id -> canonical_title lookup
+        title_lookup = (
+            base[["show_id", "canonical_title"]]
+            .dropna()
+            .drop_duplicates(subset=["show_id"])
+            .set_index("show_id")["canonical_title"]
+            .to_dict()
+        )
+
+        # Quick lookup of #1 gross per week per show (no bonuses) for summing 3-week totals
+        n1_gross_lookup = n1_week.drop_duplicates(subset=["week_ending", "show_id"])[
+            ["week_ending", "show_id", "gross_millions"]
+        ].copy()
+
         hat_rows: list[dict[str, Any]] = []
-        for (sid, title), g in n1.groupby(["show_id", "canonical_title"], sort=False):
-            g = g.sort_values(["week_number", "week_ending_dt"]).reset_index(drop=True)
-            if len(g) < 3:
-                continue
 
-            if g["week_number"].notna().all():
-                cont = _consecutive_by_week_number(g["week_number"])
-            else:
-                cont = _consecutive_by_date(g["week_ending"])
+        # Track streaks per show_id across consecutive chart weeks where that show appears at #1
+        # (ties allowed). Record a hat trick only when a show FIRST reaches 3 consecutive charts at #1.
+        streak_len_by_sid: dict[int, int] = {}
+        streak_weeks_by_sid: dict[int, list[str]] = {}
 
-            cur_len = 1
-            cur_start = 0
-            for i in range(1, len(g) + 1):
-                if i < len(g) and cont[i - 1]:
-                    cur_len += 1
-                    continue
+        for _, wkrow in week_meta.iterrows():
+            wk = str(wkrow["week_ending"])
+            n1_sids = wkrow["show_ids"]
 
-                if cur_len >= 3:
-                    block = g.iloc[cur_start:cur_start + 3].copy()
-                    weeks = [str(x) for x in block["week_ending"].tolist()]
-                    completed_week = str(block.iloc[2]["week_ending"])
+            # End streaks for shows that are no longer #1 this chart week
+            active = set(streak_len_by_sid.keys())
+            present = set(n1_sids)
+            for sid in list(active - present):
+                streak_len_by_sid.pop(sid, None)
+                streak_weeks_by_sid.pop(sid, None)
 
-                    # #2 show on completed week
+            # Advance streaks for shows that are #1 this week (including ties)
+            for sid in n1_sids:
+                prev_len = streak_len_by_sid.get(sid, 0)
+                prev_weeks = streak_weeks_by_sid.get(sid, [])
+                new_len = prev_len + 1
+                new_weeks = (prev_weeks + [wk])[-3:]
+
+                streak_len_by_sid[sid] = new_len
+                streak_weeks_by_sid[sid] = new_weeks
+
+                # Only record once per streak, when it FIRST reaches 3.
+                if new_len == 3:
+                    weeks = new_weeks[:]  # 3 consecutive chart weeks (in chart order)
+                    completed_week = weeks[-1]
+                    title = title_lookup.get(sid, str(sid))
+
+                    # #2 show on completed week (may not exist if ranks skip due to tie-at-#1)
                     sec = base[(base["week_ending"].eq(completed_week)) & (base["rank"].eq(2))]
                     sec_title = str(sec.iloc[0]["canonical_title"]) if not sec.empty else ""
 
                     status = ""
-                    if len(weeks) == 3 and all(w in week_lineups for w in weeks):
+                    if all(w in week_lineups for w in weeks):
                         if week_lineups[weeks[0]] == week_lineups[weeks[1]] == week_lineups[weeks[2]]:
                             status = "Perfect"
+
                     if status == "":
-                        sec_ids = []
+                        # "Shutout" means the #2 show is the same for all three weeks (when rank==2 exists).
+                        sec_ids: list[int] = []
                         ok = True
                         for w in weeks:
                             s2 = base[(base["week_ending"].eq(w)) & (base["rank"].eq(2))]
@@ -2037,24 +2087,25 @@ def tab_records_achievements():
 
                     gross3 = None
                     try:
-                        if block["gross_millions"].isna().any():
-                            gross3 = None
-                        else:
-                            gross3 = float(block["gross_millions"].sum())
+                        g3 = n1_gross_lookup[
+                            (n1_gross_lookup["show_id"].eq(sid))
+                            & (n1_gross_lookup["week_ending"].isin(weeks))
+                        ]["gross_millions"]
+                        if (len(g3) == 3) and (not g3.isna().any()):
+                            gross3 = float(g3.sum())
                     except Exception:
                         gross3 = None
 
-                    pair = title if not sec_title else f"{title}/{sec_title}"
-                    hat_rows.append({
-                        "#1 Show/#2 Show": pair,
-                        "Hat Trick Status": status,
-                        "Hat Trick Week": completed_week,
-                        "Total Grosses (in millions)": fmt_millions(gross3) if gross3 is not None else "",
-                        "_completed_dt": pd.to_datetime(completed_week),
-                    })
-
-                cur_len = 1
-                cur_start = i
+                    pair = str(title) if not sec_title else f"{title}/{sec_title}"
+                    hat_rows.append(
+                        {
+                            "#1 Show/#2 Show": pair,
+                            "Hat Trick Status": status,
+                            "Hat Trick Week": _fmt_date(completed_week),
+                            "Total Grosses (in millions)": fmt_millions(gross3) if gross3 is not None else "",
+                            "_completed_dt": pd.to_datetime(completed_week),
+                        }
+                    )
 
         hat = pd.DataFrame(hat_rows)
         if hat.empty:
@@ -2067,9 +2118,6 @@ def tab_records_achievements():
 
     st.divider()
 
-    # -------------------------
-    # 5) Highest gross for each position (no ties)
-    # -------------------------
     st.markdown("### Record grosses for positions (no ties)")
     pos_rows: list[dict[str, Any]] = []
     for r in range(1, 11):
