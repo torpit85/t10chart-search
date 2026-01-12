@@ -4,6 +4,7 @@ from __future__ import annotations
 import re
 import sqlite3
 import subprocess
+import shutil
 import tempfile
 import zipfile
 from dataclasses import dataclass
@@ -168,28 +169,57 @@ def compute_sheet_date(year_base: int, quarter: int, sheetname: str) -> Optional
 # LibreOffice conversion
 # -------------------------------------------------------------------
 def libreoffice_convert_xls_to_xlsx(xls_path: Path, outdir: Path) -> Path:
+    """Convert .xls to .xlsx.
+
+    Tries LibreOffice (soffice/libreoffice) first, then Gnumeric (ssconvert).
+    Raises a clear error if no converter is available.
+    """
     outdir.mkdir(parents=True, exist_ok=True)
-    profile = Path(tempfile.mkdtemp(prefix="lo_profile_"))
-    cmd = [
-        "soffice",
-        "--headless",
-        f"-env:UserInstallation=file://{profile}",
-        "--convert-to",
-        "xlsx",
-        "--outdir",
-        str(outdir),
-        str(xls_path),
-    ]
-    result = subprocess.run(cmd, check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    if result.returncode != 0:
-        print("LibreOffice conversion failed.")
-        print("STDOUT:", result.stdout)
-        print("STDERR:", result.stderr)
-        raise RuntimeError(f"Failed to convert {xls_path} to xlsx.")
-    xlsx_path = outdir / (xls_path.stem + ".xlsx")
-    if not xlsx_path.exists():
-        raise FileNotFoundError(f"Expected converted file not found: {xlsx_path}")
-    return xlsx_path
+
+    soffice_bin = shutil.which("soffice") or shutil.which("libreoffice")
+    if soffice_bin:
+        profile = Path(tempfile.mkdtemp(prefix="lo_profile_"))
+        cmd = [
+            soffice_bin,
+            "--headless",
+            f"-env:UserInstallation=file://{profile}",
+            "--convert-to",
+            "xlsx",
+            "--outdir",
+            str(outdir),
+            str(xls_path),
+        ]
+        result = subprocess.run(cmd, check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        if result.returncode != 0:
+            print("LibreOffice conversion failed.")
+            print("STDOUT:", result.stdout)
+            print("STDERR:", result.stderr)
+            raise RuntimeError(f"Failed to convert {xls_path} to xlsx with LibreOffice.")
+        xlsx_path = outdir / (xls_path.stem + ".xlsx")
+        if not xlsx_path.exists():
+            raise FileNotFoundError(f"Expected converted file not found: {xlsx_path}")
+        return xlsx_path
+
+    ssconvert_bin = shutil.which("ssconvert")
+    if ssconvert_bin:
+        xlsx_path = outdir / (xls_path.stem + ".xlsx")
+        cmd = [ssconvert_bin, str(xls_path), str(xlsx_path)]
+        result = subprocess.run(cmd, check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        if result.returncode != 0:
+            print("ssconvert conversion failed.")
+            print("STDOUT:", result.stdout)
+            print("STDERR:", result.stderr)
+            raise RuntimeError(f"Failed to convert {xls_path} to xlsx with ssconvert.")
+        if not xlsx_path.exists():
+            raise FileNotFoundError(f"Expected converted file not found: {xlsx_path}")
+        return xlsx_path
+
+    raise FileNotFoundError(
+        "No XLS converter found. Install one of:\n"
+        "  - LibreOffice: sudo apt update && sudo apt install -y libreoffice\n"
+        "  - Gnumeric (ssconvert): sudo apt update && sudo apt install -y gnumeric\n"
+        "Then re-run the import."
+    )
 
 
 # -------------------------------------------------------------------
@@ -416,7 +446,10 @@ def parse_2025_workbook(xlsx_path: Path, seq_base: int) -> tuple[pd.DataFrame, i
 def get_con(db_path: Path) -> sqlite3.Connection:
     con = sqlite3.connect(str(db_path))
     con.execute("PRAGMA foreign_keys = ON;")
+    # Ensure alias table exists (prevents duplicate show rows across minor title variations)
+    ensure_show_alias_schema(con)
     return con
+
 
 
 def ensure_pos_schema(con: sqlite3.Connection) -> None:
@@ -437,26 +470,100 @@ def ensure_pos_schema(con: sqlite3.Connection) -> None:
     if not unique_indexes:
         print("WARNING: Could not verify UNIQUE index for (week_ending,pos). Continuing anyway.")
 
+def _title_clean_for_storage(x: Any) -> str:
+    """Normalize title text we store and compare (preserve meaning, remove formatting noise)."""
+    s = _clean_text(x) or ""
+    # normalize curly quotes + whitespace/newlines
+    s = (
+        s.replace("\u2019", "'")
+        .replace("\u2018", "'")
+        .replace("\u201C", '"')
+        .replace("\u201D", '"')
+        .replace("\r", " ")
+        .replace("\n", " ")
+    )
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+def _title_norm_key(x: Any) -> str:
+    """Aggressive key for matching aliases (case/whitespace/punctuation-insensitive)."""
+    s = _title_clean_for_storage(x).casefold()
+    s = s.replace("&", " and ")
+    s = re.sub(r"[\u2013\u2014]", "-", s)  # en/em dash -> hyphen
+    # keep alnum + a few separators; drop other punctuation
+    s = re.sub(r"[^0-9a-z\s:'\-!?.]", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+def ensure_show_alias_schema(con: sqlite3.Connection) -> None:
+    """
+    Ensure show_alias exists and supports normalized lookups.
+    This allows the importer to map minor title variants back to a single show_id,
+    preventing duplicates from reappearing after imports.
+    """
+    con.execute(
+        """
+        CREATE TABLE IF NOT EXISTS show_alias (
+            alias_title TEXT PRIMARY KEY,
+            show_id     INTEGER NOT NULL
+        )
+        """
+    )
+    # Add alias_norm if missing (older DBs)
+    cols = [r[1] for r in con.execute("PRAGMA table_info(show_alias);").fetchall()]
+    if "alias_norm" not in cols:
+        con.execute("ALTER TABLE show_alias ADD COLUMN alias_norm TEXT;")
+    # Helpful indexes (idempotent)
+    con.execute("CREATE INDEX IF NOT EXISTS idx_show_alias_show_id ON show_alias(show_id);")
+    # alias_norm should be unique when present
+    con.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_show_alias_norm ON show_alias(alias_norm) "
+        "WHERE alias_norm IS NOT NULL AND alias_norm <> '';"
+    )
+
 
 def get_or_create_show_id(con: sqlite3.Connection, raw_title: str) -> int:
     cur = con.cursor()
-    row = cur.execute("SELECT show_id FROM show_alias WHERE alias_title = ?", (raw_title,)).fetchone()
+
+    title_clean = _title_clean_for_storage(raw_title)
+    title_norm = _title_norm_key(title_clean)
+
+    # 1) Alias lookup (exact or normalized)
+    row = cur.execute(
+        "SELECT show_id FROM show_alias WHERE alias_title = ? OR alias_norm = ?",
+        (title_clean, title_norm),
+    ).fetchone()
     if row:
         return int(row[0])
 
-    row = cur.execute("SELECT show_id FROM show WHERE canonical_title = ?", (raw_title,)).fetchone()
+    # 2) Exact canonical title lookup
+    row = cur.execute("SELECT show_id FROM show WHERE canonical_title = ?", (title_clean,)).fetchone()
     if row:
-        return int(row[0])
+        show_id = int(row[0])
+        # record alias so future imports map back
+        cur.execute(
+            "INSERT OR IGNORE INTO show_alias(alias_title, alias_norm, show_id) VALUES (?,?,?)",
+            (title_clean, title_norm, show_id),
+        )
+        return show_id
 
-    cur.execute("INSERT INTO show(canonical_title) VALUES (?)", (raw_title,))
-    return int(cur.lastrowid)
+    # 3) Create new show + alias
+    cur.execute("INSERT INTO show(canonical_title) VALUES (?)", (title_clean,))
+    show_id = int(cur.lastrowid)
+    cur.execute(
+        "INSERT OR IGNORE INTO show_alias(alias_title, alias_norm, show_id) VALUES (?,?,?)",
+        (title_clean, title_norm, show_id),
+    )
+    return show_id
 
 
 def upsert_entry(con: sqlite3.Connection, rec: dict[str, Any]) -> None:
     """
     UPSERT keyed to UNIQUE(week_ending, pos) to support ties.
     """
-    raw_title = _clean_text(rec.get("raw_title")) or ""
+    raw_title = _title_clean_for_storage(rec.get("raw_title")) or ""
     show_id = get_or_create_show_id(con, raw_title)
 
     gross = rec.get("gross_millions")
