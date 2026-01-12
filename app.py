@@ -1312,6 +1312,60 @@ def _month_cumulative(base: pd.DataFrame, year: int, month: int, through_dt: pd.
     return mdf, weeks
 
 
+
+def _month_28_cycle_start(through_dt: pd.Timestamp) -> pd.Timestamp:
+    """Return the cycle start for your 28th→27th 'T-25 month'."""
+    dt = pd.to_datetime(through_dt)
+    d = dt.date()
+    if d.day >= 28:
+        start = date(d.year, d.month, 28)
+    else:
+        if d.month == 1:
+            start = date(d.year - 1, 12, 28)
+        else:
+            start = date(d.year, d.month - 1, 28)
+    return pd.Timestamp(start)
+
+
+def _month_28_cycle_end(start_dt: pd.Timestamp) -> pd.Timestamp:
+    """Return the cycle end (27th of the following month) for a given 28th start."""
+    s = pd.to_datetime(start_dt).date()
+    if s.month == 12:
+        end = date(s.year + 1, 1, 27)
+    else:
+        end = date(s.year, s.month + 1, 27)
+    return pd.Timestamp(end)
+
+
+def _month_28_cycle_label(start_dt: pd.Timestamp) -> str:
+    """Label the cycle by its ending month (Dec 28 → Jan 27 is 'January')."""
+    s = pd.to_datetime(start_dt).date()
+    if s.month == 12:
+        y, m = s.year + 1, 1
+    else:
+        y, m = s.year, s.month + 1
+    return date(y, m, 1).strftime("%B %Y")
+
+
+def _month_28_cumulative(
+    base: pd.DataFrame, through_dt: pd.Timestamp
+) -> tuple[pd.DataFrame, list[pd.Timestamp], pd.Timestamp, pd.Timestamp]:
+    """Cumulative gross for the 28th→27th month cycle through a selected date."""
+    through_dt = pd.to_datetime(through_dt)
+    start_dt = _month_28_cycle_start(through_dt)
+    end_dt = _month_28_cycle_end(start_dt)
+
+    mdf = base[(base["week_ending_dt"] >= start_dt) & (base["week_ending_dt"] <= through_dt)].copy()
+    if mdf.empty:
+        return mdf, [], start_dt, end_dt
+
+    mdf = mdf.sort_values(["show_id", "week_ending_dt"]).reset_index(drop=True)
+    mdf["cum_gross_millions"] = mdf.groupby("show_id")["gross_millions"].cumsum()
+
+    weeks = sorted(mdf["week_ending_dt"].dropna().unique().tolist())
+    return mdf, weeks, start_dt, end_dt
+
+
 def _quarter_cumulative(base: pd.DataFrame, year: int, quarter: int, through_week_dt: pd.Timestamp) -> tuple[pd.DataFrame, list[pd.Timestamp]]:
     """Cumulative gross for a calendar quarter through a selected chart week.
 
@@ -1476,20 +1530,19 @@ def tab_gross_races():
     # 2B) Monthly Gross Races
     # -------------------------
     st.markdown("### Monthly Gross Races")
-    st.caption("Cumulative grosses reset at the start of each month.")
+    st.caption("Cumulative grosses reset on the 28th (cycle runs 28th → 27th).")
 
-    # Use a dropdown of available week-ending dates (like the annual selector), defaulting to the latest week.
-    avail_dates = sorted(pd.to_datetime(base["week_ending_dt"].dropna().unique()).date)
-    pick_m_date = st.selectbox(
-        "As-of week (pick a week-ending date; the race resets for that month)",
-        options=avail_dates,
-        index=len(avail_dates) - 1,
-        format_func=lambda d: d.isoformat(),
+    # Use the same date-picker pattern as Annual Gross Races.
+    pick_m_dt = st.date_input(
+        "As-of date (pick any date; cycle runs 28th → 27th)",
+        value=latest_date,
+        min_value=GROSS_TRACKING_START,
+        max_value=latest_date,
         key="monthly_race_date",
     )
-    pick_m_ts = pd.Timestamp(pick_m_date)
+    pick_m_ts = pd.to_datetime(pick_m_dt)
 
-    mdf, mweeks = _month_cumulative(base, int(pick_m_ts.year), int(pick_m_ts.month), pick_m_ts)
+    mdf, mweeks, cycle_start, cycle_end = _month_28_cumulative(base, pick_m_ts)
     if mdf.empty:
         st.info("No gross rows found for that month (through the selected date).")
     else:
@@ -1503,8 +1556,8 @@ def tab_gross_races():
         leadersm = leadersm.sort_values("cum_gross_millions", ascending=False).reset_index(drop=True)
         leadersm.insert(0, "rank", np.arange(1, len(leadersm) + 1))
 
-        month_label = pick_m_ts.strftime("%B %Y")
-        st.caption(f"Leaderboard for **{month_label}** (through **{pick_m_ts.date().isoformat()}**)")
+        month_label = _month_28_cycle_label(cycle_start)
+        st.caption(f"Leaderboard for **{month_label}** (cycle **{cycle_start.date().isoformat()}** → **{cycle_end.date().isoformat()}**, through **{pick_m_ts.date().isoformat()}**)")
         st.dataframe(leadersm, use_container_width=True, hide_index=True)
 
         # Line chart for top K at the selected date
