@@ -2589,7 +2589,8 @@ def tab_admin():
             load_lists.clear()
             st.success(f"Merged '{merge}' into '{keep}'.")
 
-    
+    st.markdown('---')
+    st.markdown('')
     st.markdown("### Merge imprint labels (relabel imprint_1 / imprint_2)")
     with st.expander("Merge/rename an imprint", expanded=False):
         st.caption("Replaces one imprint label with another across all weeks (both imprint_1 and imprint_2).")
@@ -2678,6 +2679,8 @@ def tab_admin():
                     st.rerun()
 
 
+
+    
     # Safety: refresh lists here so titles/shows are always defined (and up-to-date)
     try:
         shows, _ = load_lists()
@@ -2689,6 +2692,231 @@ def tab_admin():
         else []
     )
 
+    st.markdown("### Set imprints for a show")
+    with st.expander("Add / fix imprints for one show", expanded=False):
+        st.caption(
+            "Set imprint_1 and/or imprint_2 for a specific show across its weeks. "
+            "This keeps both imprints when they differ (no forced consolidation)."
+        )
+
+        if not titles:
+            st.info("No shows found.")
+        else:
+            sel_title = st.selectbox("Show", titles, key="imp_set_show")
+            sel_id = int(shows.loc[shows["canonical_title"] == sel_title, "show_id"].iloc[0])
+
+            stats = sql_df(
+                """
+                SELECT
+                  COUNT(*) AS weeks,
+                  SUM(CASE
+                        WHEN (imprint_1 IS NULL OR TRIM(imprint_1) = '')
+                         AND (imprint_2 IS NULL OR TRIM(imprint_2) = '')
+                        THEN 1 ELSE 0 END) AS missing_both,
+                  SUM(CASE
+                        WHEN (imprint_1 IS NULL OR TRIM(imprint_1) = '')
+                         AND (imprint_2 IS NOT NULL AND TRIM(imprint_2) <> '')
+                        THEN 1 ELSE 0 END) AS missing_imprint_1,
+                  SUM(CASE
+                        WHEN (imprint_2 IS NULL OR TRIM(imprint_2) = '')
+                         AND (imprint_1 IS NOT NULL AND TRIM(imprint_1) <> '')
+                        THEN 1 ELSE 0 END) AS missing_imprint_2
+                FROM t10_entry
+                WHERE show_id = ?
+                """,
+                (sel_id,),
+            )
+            if not stats.empty:
+                s_weeks = 0 if pd.isna(stats.loc[0,'weeks']) else int(stats.loc[0,'weeks'])
+                s_missing_both = 0 if pd.isna(stats.loc[0,'missing_both']) else int(stats.loc[0,'missing_both'])
+                s_missing_1 = 0 if pd.isna(stats.loc[0,'missing_imprint_1']) else int(stats.loc[0,'missing_imprint_1'])
+                s_missing_2 = 0 if pd.isna(stats.loc[0,'missing_imprint_2']) else int(stats.loc[0,'missing_imprint_2'])
+                st.write(
+                    f"Weeks: **{s_weeks}** · "
+                    f"Missing both: **{s_missing_both}** · "
+                    f"Missing imprint_1: **{s_missing_1}** · "
+                    f"Missing imprint_2: **{s_missing_2}**"
+                )
+
+
+            st.markdown("**Current imprint pairs in the data**")
+            cur_pairs = sql_df(
+                """
+                SELECT DISTINCT
+                  COALESCE(NULLIF(TRIM(imprint_1), ''), '(blank)') AS imprint_1,
+                  COALESCE(NULLIF(TRIM(imprint_2), ''), '(blank)') AS imprint_2
+                FROM t10_entry
+                WHERE show_id = ?
+                ORDER BY imprint_1, imprint_2
+                """,
+                (sel_id,),
+            )
+            st.dataframe(cur_pairs, use_container_width=True, hide_index=True)
+
+            c1, c2 = st.columns(2)
+            with c1:
+                new_imp1 = st.text_input("Set imprint_1 to (optional)", value="", key="imp_set_1").strip()
+            with c2:
+                new_imp2 = st.text_input("Set imprint_2 to (optional)", value="", key="imp_set_2").strip()
+
+            mode = st.radio(
+                "Apply mode",
+                ["Fill missing only", "Overwrite existing (dangerous)"],
+                index=0,
+                horizontal=True,
+                key="imp_set_mode",
+            )
+
+            if mode == "Fill missing only":
+                st.caption("Tip: leave a field blank to avoid changing that imprint column.")
+                fill_both = st.checkbox(
+                    "Fill weeks where BOTH imprints are blank",
+                    value=True,
+                    key="imp_set_fill_both",
+                )
+                fill1 = st.checkbox(
+                    "Also fill imprint_1 when blank (even if imprint_2 is present)",
+                    value=False,
+                    key="imp_set_fill1",
+                )
+                fill2 = st.checkbox(
+                    "Also fill imprint_2 when blank (even if imprint_1 is present)",
+                    value=False,
+                    key="imp_set_fill2",
+                )
+                confirm_ok = True
+            else:
+                confirm_ok = st.checkbox(
+                    "I understand this will overwrite imprints for ALL weeks of this show.",
+                    value=False,
+                    key="imp_set_confirm_overwrite",
+                )
+                fill_both = fill1 = fill2 = False  # not used
+
+            if st.button("Apply imprint update", type="primary", key="imp_set_apply"):
+                if not confirm_ok:
+                    st.warning("Please confirm overwrite to proceed.")
+                elif not (new_imp1 or new_imp2):
+                    st.warning("Enter at least one imprint value to apply.")
+                else:
+                    con = get_con()
+                    try:
+                        cur = con.cursor()
+                        cur.execute("BEGIN;")
+
+                        # Helper: conditions
+                        cond_both_blank = (
+                            "(imprint_1 IS NULL OR TRIM(imprint_1) = '') "
+                            "AND (imprint_2 IS NULL OR TRIM(imprint_2) = '')"
+                        )
+                        cond_i1_blank_i2_present = (
+                            "(imprint_1 IS NULL OR TRIM(imprint_1) = '') "
+                            "AND (imprint_2 IS NOT NULL AND TRIM(imprint_2) <> '')"
+                        )
+                        cond_i2_blank_i1_present = (
+                            "(imprint_2 IS NULL OR TRIM(imprint_2) = '') "
+                            "AND (imprint_1 IS NOT NULL AND TRIM(imprint_1) <> '')"
+                        )
+
+                        if mode == "Fill missing only":
+                            if fill_both:
+                                if new_imp1:
+                                    cur.execute(
+                                        f"UPDATE t10_entry SET imprint_1 = ? WHERE show_id = ? AND {cond_both_blank}",
+                                        (new_imp1, sel_id),
+                                    )
+                                if new_imp2:
+                                    cur.execute(
+                                        f"UPDATE t10_entry SET imprint_2 = ? WHERE show_id = ? AND {cond_both_blank}",
+                                        (new_imp2, sel_id),
+                                    )
+
+                            if fill1 and new_imp1:
+                                cur.execute(
+                                    f"UPDATE t10_entry SET imprint_1 = ? WHERE show_id = ? AND {cond_i1_blank_i2_present}",
+                                    (new_imp1, sel_id),
+                                )
+
+                            if fill2 and new_imp2:
+                                cur.execute(
+                                    f"UPDATE t10_entry SET imprint_2 = ? WHERE show_id = ? AND {cond_i2_blank_i1_present}",
+                                    (new_imp2, sel_id),
+                                )
+                        else:
+                            # Overwrite (only columns provided)
+                            if new_imp1:
+                                cur.execute(
+                                    "UPDATE t10_entry SET imprint_1 = ? WHERE show_id = ?",
+                                    (new_imp1, sel_id),
+                                )
+                            if new_imp2:
+                                cur.execute(
+                                    "UPDATE t10_entry SET imprint_2 = ? WHERE show_id = ?",
+                                    (new_imp2, sel_id),
+                                )
+
+                        # Normalize whitespace; remove exact duplicates only (keeps distinct pairs)
+                        cur.execute("UPDATE t10_entry SET imprint_1 = TRIM(imprint_1) WHERE imprint_1 IS NOT NULL;")
+                        cur.execute("UPDATE t10_entry SET imprint_2 = TRIM(imprint_2) WHERE imprint_2 IS NOT NULL;")
+                        cur.execute(
+                            """
+                            UPDATE t10_entry
+                            SET imprint_2 = NULL
+                            WHERE show_id = ?
+                              AND imprint_1 IS NOT NULL AND TRIM(imprint_1) <> ''
+                              AND imprint_2 IS NOT NULL AND TRIM(imprint_2) <> ''
+                              AND imprint_1 = imprint_2
+                            """,
+                            (sel_id,),
+                        )
+
+                        con.commit()
+                    finally:
+                        con.close()
+
+                    try:
+                        sql_df.clear()
+                    except Exception:
+                        pass
+                    try:
+                        fetch_distinct_imprints.clear()
+                    except Exception:
+                        pass
+                    st.success("Imprints updated.")
+                    st.rerun()
+
+    st.markdown('---')
+    
+    st.markdown('---')
+    st.markdown("### Export show list (show_id)")
+    export_show_df = sql_df("SELECT show_id, canonical_title FROM show ORDER BY show_id")
+    st.caption("Download a simple lookup of show_id ↔ canonical_title. (This is based on the `show` table.)")
+
+    csv_bytes = export_show_df.to_csv(index=False).encode("utf-8")
+    st.download_button(
+        "Download show_ids.csv",
+        data=csv_bytes,
+        file_name="show_ids.csv",
+        mime="text/csv",
+        key="dl_show_ids_csv",
+    )
+
+    # Excel (optional)
+    try:
+        import openpyxl  # type: ignore  # noqa: F401
+
+        xlsx_buf = io.BytesIO()
+        with pd.ExcelWriter(xlsx_buf, engine="openpyxl") as writer:
+            export_show_df.to_excel(writer, index=False, sheet_name="show_ids")
+        st.download_button(
+            "Download show_ids.xlsx",
+            data=xlsx_buf.getvalue(),
+            file_name="show_ids.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="dl_show_ids_xlsx",
+        )
+    except Exception:
+        st.info("Excel export requires `openpyxl`. Install it in your venv with: `pip install openpyxl`")
     st.markdown("### View aliases for a show")
     show_for_aliases = st.selectbox("Show", titles, key="alias_list_show")
     show_id = int(shows.loc[shows["canonical_title"] == show_for_aliases, "show_id"].iloc[0])
