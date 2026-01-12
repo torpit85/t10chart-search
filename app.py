@@ -1271,6 +1271,62 @@ def _load_gross_races_base(db_path: str, db_mtime: float) -> pd.DataFrame:
     df["week_ending_dt"] = pd.to_datetime(df["week_ending"], errors="coerce")
     return df
 
+@st.cache_data(show_spinner=False)
+def _load_show_meta_for_gross_races(db_path: str, db_mtime: float) -> pd.DataFrame:
+    """Per-show metadata for gross races (imprints + debut date). db_mtime busts cache on DB updates."""
+    con = sqlite3.connect(db_path)
+    try:
+        df = pd.read_sql_query(
+            """
+            SELECT
+              e.show_id,
+              date(e.week_ending) AS week_ending,
+              e.imprint_1,
+              e.imprint_2
+            FROM t10_entry e
+            """,
+            con,
+        )
+    finally:
+        con.close()
+
+    if df.empty:
+        return pd.DataFrame(columns=["show_id", "imprint_1", "imprint_2", "debut_date"])
+
+    df["week_ending"] = _as_date_str(df["week_ending"])
+    df["week_ending_dt"] = pd.to_datetime(df["week_ending"], errors="coerce")
+    df = df.dropna(subset=["show_id", "week_ending_dt"]).copy()
+
+    # Debut date = first chart appearance (overall, not limited to gross-tracking era)
+    debut = df.groupby("show_id")["week_ending_dt"].min()
+
+    # Latest non-empty imprint values per show (imprints can be missing on some rows)
+    work = df.sort_values(["show_id", "week_ending_dt"], ascending=[True, False]).copy()
+
+    def _first_nonempty(series: pd.Series) -> Any:
+        s = series.astype("string").fillna(pd.NA).str.strip()
+        s = s.replace({"": pd.NA})
+        s = s.dropna()
+        return s.iloc[0] if len(s) else pd.NA
+
+    imp1 = work.groupby("show_id")["imprint_1"].apply(_first_nonempty)
+    imp2 = work.groupby("show_id")["imprint_2"].apply(_first_nonempty)
+
+    meta = pd.DataFrame(
+        {
+            "show_id": debut.index.astype(int),
+            "debut_date": debut.dt.strftime("%Y-%m-%d").astype("string"),
+            "imprint_1": imp1.astype("string"),
+            "imprint_2": imp2.astype("string"),
+        }
+    ).reset_index(drop=True)
+
+    meta["imprint_1"] = meta["imprint_1"].fillna("(Unknown)").astype(str).str.strip()
+    meta["imprint_2"] = meta["imprint_2"].fillna("").astype(str).str.strip()
+    meta["debut_date"] = meta["debut_date"].fillna("").astype(str).str.strip()
+    return meta
+
+
 def _plot_multi_line(dates: list[pd.Timestamp], series_by_label: dict[str, pd.Series], xlabel: str, ylabel: str):
     fig = plt.figure()
     for label, y in series_by_label.items():
@@ -1465,17 +1521,28 @@ def tab_gross_races():
     latest_dt = pd.to_datetime(base["week_ending_dt"].max())
     latest_date = latest_dt.date()
 
+
+    meta = _load_show_meta_for_gross_races(str(DB_PATH), db_mtime)
+
     # -------------------------
     # 1) All-Time Gross Races Chart (unlimited rank)
     # -------------------------
+
     st.markdown("### All-Time Gross Races Chart")
-    all_time = base.groupby("canonical_title", as_index=False)["gross_millions"].sum()
+    all_time = (
+        base.groupby(["show_id", "canonical_title"], as_index=False)["gross_millions"]
+        .sum()
+    )
+    all_time = all_time.merge(meta, on="show_id", how="left")
     all_time = all_time[all_time["gross_millions"] > 0].copy()
     all_time = all_time.sort_values("gross_millions", ascending=False).reset_index(drop=True)
     all_time.insert(0, "rank", np.arange(1, len(all_time) + 1))
 
+    # Display: rank/title + imprints + debut + total
+    all_time_disp = all_time[["rank", "canonical_title", "imprint_1", "imprint_2", "debut_date", "gross_millions"]].copy()
+
     st.caption("Unlimited rank: every show with any gross is included.")
-    st.dataframe(all_time, use_container_width=True, hide_index=True)
+    st.dataframe(all_time_disp, use_container_width=True, hide_index=True)
 
     with st.expander("Optional: visualize the leaders (bar chart)"):
         top_plot = st.slider("How many shows to display in the bar chart", 5, min(200, int(len(all_time))), min(50, int(len(all_time))))
@@ -1505,9 +1572,11 @@ def tab_gross_races():
     else:
         # Leaderboard as-of date
         last = ydf.sort_values(["show_id", "week_ending_dt"]).groupby(["show_id", "canonical_title"], as_index=False).tail(1)
-        leaders = last[["canonical_title", "cum_gross_millions"]].copy()
+        leaders = last[["show_id", "canonical_title", "cum_gross_millions"]].copy()
+        leaders = leaders.merge(meta[["show_id", "imprint_1", "imprint_2"]], on="show_id", how="left")
         leaders = leaders.sort_values("cum_gross_millions", ascending=False).reset_index(drop=True)
         leaders.insert(0, "rank", np.arange(1, len(leaders) + 1))
+        leaders = leaders[["rank", "canonical_title", "imprint_1", "imprint_2", "cum_gross_millions"]]
 
         st.caption(f"Leaderboard for **{pick_dt.year}** (through **{pick_dt.isoformat()}**)")
         st.dataframe(leaders, use_container_width=True, hide_index=True)
@@ -1552,9 +1621,15 @@ def tab_gross_races():
             .groupby(["show_id", "canonical_title"], as_index=False)
             .tail(1)
         )
-        leadersm = lastm[["canonical_title", "cum_gross_millions"]].copy()
+        leadersm = lastm[["show_id", "canonical_title", "cum_gross_millions"]].copy()
+
+        leadersm = leadersm.merge(meta[["show_id", "imprint_1", "imprint_2"]], on="show_id", how="left")
+
         leadersm = leadersm.sort_values("cum_gross_millions", ascending=False).reset_index(drop=True)
+
         leadersm.insert(0, "rank", np.arange(1, len(leadersm) + 1))
+
+        leadersm = leadersm[["rank", "canonical_title", "imprint_1", "imprint_2", "cum_gross_millions"]]
 
         month_label = _month_28_cycle_label(cycle_start)
         st.caption(f"Leaderboard for **{month_label}** (cycle **{cycle_start.date().isoformat()}** → **{cycle_end.date().isoformat()}**, through **{pick_m_ts.date().isoformat()}**)")
@@ -1638,9 +1713,15 @@ def tab_gross_races():
         return
 
     lastq = qdf.sort_values(["show_id", "week_ending_dt"]).groupby(["show_id", "canonical_title"], as_index=False).tail(1)
-    leaders_q = lastq[["canonical_title", "cum_gross_millions"]].copy()
+    leaders_q = lastq[["show_id", "canonical_title", "cum_gross_millions"]].copy()
+
+    leaders_q = leaders_q.merge(meta[["show_id", "imprint_1", "imprint_2"]], on="show_id", how="left")
+
     leaders_q = leaders_q.sort_values("cum_gross_millions", ascending=False).reset_index(drop=True)
+
     leaders_q.insert(0, "rank", np.arange(1, len(leaders_q) + 1))
+
+    leaders_q = leaders_q[["rank", "canonical_title", "imprint_1", "imprint_2", "cum_gross_millions"]]
 
     st.caption(f"Leaderboard for **Q{int(quarter)} {int(year_pick)}** (through **{wk_dt.date().isoformat()}**)")
     st.dataframe(leaders_q, use_container_width=True, hide_index=True)
