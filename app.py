@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import os
 import sqlite3
-import io
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Optional, Callable
@@ -87,17 +86,6 @@ def load_lists() -> tuple[pd.DataFrame, pd.DataFrame]:
         ORDER BY company
     """)
     return shows, companies
-
-@st.cache_data(show_spinner=False)
-def load_imprint2_list() -> pd.DataFrame:
-    """Distinct Imprint 2 values for selector (normalize blanks to '(None)')."""
-    return sql_df(
-        """
-        SELECT DISTINCT COALESCE(NULLIF(TRIM(imprint_2),''),'(None)') AS imprint_2
-        FROM t10_entry
-        ORDER BY imprint_2
-        """
-    )
 
 
 # ----------------------------
@@ -334,39 +322,6 @@ def fetch_company_entries(company: str, filters: FilterSpec, limit: int = 2000) 
     return df
 
 
-
-
-def fetch_imprint2_entries(imprint2: str, filters: FilterSpec, limit: int = 2000) -> pd.DataFrame:
-    """Entries for Imprint 2 selection. Normalizes blanks to '(None)'."""
-    where, params = build_where(filters, "e")
-    sql = f"""
-    SELECT
-      e.week_ending,
-      e.week_number,
-      e.rank,
-      e.pos,
-      s.canonical_title,
-      e.raw_title,
-      e.imprint_1,
-      e.imprint_2,
-      e.gross_millions AS base_gross_millions,
-      COALESCE(gb.bonus_millions, 0) AS bonus_millions,
-      (e.gross_millions + COALESCE(gb.bonus_millions, 0)) AS gross_millions
-    FROM t10_entry e
-    LEFT JOIN gross_bonus gb
-      ON gb.week_ending = e.week_ending
-     AND gb.show_id = e.show_id
-    JOIN show s ON s.show_id = e.show_id
-    WHERE COALESCE(NULLIF(TRIM(e.imprint_2),''),'(None)') = ?
-      AND {where}
-    ORDER BY e.week_ending DESC, e.rank ASC, e.pos ASC
-    LIMIT ?
-    """
-    df = sql_df(sql, tuple([imprint2] + params + [int(limit)]))
-    if not df.empty:
-        df["week_ending"] = _as_date_str(df["week_ending"])
-        df["imprint_2"] = df["imprint_2"].fillna("").astype(str)
-    return df
 # ----------------------------
 # Plot helpers (matplotlib only)
 # ----------------------------
@@ -817,8 +772,19 @@ def tab_grossing_milestones():
     )
     st.write(f"Count: **{len(hit):,}**")
 
-    
-
+    st.markdown("#### Top 20 earliest to reach this milestone")
+    top20 = hit.head(20).copy()
+    st.dataframe(
+        top20[["canonical_title", "week_ending", "cumulative_gross_millions", "week_gross_millions"]],
+        use_container_width=True,
+        hide_index=True,
+    )
+    if not top20.empty:
+        w = top20.iloc[0]
+        st.success(
+            f"Earliest: **{w['canonical_title']}** reached **{fmt_int(pick_big)}** on **{w['week_ending']}** "
+            f"(cumulative: **{w['cumulative_gross_millions']:.1f}**)."
+        )
 
 # ----------------------------
 # UI Tabs
@@ -1065,12 +1031,10 @@ def tab_compare_two_shows():
             plt.close(fig)
 
 
-
 def tab_companies():
-    st.subheader("Companies")
-
-    _, companies1 = load_lists()
-    companies2 = load_imprint2_list()
+    st.subheader("Company view (Imprint 1)")
+    _, companies = load_lists()
+    company = st.selectbox("Company (Imprint 1)", companies["company"].tolist())
 
     with st.sidebar:
         st.header("Company filters")
@@ -1080,44 +1044,18 @@ def tab_companies():
 
     filters = FilterSpec(date_min.strip() or None, date_max.strip() or None, int(rank_min), int(rank_max))
 
-    t1, t2 = st.tabs(["Imprint 1", "Imprint 2"])
+    stat = sql_df("SELECT * FROM v_company_stats WHERE company = ?", (company,))
+    if not stat.empty:
+        s = stat.iloc[0].to_dict()
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Entries", int(s["entries"]))
+        c2.metric("Unique shows", int(s["unique_shows"]))
+        c3.metric("Total gross (M)", float(s["total_gross_millions"]))
+        c4.metric("Avg gross (M)", None if pd.isna(s["avg_gross_millions"]) else float(s["avg_gross_millions"]))
 
-    with t1:
-        st.markdown("#### Imprint 1")
-        company = st.selectbox("Company (Imprint 1)", companies1["company"].tolist(), key="company_imprint1")
+    df = fetch_company_entries(company, filters)
+    st.dataframe(df, use_container_width=True)
 
-        stat = sql_df("SELECT * FROM v_company_stats WHERE company = ?", (company,))
-        if not stat.empty:
-            s = stat.iloc[0].to_dict()
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric("Entries", int(s["entries"]))
-            c2.metric("Unique shows", int(s["unique_shows"]))
-            c3.metric("Total gross (M)", float(s["total_gross_millions"]))
-            c4.metric("Avg gross (M)", None if pd.isna(s["avg_gross_millions"]) else float(s["avg_gross_millions"]))
-
-        df = fetch_company_entries(company, filters)
-        st.dataframe(df, use_container_width=True)
-
-    with t2:
-        st.markdown("#### Imprint 2")
-        imprint2 = st.selectbox("Company (Imprint 2)", companies2["imprint_2"].tolist(), key="company_imprint2")
-
-        df2 = fetch_imprint2_entries(imprint2, filters)
-        if df2.empty:
-            st.info("No rows found for that Imprint 2 (or filters are too restrictive).")
-        else:
-            total_gross = float(df2["gross_millions"].sum())
-            entries = int(len(df2))
-            unique_shows = int(df2["canonical_title"].nunique())
-            avg_gross = (total_gross / entries) if entries else None
-
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric("Entries", entries)
-            c2.metric("Unique shows", unique_shows)
-            c3.metric("Total gross (M)", total_gross)
-            c4.metric("Avg gross (M)", avg_gross)
-
-        st.dataframe(df2, use_container_width=True)
 
 def tab_analytics():
     st.subheader("Analytics (grossing + movement)")
@@ -1201,46 +1139,6 @@ def tab_analytics():
     if st.checkbox("Show Top Gross Weeks"):
         chart_top_gross_weeks(weekly, n=20)
 
-    st.markdown("### Weekly average gross over time")
-    weekly_avg = (
-        dg.groupby("week_ending", as_index=False)
-          .agg(
-              total_gross_millions=(gross_col, "sum"),
-              n_shows=(gross_col, "count"),
-          )
-          .sort_values("week_ending")
-    )
-    weekly_avg["avg_gross_millions"] = weekly_avg["total_gross_millions"] / weekly_avg["n_shows"].replace(0, np.nan)
-    plot_line_dates(
-        weekly_avg["week_ending"],
-        weekly_avg["avg_gross_millions"],
-        "Week Ending",
-        "Average Gross per Show (Millions)",
-    )
-
-    if st.checkbox("Show Top Average Gross Weeks"):
-        top_avg = (
-            weekly_avg.dropna(subset=["avg_gross_millions"])
-            .sort_values("avg_gross_millions", ascending=False)
-            .head(20)
-            .copy()
-        )
-        top_avg.insert(0, "#", range(1, len(top_avg) + 1))
-        st.dataframe(
-            top_avg[
-                ["#", "week_ending", "avg_gross_millions", "n_shows", "total_gross_millions"]
-            ].rename(
-                columns={
-                    "week_ending": "Week Ending",
-                    "avg_gross_millions": "Avg Gross (Millions)",
-                    "n_shows": "# Shows",
-                    "total_gross_millions": "Total Gross (Millions)",
-                }
-            ),
-            use_container_width=True,
-        )
-
-
     st.markdown("### Rolling average total gross")
     win = st.slider("Rolling window (weeks)", 2, 52, 13)
     w2 = weekly.copy()
@@ -1322,7 +1220,65 @@ def _load_gross_races_base(db_path: str, db_mtime: float) -> pd.DataFrame:
 
     if df.empty:
         return df
+    return df
 
+
+
+@st.cache_data(show_spinner=False)
+def _load_show_meta_for_gross_races(db_path: str, db_mtime: float) -> pd.DataFrame:
+    """Show-level metadata for gross races (imprints + debut date). db_mtime busts cache on DB updates."""
+    con = sqlite3.connect(db_path)
+    try:
+        raw = pd.read_sql_query(
+            """
+            SELECT
+              e.show_id AS show_id,
+              s.canonical_title AS canonical_title,
+              date(e.week_ending) AS week_ending,
+              NULLIF(TRIM(e.imprint_1), '') AS imprint_1,
+              NULLIF(TRIM(e.imprint_2), '') AS imprint_2
+            FROM t10_entry e
+            JOIN show s ON s.show_id = e.show_id
+            WHERE e.week_ending IS NOT NULL
+            """,
+            con,
+        )
+    finally:
+        con.close()
+
+    if raw.empty:
+        return pd.DataFrame(columns=["show_id", "canonical_title", "debut_date", "imprint_1", "imprint_2"])
+
+    raw["week_ending_dt"] = pd.to_datetime(raw["week_ending"], errors="coerce")
+    raw = raw.sort_values(["show_id", "week_ending_dt"]).copy()
+
+    def _norm(s: pd.Series) -> pd.Series:
+        s2 = s.astype(object)
+        s2 = s2.apply(lambda x: x.strip() if isinstance(x, str) else x)
+        s2 = s2.replace({"<none>": None, "<None>": None, "None": None, "NONE": None, "": None})
+        return s2
+
+    raw["imprint_1"] = _norm(raw["imprint_1"])
+    raw["imprint_2"] = _norm(raw["imprint_2"])
+
+    def _last_nonempty(s: pd.Series) -> str:
+        s2 = s.dropna().astype(str).str.strip()
+        s2 = s2[s2 != ""]
+        s2 = s2[s2.str.lower() != "<none>"]
+        return s2.iloc[-1] if len(s2) else ""
+
+    meta = (
+        raw.groupby(["show_id", "canonical_title"], as_index=False)
+        .agg(
+            debut_date=("week_ending_dt", "min"),
+            imprint_1=("imprint_1", _last_nonempty),
+            imprint_2=("imprint_2", _last_nonempty),
+        )
+    )
+    meta["debut_date"] = meta["debut_date"].dt.date
+    meta["imprint_1"] = meta["imprint_1"].fillna("")
+    meta["imprint_2"] = meta["imprint_2"].fillna("")
+    return meta
     df["week_ending"] = _as_date_str(df["week_ending"])
     df["week_ending_dt"] = pd.to_datetime(df["week_ending"], errors="coerce")
     df = df.dropna(subset=["week_ending_dt", "show_id", "canonical_title"]).copy()
@@ -1368,149 +1324,23 @@ def _year_cumulative(base: pd.DataFrame, year: int, through_dt: pd.Timestamp) ->
     return ydf, weeks
 
 
-
-def _month_cumulative(base: pd.DataFrame, year: int, month: int, through_dt: pd.Timestamp) -> tuple[pd.DataFrame, list[pd.Timestamp]]:
-    m = int(month)
-    y = int(year)
-    mdf = base[(base["week_ending_dt"].dt.year == y) & (base["week_ending_dt"].dt.month == m)].copy()
-    mdf = mdf[mdf["week_ending_dt"] <= through_dt].copy()
-    if mdf.empty:
-        return mdf, []
-
-    mdf = mdf.sort_values(["show_id", "week_ending_dt"]).reset_index(drop=True)
-    mdf["cum_gross_millions"] = mdf.groupby("show_id")["gross_millions"].cumsum()
-
-    weeks = sorted(mdf["week_ending_dt"].dropna().unique().tolist())
-    return mdf, weeks
-
-
-
-def _month_28_cycle_start(through_dt: pd.Timestamp) -> pd.Timestamp:
-    """Return the cycle start for your 28th→27th 'T-25 month'."""
-    dt = pd.to_datetime(through_dt)
-    d = dt.date()
-    if d.day >= 28:
-        start = date(d.year, d.month, 28)
-    else:
-        if d.month == 1:
-            start = date(d.year - 1, 12, 28)
-        else:
-            start = date(d.year, d.month - 1, 28)
-    return pd.Timestamp(start)
-
-
-def _month_28_cycle_end(start_dt: pd.Timestamp) -> pd.Timestamp:
-    """Return the cycle end (27th of the following month) for a given 28th start."""
-    s = pd.to_datetime(start_dt).date()
-    if s.month == 12:
-        end = date(s.year + 1, 1, 27)
-    else:
-        end = date(s.year, s.month + 1, 27)
-    return pd.Timestamp(end)
-
-
-def _month_28_cycle_label(start_dt: pd.Timestamp) -> str:
-    """Label the cycle by its ending month (Dec 28 → Jan 27 is 'January')."""
-    s = pd.to_datetime(start_dt).date()
-    if s.month == 12:
-        y, m = s.year + 1, 1
-    else:
-        y, m = s.year, s.month + 1
-    return date(y, m, 1).strftime("%B %Y")
-
-
-def _month_28_cumulative(
-    base: pd.DataFrame, through_dt: pd.Timestamp
-) -> tuple[pd.DataFrame, list[pd.Timestamp], pd.Timestamp, pd.Timestamp]:
-    """Cumulative gross for the 28th→27th month cycle through a selected date."""
-    through_dt = pd.to_datetime(through_dt)
-    start_dt = _month_28_cycle_start(through_dt)
-    end_dt = _month_28_cycle_end(start_dt)
-
-    mdf = base[(base["week_ending_dt"] >= start_dt) & (base["week_ending_dt"] <= through_dt)].copy()
-    if mdf.empty:
-        return mdf, [], start_dt, end_dt
-
-    mdf = mdf.sort_values(["show_id", "week_ending_dt"]).reset_index(drop=True)
-    mdf["cum_gross_millions"] = mdf.groupby("show_id")["gross_millions"].cumsum()
-
-    weeks = sorted(mdf["week_ending_dt"].dropna().unique().tolist())
-    return mdf, weeks, start_dt, end_dt
-
-
 def _quarter_cumulative(base: pd.DataFrame, year: int, quarter: int, through_week_dt: pd.Timestamp) -> tuple[pd.DataFrame, list[pd.Timestamp]]:
-    """Cumulative gross for a calendar quarter through a selected chart week.
-
-    Bonus rows (annual + quarter) are attributed to the *ending period* and applied on the
-    quarter's final chart week. This avoids "missing" bonuses when the bonus week_ending
-    date falls just outside the quarter or when the quarter has fewer chart weeks.
-    """
     q = int(quarter)
     start_month = (q - 1) * 3 + 1
     end_month = start_month + 2
 
-    q_all = base[base["week_ending_dt"].dt.year == year].copy()
-    q_all = q_all[(q_all["week_ending_dt"].dt.month >= start_month) & (q_all["week_ending_dt"].dt.month <= end_month)].copy()
-    if q_all.empty:
-        return q_all, []
+    qdf = base[(base["week_ending_dt"].dt.year == year)].copy()
+    qdf = qdf[(qdf["week_ending_dt"].dt.month >= start_month) & (qdf["week_ending_dt"].dt.month <= end_month)].copy()
+    qdf = qdf[qdf["week_ending_dt"] <= through_week_dt].copy()
 
-    # Chart weeks = weeks where the show had a base gross row (ignore bonus-only rows)
-    chart_weeks = (
-        q_all.loc[q_all["base_gross_millions"].fillna(0.0) > 0.0, "week_ending_dt"]
-        .dropna()
-        .unique()
-        .tolist()
-    )
-    weeks = sorted(pd.to_datetime(chart_weeks))
-    if not weeks:
-        return q_all.head(0).copy(), []
-
-    last_week_dt = pd.to_datetime(max(weeks))
-    through_week_dt = pd.to_datetime(through_week_dt)
-
-    # Through selected week
-    qdf = q_all[q_all["week_ending_dt"] <= through_week_dt].copy()
     if qdf.empty:
-        weeks_through = [pd.to_datetime(x) for x in weeks if pd.to_datetime(x) <= through_week_dt]
-        return qdf, weeks_through
-
-    # Use base gross for within-quarter weeks; bonuses are applied on the quarter's final chart week.
-    qdf["bonus_millions"] = 0.0
-    qdf["gross_millions"] = qdf["base_gross_millions"]
-
-    if through_week_dt >= last_week_dt:
-        bonus = base[base["bonus_millions"] > 0.0].copy()
-        if not bonus.empty:
-            # Attribute bonus to the period that ended one chart-week earlier (handles "spillover" dates).
-            bonus["attrib_dt"] = bonus["week_ending_dt"] - pd.Timedelta(days=7)
-            bonus["attrib_year"] = bonus["attrib_dt"].dt.year
-            bonus["attrib_quarter"] = ((bonus["attrib_dt"].dt.month - 1) // 3) + 1
-            bonus = bonus[(bonus["attrib_year"] == year) & (bonus["attrib_quarter"] == q)].copy()
-
-        if not bonus.empty:
-            bonus_sum = bonus.groupby(["show_id", "canonical_title"], as_index=False)["bonus_millions"].sum()
-            bonus_sum["week_ending_dt"] = last_week_dt
-            bonus_sum["week_ending"] = last_week_dt.date().isoformat()
-            bonus_sum["base_gross_millions"] = 0.0
-            bonus_sum["gross_millions"] = bonus_sum["bonus_millions"]
-
-            # Append and collapse duplicates on the quarter-end week
-            qdf = pd.concat([qdf, bonus_sum], ignore_index=True, sort=False)
-            qdf = (
-                qdf.groupby(["show_id", "canonical_title", "week_ending"], as_index=False)[
-                    ["base_gross_millions", "bonus_millions", "gross_millions"]
-                ]
-                .sum()
-                .sort_values(["show_id", "week_ending"])
-                .reset_index(drop=True)
-            )
-            qdf["week_ending_dt"] = pd.to_datetime(qdf["week_ending"], errors="coerce")
+        return qdf, []
 
     qdf = qdf.sort_values(["show_id", "week_ending_dt"]).reset_index(drop=True)
     qdf["cum_gross_millions"] = qdf.groupby("show_id")["gross_millions"].cumsum()
 
-    weeks_through = [pd.to_datetime(x) for x in weeks if pd.to_datetime(x) <= through_week_dt]
-    return qdf, weeks_through
+    weeks = sorted(qdf["week_ending_dt"].dropna().unique().tolist())
+    return qdf, weeks
 
 
 def tab_gross_races():
@@ -1537,17 +1367,31 @@ def tab_gross_races():
     latest_dt = pd.to_datetime(base["week_ending_dt"].max())
     latest_date = latest_dt.date()
 
+    meta = _load_show_meta_for_gross_races(str(DB_PATH), db_mtime)
+
     # -------------------------
     # 1) All-Time Gross Races Chart (unlimited rank)
     # -------------------------
     st.markdown("### All-Time Gross Races Chart")
-    all_time = base.groupby("canonical_title", as_index=False)["gross_millions"].sum()
+    all_time = base.groupby(["show_id", "canonical_title"], as_index=False)["gross_millions"].sum()
     all_time = all_time[all_time["gross_millions"] > 0].copy()
+
+    if not meta.empty:
+        all_time = all_time.merge(meta[["show_id", "imprint_1", "imprint_2", "debut_date"]], on="show_id", how="left")
+    else:
+        all_time["imprint_1"] = ""
+        all_time["imprint_2"] = ""
+        all_time["debut_date"] = pd.NaT
+
+    all_time["imprint_1"] = all_time["imprint_1"].fillna("")
+    all_time["imprint_2"] = all_time["imprint_2"].fillna("")
+
     all_time = all_time.sort_values("gross_millions", ascending=False).reset_index(drop=True)
     all_time.insert(0, "rank", np.arange(1, len(all_time) + 1))
 
     st.caption("Unlimited rank: every show with any gross is included.")
-    st.dataframe(all_time, use_container_width=True, hide_index=True)
+    all_time_disp = all_time[["rank", "canonical_title", "imprint_1", "imprint_2", "debut_date", "gross_millions"]].copy()
+    st.dataframe(all_time_disp, use_container_width=True, hide_index=True)
 
     with st.expander("Optional: visualize the leaders (bar chart)"):
         top_plot = st.slider("How many shows to display in the bar chart", 5, min(200, int(len(all_time))), min(50, int(len(all_time))))
@@ -1577,9 +1421,21 @@ def tab_gross_races():
     else:
         # Leaderboard as-of date
         last = ydf.sort_values(["show_id", "week_ending_dt"]).groupby(["show_id", "canonical_title"], as_index=False).tail(1)
-        leaders = last[["canonical_title", "cum_gross_millions"]].copy()
+        leaders = last[["show_id", "canonical_title", "cum_gross_millions"]].copy()
+
+        if not meta.empty:
+            leaders = leaders.merge(meta[["show_id", "imprint_1", "imprint_2"]], on="show_id", how="left")
+        else:
+            leaders["imprint_1"] = ""
+            leaders["imprint_2"] = ""
+
+        leaders["imprint_1"] = leaders["imprint_1"].fillna("")
+        leaders["imprint_2"] = leaders["imprint_2"].fillna("")
+
         leaders = leaders.sort_values("cum_gross_millions", ascending=False).reset_index(drop=True)
         leaders.insert(0, "rank", np.arange(1, len(leaders) + 1))
+
+        leaders = leaders[["rank", "canonical_title", "imprint_1", "imprint_2", "cum_gross_millions"]].copy()
 
         st.caption(f"Leaderboard for **{pick_dt.year}** (through **{pick_dt.isoformat()}**)")
         st.dataframe(leaders, use_container_width=True, hide_index=True)
@@ -1594,55 +1450,6 @@ def tab_gross_races():
 
         series_by_label = {c: piv[c] for c in piv.columns}
         _plot_multi_line(list(piv.index), series_by_label, "Week Ending", "Cumulative Gross (Millions)")
-
-    st.divider()
-
-
-    # -------------------------
-    # 2B) Monthly Gross Races
-    # -------------------------
-    st.markdown("### Monthly Gross Races")
-    st.caption("Cumulative grosses reset on the 28th (cycle runs 28th → 27th).")
-
-    # Use the same date-picker pattern as Annual Gross Races.
-    pick_m_dt = st.date_input(
-        "As-of date (pick any date; cycle runs 28th → 27th)",
-        value=latest_date,
-        min_value=GROSS_TRACKING_START,
-        max_value=latest_date,
-        key="monthly_race_date",
-    )
-    pick_m_ts = pd.to_datetime(pick_m_dt)
-
-    mdf, mweeks, cycle_start, cycle_end = _month_28_cumulative(base, pick_m_ts)
-    if mdf.empty:
-        st.info("No gross rows found for that month (through the selected date).")
-    else:
-        # Leaderboard as-of date
-        lastm = (
-            mdf.sort_values(["show_id", "week_ending_dt"])
-            .groupby(["show_id", "canonical_title"], as_index=False)
-            .tail(1)
-        )
-        leadersm = lastm[["canonical_title", "cum_gross_millions"]].copy()
-        leadersm = leadersm.sort_values("cum_gross_millions", ascending=False).reset_index(drop=True)
-        leadersm.insert(0, "rank", np.arange(1, len(leadersm) + 1))
-
-        month_label = _month_28_cycle_label(cycle_start)
-        st.caption(f"Leaderboard for **{month_label}** (cycle **{cycle_start.date().isoformat()}** → **{cycle_end.date().isoformat()}**, through **{pick_m_ts.date().isoformat()}**)")
-        st.dataframe(leadersm, use_container_width=True, hide_index=True)
-
-        # Line chart for top K at the selected date
-        top_km = st.slider("Shows to plot (monthly)", 2, min(50, int(len(leadersm))), min(10, int(len(leadersm))), key="monthly_race_topk")
-        top_titles_m = leadersm.head(int(top_km))["canonical_title"].tolist()
-
-        pivm = mdf[mdf["canonical_title"].isin(top_titles_m)].copy()
-        pivm = pivm.pivot_table(index="week_ending_dt", columns="canonical_title", values="cum_gross_millions", aggfunc="max").sort_index()
-        pivm = pivm.reindex(pd.to_datetime(mweeks)).ffill()
-
-        series_by_label_m = {c: pivm[c] for c in pivm.columns}
-        _plot_multi_line(list(pivm.index), series_by_label_m, "Week Ending", "Cumulative Gross (Millions)")
-
 
     st.divider()
 
@@ -1677,7 +1484,6 @@ def tab_gross_races():
     end_month = start_month + 2
     q_weeks = base[(base["week_ending_dt"].dt.year == int(year_pick))].copy()
     q_weeks = q_weeks[(q_weeks["week_ending_dt"].dt.month >= start_month) & (q_weeks["week_ending_dt"].dt.month <= end_month)].copy()
-    q_weeks = q_weeks[q_weeks["base_gross_millions"] > 0.0].copy()
     q_week_list = sorted(pd.to_datetime(q_weeks["week_ending_dt"].dropna().unique()))
     q_week_list = [pd.to_datetime(x).normalize() for x in q_week_list]
 
@@ -1710,9 +1516,21 @@ def tab_gross_races():
         return
 
     lastq = qdf.sort_values(["show_id", "week_ending_dt"]).groupby(["show_id", "canonical_title"], as_index=False).tail(1)
-    leaders_q = lastq[["canonical_title", "cum_gross_millions"]].copy()
+    leaders_q = lastq[["show_id", "canonical_title", "cum_gross_millions"]].copy()
+
+    if not meta.empty:
+        leaders_q = leaders_q.merge(meta[["show_id", "imprint_1", "imprint_2"]], on="show_id", how="left")
+    else:
+        leaders_q["imprint_1"] = ""
+        leaders_q["imprint_2"] = ""
+
+    leaders_q["imprint_1"] = leaders_q["imprint_1"].fillna("")
+    leaders_q["imprint_2"] = leaders_q["imprint_2"].fillna("")
+
     leaders_q = leaders_q.sort_values("cum_gross_millions", ascending=False).reset_index(drop=True)
     leaders_q.insert(0, "rank", np.arange(1, len(leaders_q) + 1))
+
+    leaders_q = leaders_q[["rank", "canonical_title", "imprint_1", "imprint_2", "cum_gross_millions"]].copy()
 
     st.caption(f"Leaderboard for **Q{int(quarter)} {int(year_pick)}** (through **{wk_dt.date().isoformat()}**)")
     st.dataframe(leaders_q, use_container_width=True, hide_index=True)
@@ -1727,722 +1545,85 @@ def tab_gross_races():
     series_by_label_q = {c: pivq[c] for c in pivq.columns}
     _plot_multi_line(list(pivq.index), series_by_label_q, "Week Ending", "Cumulative Gross (Millions)")
 
+    st.divider()
 
+    # -------------------------
+    # 4) Monthly Gross Races (28th → 27th)
+    # -------------------------
+    st.markdown("### Monthly Gross Races")
+    st.caption("Cumulative grosses reset on the 28th of each month (e.g., Dec 28 → Jan 27).")
 
-
-# ----------------------------
-# New tab: Grossing Trends
-# ----------------------------
-@st.cache_data(show_spinner=False)
-def _load_grossing_trends_base(db_path: str, db_mtime: float) -> pd.DataFrame:
-    """Load weekly chart rows needed for trend analysis.
-    - Base gross from t10_entry.gross_millions
-    - Optional bonus from gross_bonus (annual/quarter) is included as a separate column
-    db_mtime busts cache when DB changes.
-    """
-    con = sqlite3.connect(db_path)
-    try:
-        df = pd.read_sql_query(
-            """
-            WITH bonus AS (
-              SELECT
-                date(week_ending) AS week_ending,
-                show_id,
-                SUM(COALESCE(bonus_millions, 0.0)) AS bonus_millions
-              FROM gross_bonus
-              WHERE bonus_type IN ('annual', 'quarter')
-              GROUP BY 1, 2
-            )
-            SELECT
-              date(e.week_ending) AS week_ending,
-              e.show_id AS show_id,
-              e.rank AS rank,
-              s.canonical_title AS canonical_title,
-              COALESCE(e.gross_millions, 0.0) AS base_gross_millions,
-              COALESCE(b.bonus_millions, 0.0) AS bonus_millions,
-              (COALESCE(e.gross_millions, 0.0) + COALESCE(b.bonus_millions, 0.0)) AS gross_millions,
-              COALESCE(e.imprint_1, '(Unknown)') AS imprint_1,
-              COALESCE(e.imprint_2, '') AS imprint_2
-            FROM t10_entry e
-            JOIN show s
-              ON s.show_id = e.show_id
-            LEFT JOIN bonus b
-              ON b.week_ending = date(e.week_ending)
-             AND b.show_id = e.show_id
-            """,
-            con,
-        )
-    finally:
-        con.close()
-
-    df["week_ending_dt"] = pd.to_datetime(df["week_ending"], errors="coerce")
-    df["imprint_1"] = df["imprint_1"].fillna("(Unknown)").astype(str).str.strip()
-    df["imprint_2"] = df["imprint_2"].fillna("").astype(str).str.strip()
-    return df
-
-
-def tab_grossing_trends():
-    st.subheader("Grossing Trends")
-    st.caption(
-        "Seasonality, rank/gross structure, volatility, momentum, longevity, concentration/turnover, imprint trends, and anomalies. "
-        "Use the filters once, and everything below updates."
+    pick_m_dt = st.date_input(
+        "As-of date (pick any date to view that cycle's race)",
+        value=latest_date,
+        min_value=GROSS_TRACKING_START,
+        max_value=latest_date,
+        key="gross_races_month_pick",
     )
+    through_m_dt = pd.to_datetime(pick_m_dt)
 
-    db_mtime = DB_PATH.stat().st_mtime
-    base = _load_grossing_trends_base(str(DB_PATH), db_mtime)
+    # Cycle start (28th)
+    if through_m_dt.day >= 28:
+        cycle_start = pd.Timestamp(year=int(through_m_dt.year), month=int(through_m_dt.month), day=28)
+    else:
+        prev = through_m_dt - pd.DateOffset(months=1)
+        cycle_start = pd.Timestamp(year=int(prev.year), month=int(prev.month), day=28)
+    cycle_end_excl = cycle_start + pd.DateOffset(months=1)
+    cycle_end_incl = (cycle_end_excl - pd.Timedelta(days=1)).date()
 
-    # Default: grossing era only
-    base = base[base["week_ending_dt"].notna()].copy()
+    mbase = base[(base["week_ending_dt"] >= cycle_start) & (base["week_ending_dt"] < cycle_end_excl)].copy()
+    mbase = mbase[mbase["week_ending_dt"] <= through_m_dt].copy()
 
-    # --- Filters ---
-    with st.expander("Filters", expanded=True):
-        c1, c2, c3, c4 = st.columns([1.4, 1.2, 1.2, 1.2])
+    if mbase.empty:
+        st.info("No monthly data available for that date range (gross-tracking era filter applied).")
+    else:
+        mdf = mbase.sort_values(["show_id", "week_ending_dt"]).reset_index(drop=True)
+        mdf["cum_gross_millions"] = mdf.groupby("show_id")["gross_millions"].cumsum()
+        mweeks = sorted(mdf["week_ending_dt"].dropna().unique().tolist())
 
-        min_dt = base["week_ending_dt"].min().date()
-        max_dt = base["week_ending_dt"].max().date()
+        lastm = mdf.sort_values(["show_id", "week_ending_dt"]).groupby(["show_id", "canonical_title"], as_index=False).tail(1)
+        leaders_m = lastm[["show_id", "canonical_title", "cum_gross_millions"]].copy()
 
-        with c1:
-            date_range = st.date_input(
-                "Date range",
-                value=(max(min_dt, GROSS_TRACKING_START), max_dt),
-                min_value=min_dt,
-                max_value=max_dt,
-                key="trends_date_range",
-            )
-            if isinstance(date_range, tuple) and len(date_range) == 2:
-                d0, d1 = date_range
-            else:
-                d0, d1 = max(min_dt, GROSS_TRACKING_START), max_dt
-
-        with c2:
-            grossing_era_only = st.checkbox(
-                f"Grossing era only (≥ {GROSS_TRACKING_START.isoformat()})",
-                value=True,
-                key="trends_grossing_era_only",
-            )
-            include_bonuses = st.checkbox("Include annual/quarter bonuses", value=False, key="trends_include_bonuses")
-
-        with c3:
-            rank_scope = st.selectbox(
-                "Rank scope (for totals & shares)",
-                ["Top 10", "Top 5", "Top 3", "#1 only"],
-                index=0,
-                key="trends_rank_scope",
-            )
-            min_weeks = st.number_input("Min chart weeks for show-level stats", min_value=1, max_value=200, value=5, step=1, key="trends_min_weeks")
-
-        with c4:
-            # Imprint/company filter (matches imprint_1 or imprint_2)
-            imprints = sorted(set(base["imprint_1"].dropna().astype(str)) | set(base["imprint_2"].dropna().astype(str)))
-            imprints = [i for i in imprints if i and i != "nan"]
-            selected_imprints = st.multiselect("Filter by imprint/company (optional)", imprints, default=[], key="trends_imprints")
-
-    df = base.copy()
-    if grossing_era_only:
-        df = df[df["week_ending_dt"].dt.date >= GROSS_TRACKING_START].copy()
-
-    df = df[(df["week_ending_dt"].dt.date >= d0) & (df["week_ending_dt"].dt.date <= d1)].copy()
-
-    if selected_imprints:
-        df = df[df["imprint_1"].isin(selected_imprints) | df["imprint_2"].isin(selected_imprints)].copy()
-
-    gross_col = "gross_millions" if include_bonuses else "base_gross_millions"
-    df["gross_use"] = pd.to_numeric(df[gross_col], errors="coerce").fillna(0.0)
-
-    # rank scope helper
-    rank_max = 10
-    if rank_scope == "Top 5":
-        rank_max = 5
-    elif rank_scope == "Top 3":
-        rank_max = 3
-    elif rank_scope == "#1 only":
-        rank_max = 1
-
-    df_top = df[df["rank"].between(1, rank_max)].copy()
-    df_top10 = df[df["rank"].between(1, 10)].copy()  # used in several sections regardless of rank_scope
-    df_n1 = df[df["rank"].eq(1)].copy()
-
-    # A stable, chart-ordered list of weeks
-    chart_weeks = pd.Series(sorted(df["week_ending_dt"].dropna().unique()))
-    if chart_weeks.empty:
-        st.info("No rows match the current filters.")
-        return
-
-    through_week = st.selectbox(
-        "Through week ending (applies to Momentum & some tables)",
-        [d.date() for d in chart_weeks],
-        index=len(chart_weeks) - 1,
-        key="trends_through_week",
-    )
-    df_through = df[df["week_ending_dt"].dt.date <= through_week].copy()
-    df_top_through = df_through[df_through["rank"].between(1, rank_max)].copy()
-    df_top10_through = df_through[df_through["rank"].between(1, 10)].copy()
-    df_n1_through = df_through[df_through["rank"].eq(1)].copy()
-
-    subtabs = st.tabs(["Overview", "Momentum", "Longevity", "Market Structure", "Imprints/Companies", "Anomalies & Eras"])
-
-    # ----------------------------
-    # Overview
-    # ----------------------------
-    with subtabs[0]:
-        st.markdown("### Seasonality")
-
-        weekly_total = df_top10.groupby("week_ending_dt", as_index=True)["gross_use"].sum().sort_index()
-        if weekly_total.empty:
-            st.info("No gross data in the selected range.")
+        if not meta.empty:
+            leaders_m = leaders_m.merge(meta[["show_id", "imprint_1", "imprint_2"]], on="show_id", how="left")
         else:
-            season_df = weekly_total.reset_index().rename(columns={"gross_use": "total_gross"})
-            season_df["month"] = season_df["week_ending_dt"].dt.month
-            season_df["week_of_year"] = season_df["week_ending_dt"].dt.isocalendar().week.astype(int)
+            leaders_m["imprint_1"] = ""
+            leaders_m["imprint_2"] = ""
 
-            month_stats = (
-                season_df.groupby("month")["total_gross"]
-                .agg(avg="mean", median="median", n="count")
-                .reset_index()
-            )
-            month_stats["month_name"] = pd.to_datetime(month_stats["month"], format="%m").dt.strftime("%B")
+        leaders_m["imprint_1"] = leaders_m["imprint_1"].fillna("")
+        leaders_m["imprint_2"] = leaders_m["imprint_2"].fillna("")
 
-            fig = plt.figure()
-            plt.bar(month_stats["month_name"], month_stats["avg"])
-            plt.xticks(rotation=45, ha="right")
-            plt.ylabel("Average total gross (Top 10)")
-            plt.title("Average total gross by month-of-year")
-            st.pyplot(fig, clear_figure=True)
+        leaders_m = leaders_m.sort_values("cum_gross_millions", ascending=False).reset_index(drop=True)
+        leaders_m.insert(0, "rank", np.arange(1, len(leaders_m) + 1))
+        leaders_m = leaders_m[["rank", "canonical_title", "imprint_1", "imprint_2", "cum_gross_millions"]].copy()
 
-            woy_stats = season_df.groupby("week_of_year")["total_gross"].mean().reset_index()
-            fig = plt.figure()
-            plt.plot(woy_stats["week_of_year"], woy_stats["total_gross"])
-            plt.xlabel("ISO week of year")
-            plt.ylabel("Average total gross (Top 10)")
-            plt.title("Average total gross by week-of-year")
-            st.pyplot(fig, clear_figure=True)
-
-            with st.expander("Seasonality table"):
-                show_tbl = month_stats[["month_name", "avg", "median", "n"]].rename(columns={"month_name": "Month", "avg": "Avg", "median": "Median", "n": "Weeks"})
-                st.dataframe(show_tbl, use_container_width=True)
-
-        st.markdown("### Position decay curves (gross by rank)")
-        if df_top10.empty:
-            st.info("No ranked rows in the selected range.")
-        else:
-            pos_stats = (
-                df_top10.groupby("rank")["gross_use"]
-                .agg(median="median", avg="mean", p25=lambda s: s.quantile(0.25), p75=lambda s: s.quantile(0.75), n="count")
-                .reset_index()
-                .sort_values("rank")
-            )
-
-            fig = plt.figure()
-            plt.plot(pos_stats["rank"], pos_stats["median"], marker="o")
-            plt.xlabel("Rank")
-            plt.ylabel("Median weekly gross")
-            plt.title("Median gross by rank (Top 10)")
-            st.pyplot(fig, clear_figure=True)
-
-            with st.expander("Position decay table"):
-                st.dataframe(pos_stats, use_container_width=True)
-
-        st.markdown("### Volatility index")
-        if not weekly_total.empty:
-            roll_w = st.slider("Rolling window (weeks)", min_value=4, max_value=26, value=13, step=1, key="trends_vol_window")
-            roll_mean = weekly_total.rolling(roll_w, min_periods=max(2, roll_w // 2)).mean()
-            roll_std = weekly_total.rolling(roll_w, min_periods=max(2, roll_w // 2)).std()
-            vol_score = (roll_std / roll_mean.replace(0, np.nan)).fillna(0.0)
-
-            fig = plt.figure()
-            plt.plot(weekly_total.index, weekly_total.values, label="Weekly total")
-            plt.plot(roll_mean.index, roll_mean.values, label=f"{roll_w}w avg")
-            plt.legend()
-            plt.title("Weekly total gross (Top 10)")
-            st.pyplot(fig, clear_figure=True)
-
-            fig = plt.figure()
-            plt.plot(roll_std.index, roll_std.values)
-            plt.title(f"Rolling {roll_w}-week std dev (volatility)")
-            plt.ylabel("Std dev")
-            st.pyplot(fig, clear_figure=True)
-
-            fig = plt.figure()
-            plt.plot(vol_score.index, vol_score.values)
-            plt.title(f"Volatility score (std/mean) over {roll_w} weeks")
-            st.pyplot(fig, clear_figure=True)
-
-        st.markdown("### #1 premium (#1 vs #2)")
-        # Use Top 2 regardless of chosen rank_scope
-        df_top2 = df[df["rank"].between(1, 2)].copy()
-        if df_top2.empty:
-            st.info("Not enough data for #1 vs #2.")
-        else:
-            pivot = (
-                df_top2.groupby(["week_ending_dt", "rank"])["gross_use"]
-                .mean()
-                .reset_index()
-                .pivot(index="week_ending_dt", columns="rank", values="gross_use")
-                .sort_index()
-            )
-            if 1 not in pivot.columns or 2 not in pivot.columns:
-                st.info("Not enough data for both #1 and #2 weeks.")
-            else:
-                ratio = (pivot[1] / pivot[2].replace(0, np.nan)).replace([np.inf, -np.inf], np.nan)
-                diff = pivot[1] - pivot[2]
-                fig = plt.figure()
-                plt.plot(diff.index, diff.values)
-                plt.title("#1 premium (difference: #1 − #2)")
-                st.pyplot(fig, clear_figure=True)
-
-                fig = plt.figure()
-                plt.plot(ratio.index, ratio.values)
-                plt.title("#1 premium (ratio: #1 ÷ #2)")
-                st.pyplot(fig, clear_figure=True)
-
-    # ----------------------------
-    # Momentum
-    # ----------------------------
-    with subtabs[1]:
-        st.markdown("### Momentum")
-        st.caption("Biggest week-over-week gains/declines, 4-week moves, hot slopes, and rebounders. Uses consecutive chart appearances (date gaps ignored).")
-
-        show_week = (
-            df_top10_through.groupby(["show_id", "canonical_title", "week_ending_dt"], as_index=False)["gross_use"]
-            .sum()
-            .sort_values(["show_id", "week_ending_dt"])
+        st.caption(
+            f"Leaderboard for cycle **{cycle_start.date().isoformat()} → {cycle_end_incl.isoformat()}** "
+            f"(through **{through_m_dt.date().isoformat()}**)"
         )
-        if show_week.empty:
-            st.info("No show/week data for Momentum under current filters.")
-        else:
-            # Per-show deltas across consecutive chart appearances
-            show_week["prev_gross"] = show_week.groupby("show_id")["gross_use"].shift(1)
-            show_week["abs_change"] = show_week["gross_use"] - show_week["prev_gross"]
-            show_week["pct_change"] = np.where(
-                show_week["prev_gross"].fillna(0.0) > 0,
-                show_week["abs_change"] / show_week["prev_gross"].replace(0, np.nan),
-                np.nan,
-            )
+        st.dataframe(leaders_m, use_container_width=True, hide_index=True)
 
-            min_prev = st.number_input("Min previous-week gross for % change leaderboard", min_value=0.0, value=1.0, step=0.5, key="trends_min_prev_gross")
-            topn = st.slider("Top N", min_value=5, max_value=50, value=20, step=5, key="trends_mom_topn")
-
-            wo = show_week[show_week["prev_gross"] >= float(min_prev)].copy()
-
-            c1, c2 = st.columns(2)
-            with c1:
-                st.markdown("#### Biggest week-over-week % gains")
-                tbl = wo.sort_values("pct_change", ascending=False).head(topn)[
-                    ["canonical_title", "week_ending_dt", "prev_gross", "gross_use", "pct_change"]
-                ].copy()
-                tbl["week_ending_dt"] = tbl["week_ending_dt"].dt.date
-                st.dataframe(tbl, use_container_width=True)
-
-                st.markdown("#### Biggest week-over-week $ gains")
-                tbl = show_week.sort_values("abs_change", ascending=False).head(topn)[
-                    ["canonical_title", "week_ending_dt", "prev_gross", "gross_use", "abs_change"]
-                ].copy()
-                tbl["week_ending_dt"] = tbl["week_ending_dt"].dt.date
-                st.dataframe(tbl, use_container_width=True)
-
-            with c2:
-                st.markdown("#### Biggest week-over-week drops")
-                tbl = show_week.sort_values("abs_change", ascending=True).head(topn)[
-                    ["canonical_title", "week_ending_dt", "prev_gross", "gross_use", "abs_change"]
-                ].copy()
-                tbl["week_ending_dt"] = tbl["week_ending_dt"].dt.date
-                st.dataframe(tbl, use_container_width=True)
-
-                st.markdown("#### Biggest 4-appearance moves (net change)")
-                show_week["gross_4_ago"] = show_week.groupby("show_id")["gross_use"].shift(4)
-                show_week["net_4"] = show_week["gross_use"] - show_week["gross_4_ago"]
-                tbl = show_week.dropna(subset=["gross_4_ago"]).sort_values("net_4", ascending=False).head(topn)[
-                    ["canonical_title", "week_ending_dt", "gross_4_ago", "gross_use", "net_4"]
-                ].copy()
-                tbl["week_ending_dt"] = tbl["week_ending_dt"].dt.date
-                st.dataframe(tbl, use_container_width=True)
-
-            st.markdown("#### Hot shows right now (slope over last N appearances)")
-            window_n = st.slider("N appearances", min_value=3, max_value=20, value=6, step=1, key="trends_hot_n")
-            slopes = []
-            for (sid, title), g in show_week.groupby(["show_id", "canonical_title"]):
-                if len(g) < window_n:
-                    continue
-                gg = g.tail(window_n).copy()
-                y = gg["gross_use"].to_numpy()
-                x = np.arange(len(y), dtype=float)
-                # simple slope
-                try:
-                    slope = np.polyfit(x, y, 1)[0]
-                except Exception:
-                    continue
-                slopes.append({"show_id": sid, "canonical_title": title, "slope": slope, "last_week": gg["week_ending_dt"].iloc[-1].date()})
-            slope_df = pd.DataFrame(slopes).sort_values("slope", ascending=False).head(topn)
-            st.dataframe(slope_df, use_container_width=True)
-
-            st.markdown("#### Rebounders (big drop then recovery next appearance)")
-            drop_thr = st.number_input("Drop threshold (absolute)", min_value=0.0, value=5.0, step=0.5, key="trends_drop_thr")
-            rebound_thr = st.number_input("Rebound threshold (absolute)", min_value=0.0, value=5.0, step=0.5, key="trends_rebound_thr")
-
-            rebounds = []
-            for (sid, title), g in show_week.groupby(["show_id", "canonical_title"]):
-                g = g.sort_values("week_ending_dt").reset_index(drop=True)
-                for i in range(1, len(g)):
-                    if pd.isna(g.loc[i, "abs_change"]) or pd.isna(g.loc[i-1, "abs_change"]):
-                        continue
-                    # drop happened at i (from i-1 -> i)
-                    if g.loc[i, "abs_change"] <= -float(drop_thr):
-                        # recovery at next step
-                        if i + 1 < len(g) and g.loc[i + 1, "abs_change"] >= float(rebound_thr):
-                            rebounds.append({
-                                "canonical_title": title,
-                                "drop_week": g.loc[i, "week_ending_dt"].date(),
-                                "drop_change": g.loc[i, "abs_change"],
-                                "rebound_week": g.loc[i + 1, "week_ending_dt"].date(),
-                                "rebound_change": g.loc[i + 1, "abs_change"],
-                            })
-            reb_df = pd.DataFrame(rebounds).sort_values(["drop_week", "canonical_title"], ascending=[False, True]).head(topn)
-            st.dataframe(reb_df, use_container_width=True)
-
-    # ----------------------------
-    # Longevity
-    # ----------------------------
-    with subtabs[2]:
-        st.markdown("### Longevity & lifecycle")
-        st.caption("How shows typically rise/fall, time-to-peak, and half-life (time to 50% of peak).")
-
-        show_week = (
-            df_top10.groupby(["show_id", "canonical_title", "week_ending_dt"], as_index=False)["gross_use"]
-            .sum()
-            .sort_values(["show_id", "week_ending_dt"])
+        top_km = st.slider(
+            "Shows to plot (monthly)",
+            2,
+            min(50, int(len(leaders_m))),
+            min(10, int(len(leaders_m))),
+            key="m_race_topk",
         )
-        if show_week.empty:
-            st.info("No show/week data under current filters.")
-        else:
-            # chart age
-            show_week["chart_age"] = show_week.groupby("show_id").cumcount() + 1
+        top_titles_m = leaders_m.head(int(top_km))["canonical_title"].tolist()
 
-            # filter to shows with >= min_weeks
-            counts = show_week.groupby("show_id")["chart_age"].max()
-            keep_ids = counts[counts >= int(min_weeks)].index
-            sw = show_week[show_week["show_id"].isin(keep_ids)].copy()
-            if sw.empty:
-                st.info("No shows meet the 'min weeks' filter.")
-            else:
-                # Lifecycle curve (median + IQR by chart_age)
-                life = (
-                    sw.groupby("chart_age")["gross_use"]
-                    .agg(median="median", p25=lambda s: s.quantile(0.25), p75=lambda s: s.quantile(0.75), n="count")
-                    .reset_index()
-                )
-                fig = plt.figure()
-                plt.plot(life["chart_age"], life["median"])
-                plt.fill_between(life["chart_age"], life["p25"], life["p75"], alpha=0.2)
-                plt.xlabel("Chart week age")
-                plt.ylabel("Gross")
-                plt.title("Typical show lifecycle (median with IQR)")
-                st.pyplot(fig, clear_figure=True)
+        pivm = mdf[mdf["canonical_title"].isin(top_titles_m)].copy()
+        pivm = pivm.pivot_table(
+            index="week_ending_dt",
+            columns="canonical_title",
+            values="cum_gross_millions",
+            aggfunc="max",
+        ).sort_index()
+        pivm = pivm.reindex(pd.to_datetime(mweeks)).ffill()
 
-                # Time to peak
-                peak_rows = []
-                for (sid, title), g in sw.groupby(["show_id", "canonical_title"]):
-                    g = g.sort_values("chart_age")
-                    peak_idx = g["gross_use"].idxmax()
-                    row = g.loc[peak_idx]
-                    peak_rows.append({"canonical_title": title, "peak_age": int(row["chart_age"]), "peak_gross": float(row["gross_use"]), "peak_week": row["week_ending_dt"].date()})
-                peaks = pd.DataFrame(peak_rows)
-                fig = plt.figure()
-                bins = range(1, int(peaks["peak_age"].max()) + 2)
-                plt.hist(peaks["peak_age"], bins=bins)
-                plt.xlabel("Chart age at peak")
-                plt.ylabel("Count of shows")
-                plt.title("Time-to-peak distribution")
-                st.pyplot(fig, clear_figure=True)
+        series_by_label_m = {c: pivm[c] for c in pivm.columns}
+        _plot_multi_line(list(pivm.index), series_by_label_m, "Week Ending", "Cumulative Gross (Millions)")
 
-                with st.expander("Peak table (top 200 by peak gross)"):
-                    st.dataframe(peaks.sort_values("peak_gross", ascending=False).head(200), use_container_width=True)
-
-                # Half-life
-                half_rows = []
-                for (sid, title), g in sw.groupby(["show_id", "canonical_title"]):
-                    g = g.sort_values("chart_age")
-                    peak_g = g["gross_use"].max()
-                    if peak_g <= 0:
-                        continue
-                    half = 0.5 * peak_g
-                    # after (and including) peak, first time <= half
-                    peak_age = int(g.loc[g["gross_use"].idxmax(), "chart_age"])
-                    g_after = g[g["chart_age"] >= peak_age].copy()
-                    hit = g_after[g_after["gross_use"] <= half]
-                    if hit.empty:
-                        continue
-                    first = hit.iloc[0]
-                    half_rows.append({"canonical_title": title, "peak_age": peak_age, "half_age": int(first["chart_age"]), "weeks_to_half": int(first["chart_age"]) - peak_age})
-                half_df = pd.DataFrame(half_rows)
-                if not half_df.empty:
-                    fig = plt.figure()
-                    plt.hist(half_df["weeks_to_half"], bins=range(0, int(half_df["weeks_to_half"].max()) + 2))
-                    plt.xlabel("Weeks to fall to 50% of peak (after peak)")
-                    plt.ylabel("Count of shows")
-                    plt.title("Half-life distribution")
-                    st.pyplot(fig, clear_figure=True)
-
-                    with st.expander("Half-life table (top 200 slowest to decay)"):
-                        st.dataframe(half_df.sort_values("weeks_to_half", ascending=False).head(200), use_container_width=True)
-
-    # ----------------------------
-    # Market Structure
-    # ----------------------------
-    with subtabs[3]:
-        st.markdown("### Concentration / dominance")
-        wk_total = df_top10.groupby("week_ending_dt")["gross_use"].sum().sort_index()
-        if wk_total.empty:
-            st.info("No weekly totals.")
-        else:
-            wk_n1 = df_top10[df_top10["rank"].eq(1)].groupby("week_ending_dt")["gross_use"].sum()
-            wk_top3 = df_top10[df_top10["rank"].le(3)].groupby("week_ending_dt")["gross_use"].sum()
-            share1 = (wk_n1 / wk_total.replace(0, np.nan)).fillna(0.0)
-            share3 = (wk_top3 / wk_total.replace(0, np.nan)).fillna(0.0)
-
-            fig = plt.figure()
-            plt.plot(share1.index, share1.values, label="Top #1 share")
-            plt.plot(share3.index, share3.values, label="Top 3 share")
-            plt.legend()
-            plt.title("Share of total gross captured by #1 and Top 3")
-            st.pyplot(fig, clear_figure=True)
-
-            # HHI concentration across shows each week
-            hhi_rows = []
-            for wk, g in df_top10.groupby("week_ending_dt"):
-                tot = g["gross_use"].sum()
-                if tot <= 0:
-                    continue
-                shares = (g.groupby("show_id")["gross_use"].sum() / tot).to_numpy()
-                hhi = float(np.sum(shares ** 2))
-                hhi_rows.append({"week_ending_dt": wk, "hhi": hhi})
-            hhi_df = pd.DataFrame(hhi_rows).sort_values("week_ending_dt")
-            if not hhi_df.empty:
-                fig = plt.figure()
-                plt.plot(hhi_df["week_ending_dt"], hhi_df["hhi"])
-                plt.title("HHI-style concentration index (higher = more dominated)")
-                st.pyplot(fig, clear_figure=True)
-
-        st.markdown("### Turnover")
-        # New shows per week (first appearance in the FULL df, then filtered to current range)
-        full_sw = df_top10.groupby(["show_id"])["week_ending_dt"].min()
-        df_first = full_sw.reset_index().rename(columns={"week_ending_dt": "first_week"})
-        # Join back to get title for display
-        titles = df_top10.drop_duplicates("show_id")[["show_id", "canonical_title"]]
-        df_first = df_first.merge(titles, on="show_id", how="left")
-
-        new_counts = df_first.groupby("first_week").size().reset_index(name="new_shows").sort_values("first_week")
-        # only show within filter range
-        new_counts = new_counts[(new_counts["first_week"].dt.date >= d0) & (new_counts["first_week"].dt.date <= d1)].copy()
-
-        fig = plt.figure()
-        plt.plot(new_counts["first_week"], new_counts["new_shows"])
-        plt.title("New shows entering Top 10 (first-ever appearance) per week")
-        st.pyplot(fig, clear_figure=True)
-
-        with st.expander("Newest shows (top 200)"):
-            newest = df_first.sort_values("first_week", ascending=False).head(200)
-            newest["first_week"] = newest["first_week"].dt.date
-            st.dataframe(newest[["canonical_title", "first_week"]], use_container_width=True)
-
-    # ----------------------------
-    # Imprints / Companies
-    # ----------------------------
-    with subtabs[4]:
-        st.markdown("### Imprints / Companies")
-        st.caption("Share, momentum, and hit rate. By default, assigns gross to imprint_1 to avoid double-counting.")
-
-        mode = st.selectbox("Attribution mode", ["imprint_1 (no double count)", "imprint_2 (secondary only)", "split imprint_1 + imprint_2"], index=0, key="trends_imprint_mode")
-        topn = st.slider("Top N imprints to chart", min_value=3, max_value=15, value=8, step=1, key="trends_imprint_topn")
-
-        rows = []
-        for _, r in df_top10.iterrows():
-            g = float(r["gross_use"])
-            i1 = (r.get("imprint_1") or "(Unknown)").strip() if isinstance(r.get("imprint_1"), str) else "(Unknown)"
-            i2 = (r.get("imprint_2") or "").strip() if isinstance(r.get("imprint_2"), str) else ""
-            wk = r["week_ending_dt"]
-            sid = r["show_id"]
-            title = r["canonical_title"]
-
-            if mode.startswith("imprint_1"):
-                rows.append({"week_ending_dt": wk, "imprint": i1, "gross": g, "show_id": sid, "canonical_title": title})
-            elif mode.startswith("imprint_2"):
-                rows.append({"week_ending_dt": wk, "imprint": i2 or "(None)", "gross": g, "show_id": sid, "canonical_title": title})
-            else:
-                if i2:
-                    rows.append({"week_ending_dt": wk, "imprint": i1, "gross": g * 0.5, "show_id": sid, "canonical_title": title})
-                    rows.append({"week_ending_dt": wk, "imprint": i2, "gross": g * 0.5, "show_id": sid, "canonical_title": title})
-                else:
-                    rows.append({"week_ending_dt": wk, "imprint": i1, "gross": g, "show_id": sid, "canonical_title": title})
-
-        imp = pd.DataFrame(rows)
-        if imp.empty:
-            st.info("No imprint-attributed rows.")
-        else:
-            totals = imp.groupby("imprint")["gross"].sum().sort_values(ascending=False)
-            top_imps = list(totals.head(int(topn)).index)
-            imp["bucket"] = np.where(imp["imprint"].isin(top_imps), imp["imprint"], "Other")
-
-            ts = imp.groupby(["week_ending_dt", "bucket"])["gross"].sum().reset_index()
-            # pivot for plotting
-            piv = ts.pivot(index="week_ending_dt", columns="bucket", values="gross").fillna(0.0).sort_index()
-
-            fig = plt.figure()
-            for col in piv.columns:
-                plt.plot(piv.index, piv[col], label=str(col))
-            plt.legend(loc="upper left", ncol=2)
-            plt.title("Weekly gross by imprint (Top N + Other)")
-            st.pyplot(fig, clear_figure=True)
-
-            share_tbl = (totals / totals.sum()).reset_index()
-            share_tbl.columns = ["Imprint", "Share"]
-            share_tbl["TotalGross"] = totals.reset_index(drop=True)
-            st.dataframe(share_tbl.head(50), use_container_width=True)
-
-            st.markdown("#### Imprint momentum (last 13 weeks vs prior 13)")
-            w = 13
-            weekly_imp = imp.groupby(["week_ending_dt", "imprint"])["gross"].sum().reset_index()
-            all_weeks = sorted(weekly_imp["week_ending_dt"].unique())
-            if len(all_weeks) >= 2 * w:
-                end = all_weeks[-1]
-                last_start = all_weeks[-w]
-                prev_start = all_weeks[-2*w]
-                last = weekly_imp[(weekly_imp["week_ending_dt"] >= last_start) & (weekly_imp["week_ending_dt"] <= end)].groupby("imprint")["gross"].sum()
-                prev = weekly_imp[(weekly_imp["week_ending_dt"] >= prev_start) & (weekly_imp["week_ending_dt"] < last_start)].groupby("imprint")["gross"].sum()
-                mom = pd.DataFrame({"last13": last, "prev13": prev}).fillna(0.0)
-                mom["change"] = mom["last13"] - mom["prev13"]
-                mom = mom.sort_values("change", ascending=False).reset_index()
-                st.dataframe(mom.head(50), use_container_width=True)
-            else:
-                st.info("Not enough weeks for 13+13 momentum window.")
-
-            st.markdown("#### Hit rate")
-            # For hit rate, use imprint assignment on weekly #1 and top3
-            top3 = df[df["rank"].le(3)].copy()
-            top1 = df[df["rank"].eq(1)].copy()
-
-            def _assign_imprint(dfx: pd.DataFrame) -> pd.DataFrame:
-                out = []
-                for _, rr in dfx.iterrows():
-                    i1 = (rr.get("imprint_1") or "(Unknown)").strip() if isinstance(rr.get("imprint_1"), str) else "(Unknown)"
-                    i2 = (rr.get("imprint_2") or "").strip() if isinstance(rr.get("imprint_2"), str) else ""
-                    if mode.startswith("imprint_1"):
-                        out.append({"imprint": i1, "show_id": rr["show_id"]})
-                    elif mode.startswith("imprint_2"):
-                        out.append({"imprint": i2 or "(None)", "show_id": rr["show_id"]})
-                    else:
-                        if i2:
-                            out.append({"imprint": i1, "show_id": rr["show_id"]})
-                            out.append({"imprint": i2, "show_id": rr["show_id"]})
-                        else:
-                            out.append({"imprint": i1, "show_id": rr["show_id"]})
-                return pd.DataFrame(out)
-
-            all_imp = _assign_imprint(df_top10)
-            t3_imp = _assign_imprint(top3)
-            t1_imp = _assign_imprint(top1)
-
-            hits = pd.DataFrame({
-                "entries": all_imp.groupby("imprint").size(),
-                "top3_entries": t3_imp.groupby("imprint").size(),
-                "n1_entries": t1_imp.groupby("imprint").size(),
-            }).fillna(0.0)
-            hits["top3_rate"] = hits["top3_entries"] / hits["entries"].replace(0, np.nan)
-            hits["n1_rate"] = hits["n1_entries"] / hits["entries"].replace(0, np.nan)
-            hits = hits.fillna(0.0).sort_values("entries", ascending=False).reset_index()
-            st.dataframe(hits.head(50), use_container_width=True)
-
-    # ----------------------------
-    # Anomalies & Eras
-    # ----------------------------
-    with subtabs[5]:
-        st.markdown("### Outlier weeks")
-        weekly_total = df_top10.groupby("week_ending_dt")["gross_use"].sum().sort_index()
-        if weekly_total.empty:
-            st.info("No weekly totals.")
-        else:
-            w = st.slider("Rolling window for outliers (weeks)", min_value=4, max_value=26, value=13, step=1, key="trends_outlier_window")
-            zthr = st.slider("Z-score threshold", min_value=1.0, max_value=5.0, value=2.5, step=0.1, key="trends_zthr")
-
-            mu = weekly_total.rolling(w, min_periods=max(2, w//2)).mean()
-            sd = weekly_total.rolling(w, min_periods=max(2, w//2)).std().replace(0, np.nan)
-            z = ((weekly_total - mu) / sd).replace([np.inf, -np.inf], np.nan)
-
-            out = pd.DataFrame({"week": weekly_total.index, "total_gross": weekly_total.values, "z": z.values}).dropna(subset=["z"])
-            out = out[np.abs(out["z"]) >= float(zthr)].sort_values("z", ascending=False)
-
-            fig = plt.figure()
-            plt.plot(weekly_total.index, weekly_total.values)
-            plt.title("Weekly total gross (Top 10)")
-            st.pyplot(fig, clear_figure=True)
-
-            if out.empty:
-                st.info("No outliers at the current threshold/window.")
-            else:
-                # add top contributors (top 3 shows that week)
-                contrib = []
-                for wk in out["week"].head(50):
-                    g = df_top10[df_top10["week_ending_dt"].eq(wk)].sort_values("gross_use", ascending=False)
-                    tops = g.head(3)[["canonical_title", "gross_use"]].to_records(index=False)
-                    contrib.append(", ".join([f"{t} ({v:.2f})" for t, v in tops]))
-                out_disp = out.head(50).copy()
-                out_disp["week"] = out_disp["week"].dt.date
-                out_disp["top_contributors"] = contrib + [""] * max(0, len(out_disp) - len(contrib))
-                st.dataframe(out_disp, use_container_width=True)
-
-        st.markdown("### Era detection (heuristic change points)")
-        st.caption("Detects large sustained shifts in average total gross using a lookback/lookahead window. This is a heuristic, not a statistical guarantee.")
-
-        weekly_total = df_top10.groupby("week_ending_dt")["gross_use"].sum().sort_index()
-        if len(weekly_total) < 60:
-            st.info("Need at least ~60 weeks in the selected range for era detection.")
-        else:
-            look = st.slider("Lookback/lookahead window (weeks)", min_value=8, max_value=52, value=26, step=1, key="trends_era_look")
-            thr = st.slider("Shift threshold (%)", min_value=5, max_value=50, value=15, step=1, key="trends_era_thr")
-
-            vals = weekly_total.values
-            idx = weekly_total.index.to_list()
-            boundaries = []
-            last_b = 0
-            for i in range(look, len(vals) - look):
-                if i - last_b < look:
-                    continue
-                back = np.mean(vals[i - look : i])
-                fwd = np.mean(vals[i : i + look])
-                if back <= 0:
-                    continue
-                pct = abs(fwd - back) / back * 100.0
-                if pct >= float(thr):
-                    boundaries.append(i)
-                    last_b = i
-
-            # Build eras
-            cuts = [0] + boundaries + [len(vals)]
-            eras = []
-            for a, b in zip(cuts[:-1], cuts[1:]):
-                if b - a < max(6, look // 2):
-                    continue
-                seg = vals[a:b]
-                eras.append({
-                    "start_week": idx[a].date(),
-                    "end_week": idx[b-1].date(),
-                    "weeks": b - a,
-                    "avg_total": float(np.mean(seg)),
-                    "median_total": float(np.median(seg)),
-                    "volatility": float(np.std(seg)),
-                })
-            eras_df = pd.DataFrame(eras)
-
-            fig = plt.figure()
-            plt.plot(idx, vals)
-            for bi in boundaries:
-                plt.axvline(idx[bi], linestyle="--")
-            plt.title("Weekly total gross with detected era boundaries")
-            st.pyplot(fig, clear_figure=True)
-
-            if eras_df.empty:
-                st.info("No eras detected at current settings.")
-            else:
-                st.dataframe(eras_df, use_container_width=True)
 
 # ----------------------------
 # New tab: Streak Analytics
@@ -2636,10 +1817,175 @@ def tab_holidays():
             "- Easter/Memorial Day/Labor Day/MLK Day/Presidents Day → Saturday before\n"
         )
 
+def tab_admin():
+    st.subheader("Admin (Normalize titles: aliases + merges)")
+    st.warning("This edits the database. If you're experimenting, copy t10.sqlite first.")
+    shows, _ = load_lists()
+    titles = shows["canonical_title"].tolist()
+
+    st.markdown("### Add alias (map a raw title string to a canonical show)")
+    col1, col2 = st.columns(2)
+    with col1:
+        canonical = st.selectbox("Canonical show", titles, key="alias_canonical")
+    with col2:
+        alias = st.text_input("Alias title (exact)", key="alias_title", placeholder="Type the exact variant you want to map")
+
+    if st.button("Add alias mapping"):
+        if not alias.strip():
+            st.error("Alias title can't be blank.")
+        else:
+            show_id = int(shows.loc[shows["canonical_title"] == canonical, "show_id"].iloc[0])
+            sql_exec("INSERT OR REPLACE INTO show_alias(alias_title, show_id) VALUES (?, ?)", (alias.strip(), show_id))
+            sql_df.clear()
+            load_lists.clear()
+            st.success("Alias saved.")
+
+    st.markdown("### Merge two canonical shows (combine histories)")
+    c1, c2 = st.columns(2)
+    with c1:
+        keep = st.selectbox("Keep (target canonical)", titles, key="merge_keep")
+    with c2:
+        merge = st.selectbox("Merge (source canonical)", titles, key="merge_src")
+
+    if st.button("Merge these shows"):
+        if keep == merge:
+            st.error("Pick two different shows.")
+        else:
+            keep_id = int(shows.loc[shows["canonical_title"] == keep, "show_id"].iloc[0])
+            src_id = int(shows.loc[shows["canonical_title"] == merge, "show_id"].iloc[0])
+
+            con = get_con()
+            try:
+                cur = con.cursor()
+                cur.execute("BEGIN;")
+
+                cur.execute("UPDATE t10_entry SET show_id = ? WHERE show_id = ?", (keep_id, src_id))
+
+                cur.execute("""
+                    INSERT OR IGNORE INTO show_alias(alias_title, show_id)
+                    SELECT alias_title, ? FROM show_alias WHERE show_id = ?
+                """, (keep_id, src_id))
+
+                cur.execute("INSERT OR IGNORE INTO show_alias(alias_title, show_id) VALUES (?, ?)", (merge, keep_id))
+                cur.execute("DELETE FROM show WHERE show_id = ?", (src_id,))
+
+                con.commit()
+            finally:
+                con.close()
+
+            sql_df.clear()
+            load_lists.clear()
+            st.success(f"Merged '{merge}' into '{keep}'.")
+
+    
+    st.markdown("### Merge imprint labels (relabel imprint_1 / imprint_2)")
+    with st.expander("Merge/rename an imprint", expanded=False):
+        st.caption("Replaces one imprint label with another across all weeks (both imprint_1 and imprint_2).")
+
+        imprints = fetch_distinct_imprints()
+        if not imprints:
+            st.info("No imprints found in the database.")
+        else:
+            c1, c2 = st.columns(2)
+            with c1:
+                from_imp = st.selectbox("From (imprint to replace)", imprints, key="imp_merge_from")
+            with c2:
+                to_imp_pick = st.selectbox("To (existing imprint)", imprints, key="imp_merge_to_pick")
+
+            to_imp_custom = st.text_input("Or type a new imprint label (optional)", value="", key="imp_merge_to_custom")
+            to_imp = to_imp_custom.strip() if to_imp_custom.strip() else to_imp_pick
+
+            if from_imp == to_imp:
+                st.warning("Pick two different imprint labels.")
+            else:
+                preview = sql_df(
+                    """
+                    SELECT
+                      SUM(CASE WHEN imprint_1 = :f THEN 1 ELSE 0 END) AS hits_imprint_1,
+                      SUM(CASE WHEN imprint_2 = :f THEN 1 ELSE 0 END) AS hits_imprint_2
+                    FROM t10_entry
+                    """,
+                    params={"f": from_imp},
+                )
+                h1 = int(preview.loc[0, "hits_imprint_1"]) if not preview.empty else 0
+                h2 = int(preview.loc[0, "hits_imprint_2"]) if not preview.empty else 0
+                st.write(f"Rows to change: imprint_1 = **{h1}**, imprint_2 = **{h2}**")
+
+                if st.button("Merge imprint", type="primary", key="imp_merge_apply"):
+                    con = get_con()
+                    try:
+                        cur = con.cursor()
+                        cur.execute("BEGIN;")
+
+                        cur.execute("UPDATE t10_entry SET imprint_1 = ? WHERE imprint_1 = ?", (to_imp, from_imp))
+                        cur.execute("UPDATE t10_entry SET imprint_2 = ? WHERE imprint_2 = ?", (to_imp, from_imp))
+
+                        # Normalize whitespace
+                        cur.execute("UPDATE t10_entry SET imprint_1 = TRIM(imprint_1) WHERE imprint_1 IS NOT NULL;")
+                        cur.execute("UPDATE t10_entry SET imprint_2 = TRIM(imprint_2) WHERE imprint_2 IS NOT NULL;")
+
+                        # If imprint_1 empty but imprint_2 filled, shift up
+                        cur.execute(
+                            """
+                            UPDATE t10_entry
+                            SET imprint_1 = imprint_2, imprint_2 = NULL
+                            WHERE (imprint_1 IS NULL OR TRIM(imprint_1) = '')
+                              AND imprint_2 IS NOT NULL AND TRIM(imprint_2) <> ''
+                            """
+                        )
+
+                        # If imprint_2 duplicates imprint_1, drop imprint_2
+                        cur.execute(
+                            """
+                            UPDATE t10_entry
+                            SET imprint_2 = NULL
+                            WHERE imprint_1 IS NOT NULL AND TRIM(imprint_1) <> ''
+                              AND imprint_2 IS NOT NULL AND TRIM(imprint_2) <> ''
+                              AND imprint_1 = imprint_2
+                            """
+                        )
+
+                        con.commit()
+                        st.success(f"Merged imprint '{from_imp}' → '{to_imp}'.")
+                    finally:
+                        con.close()
+
+                    # refresh cached lists/data
+                    try:
+                        sql_df.clear()
+                    except Exception:
+                        pass
+                    try:
+                        load_lists.clear()
+                    except Exception:
+                        pass
+                    try:
+                        fetch_distinct_imprints.clear()
+                    except Exception:
+                        pass
+                    st.rerun()
+
+
+    # Safety: refresh lists here so titles/shows are always defined (and up-to-date)
+    try:
+        shows, _ = load_lists()
+    except Exception:
+        shows = pd.DataFrame(columns=["show_id", "canonical_title"])
+    titles = (
+        shows["canonical_title"].astype(str).tolist()
+        if isinstance(shows, pd.DataFrame) and "canonical_title" in shows.columns
+        else []
+    )
+
+    st.markdown("### View aliases for a show")
+    show_for_aliases = st.selectbox("Show", titles, key="alias_list_show")
+    show_id = int(shows.loc[shows["canonical_title"] == show_for_aliases, "show_id"].iloc[0])
+    alias_df = sql_df("SELECT alias_title FROM show_alias WHERE show_id = ? ORDER BY alias_title", (show_id,))
+    st.dataframe(alias_df, use_container_width=True)
+
 
 # ----------------------------
-# New tab: Records and Achievements
-# ----------------------------
+# Main
 @st.cache_data(show_spinner=False)
 def _load_records_base(db_path: str, db_mtime: float) -> pd.DataFrame:
     """Load chart rows for record calculations (weekly gross only; no gross bonuses). db_mtime busts cache."""
@@ -3317,433 +2663,28 @@ def tab_records_achievements():
         disp = pd.DataFrame(rows)
         st.dataframe(disp, use_container_width=True, hide_index=True)
 
-def tab_admin():
-    st.subheader("Admin (Normalize titles: aliases + merges)")
-    st.warning("This edits the database. If you're experimenting, copy t10.sqlite first.")
-    shows, _ = load_lists()
-    titles = shows["canonical_title"].tolist()
 
-    st.markdown("### Add alias (map a raw title string to a canonical show)")
-    col1, col2 = st.columns(2)
-    with col1:
-        canonical = st.selectbox("Canonical show", titles, key="alias_canonical")
-    with col2:
-        alias = st.text_input("Alias title (exact)", key="alias_title", placeholder="Type the exact variant you want to map")
-
-    if st.button("Add alias mapping"):
-        if not alias.strip():
-            st.error("Alias title can't be blank.")
-        else:
-            show_id = int(shows.loc[shows["canonical_title"] == canonical, "show_id"].iloc[0])
-            sql_exec("INSERT OR REPLACE INTO show_alias(alias_title, show_id) VALUES (?, ?)", (alias.strip(), show_id))
-            sql_df.clear()
-            load_lists.clear()
-            st.success("Alias saved.")
-
-    st.markdown("### Merge two canonical shows (combine histories)")
-    c1, c2 = st.columns(2)
-    with c1:
-        keep = st.selectbox("Keep (target canonical)", titles, key="merge_keep")
-    with c2:
-        merge = st.selectbox("Merge (source canonical)", titles, key="merge_src")
-
-    if st.button("Merge these shows"):
-        if keep == merge:
-            st.error("Pick two different shows.")
-        else:
-            keep_id = int(shows.loc[shows["canonical_title"] == keep, "show_id"].iloc[0])
-            src_id = int(shows.loc[shows["canonical_title"] == merge, "show_id"].iloc[0])
-
-            con = get_con()
-            try:
-                cur = con.cursor()
-                cur.execute("BEGIN;")
-
-                cur.execute("UPDATE t10_entry SET show_id = ? WHERE show_id = ?", (keep_id, src_id))
-
-                cur.execute("""
-                    INSERT OR IGNORE INTO show_alias(alias_title, show_id)
-                    SELECT alias_title, ? FROM show_alias WHERE show_id = ?
-                """, (keep_id, src_id))
-
-                cur.execute("INSERT OR IGNORE INTO show_alias(alias_title, show_id) VALUES (?, ?)", (merge, keep_id))
-                cur.execute("DELETE FROM show WHERE show_id = ?", (src_id,))
-
-                con.commit()
-            finally:
-                con.close()
-
-            sql_df.clear()
-            load_lists.clear()
-            st.success(f"Merged '{merge}' into '{keep}'.")
-
-    st.markdown('---')
-    st.markdown('')
-    st.markdown("### Merge imprint labels (relabel imprint_1 / imprint_2)")
-    with st.expander("Merge/rename an imprint", expanded=False):
-        st.caption("Replaces one imprint label with another across all weeks (both imprint_1 and imprint_2).")
-
-        imprints = fetch_distinct_imprints()
-        if not imprints:
-            st.info("No imprints found in the database.")
-        else:
-            c1, c2 = st.columns(2)
-            with c1:
-                from_imp = st.selectbox("From (imprint to replace)", imprints, key="imp_merge_from")
-            with c2:
-                to_imp_pick = st.selectbox("To (existing imprint)", imprints, key="imp_merge_to_pick")
-
-            to_imp_custom = st.text_input("Or type a new imprint label (optional)", value="", key="imp_merge_to_custom")
-            to_imp = to_imp_custom.strip() if to_imp_custom.strip() else to_imp_pick
-
-            if from_imp == to_imp:
-                st.warning("Pick two different imprint labels.")
-            else:
-                preview = sql_df(
-                    """
-                    SELECT
-                      SUM(CASE WHEN imprint_1 = :f THEN 1 ELSE 0 END) AS hits_imprint_1,
-                      SUM(CASE WHEN imprint_2 = :f THEN 1 ELSE 0 END) AS hits_imprint_2
-                    FROM t10_entry
-                    """,
-                    params={"f": from_imp},
-                )
-                h1 = int(preview.loc[0, "hits_imprint_1"]) if not preview.empty else 0
-                h2 = int(preview.loc[0, "hits_imprint_2"]) if not preview.empty else 0
-                st.write(f"Rows to change: imprint_1 = **{h1}**, imprint_2 = **{h2}**")
-
-                if st.button("Merge imprint", type="primary", key="imp_merge_apply"):
-                    con = get_con()
-                    try:
-                        cur = con.cursor()
-                        cur.execute("BEGIN;")
-
-                        cur.execute("UPDATE t10_entry SET imprint_1 = ? WHERE imprint_1 = ?", (to_imp, from_imp))
-                        cur.execute("UPDATE t10_entry SET imprint_2 = ? WHERE imprint_2 = ?", (to_imp, from_imp))
-
-                        # Normalize whitespace
-                        cur.execute("UPDATE t10_entry SET imprint_1 = TRIM(imprint_1) WHERE imprint_1 IS NOT NULL;")
-                        cur.execute("UPDATE t10_entry SET imprint_2 = TRIM(imprint_2) WHERE imprint_2 IS NOT NULL;")
-
-                        # If imprint_1 empty but imprint_2 filled, shift up
-                        cur.execute(
-                            """
-                            UPDATE t10_entry
-                            SET imprint_1 = imprint_2, imprint_2 = NULL
-                            WHERE (imprint_1 IS NULL OR TRIM(imprint_1) = '')
-                              AND imprint_2 IS NOT NULL AND TRIM(imprint_2) <> ''
-                            """
-                        )
-
-                        # If imprint_2 duplicates imprint_1, drop imprint_2
-                        cur.execute(
-                            """
-                            UPDATE t10_entry
-                            SET imprint_2 = NULL
-                            WHERE imprint_1 IS NOT NULL AND TRIM(imprint_1) <> ''
-                              AND imprint_2 IS NOT NULL AND TRIM(imprint_2) <> ''
-                              AND imprint_1 = imprint_2
-                            """
-                        )
-
-                        con.commit()
-                        st.success(f"Merged imprint '{from_imp}' → '{to_imp}'.")
-                    finally:
-                        con.close()
-
-                    # refresh cached lists/data
-                    try:
-                        sql_df.clear()
-                    except Exception:
-                        pass
-                    try:
-                        load_lists.clear()
-                    except Exception:
-                        pass
-                    try:
-                        fetch_distinct_imprints.clear()
-                    except Exception:
-                        pass
-                    st.rerun()
-
-
-
-    
-    # Safety: refresh lists here so titles/shows are always defined (and up-to-date)
-    try:
-        shows, _ = load_lists()
-    except Exception:
-        shows = pd.DataFrame(columns=["show_id", "canonical_title"])
-    titles = (
-        shows["canonical_title"].astype(str).tolist()
-        if isinstance(shows, pd.DataFrame) and "canonical_title" in shows.columns
-        else []
-    )
-
-    st.markdown("### Set imprints for a show")
-    with st.expander("Add / fix imprints for one show", expanded=False):
-        st.caption(
-            "Set imprint_1 and/or imprint_2 for a specific show across its weeks. "
-            "This keeps both imprints when they differ (no forced consolidation)."
-        )
-
-        if not titles:
-            st.info("No shows found.")
-        else:
-            sel_title = st.selectbox("Show", titles, key="imp_set_show")
-            sel_id = int(shows.loc[shows["canonical_title"] == sel_title, "show_id"].iloc[0])
-
-            stats = sql_df(
-                """
-                SELECT
-                  COUNT(*) AS weeks,
-                  SUM(CASE
-                        WHEN (imprint_1 IS NULL OR TRIM(imprint_1) = '')
-                         AND (imprint_2 IS NULL OR TRIM(imprint_2) = '')
-                        THEN 1 ELSE 0 END) AS missing_both,
-                  SUM(CASE
-                        WHEN (imprint_1 IS NULL OR TRIM(imprint_1) = '')
-                         AND (imprint_2 IS NOT NULL AND TRIM(imprint_2) <> '')
-                        THEN 1 ELSE 0 END) AS missing_imprint_1,
-                  SUM(CASE
-                        WHEN (imprint_2 IS NULL OR TRIM(imprint_2) = '')
-                         AND (imprint_1 IS NOT NULL AND TRIM(imprint_1) <> '')
-                        THEN 1 ELSE 0 END) AS missing_imprint_2
-                FROM t10_entry
-                WHERE show_id = ?
-                """,
-                (sel_id,),
-            )
-            if not stats.empty:
-                s_weeks = 0 if pd.isna(stats.loc[0,'weeks']) else int(stats.loc[0,'weeks'])
-                s_missing_both = 0 if pd.isna(stats.loc[0,'missing_both']) else int(stats.loc[0,'missing_both'])
-                s_missing_1 = 0 if pd.isna(stats.loc[0,'missing_imprint_1']) else int(stats.loc[0,'missing_imprint_1'])
-                s_missing_2 = 0 if pd.isna(stats.loc[0,'missing_imprint_2']) else int(stats.loc[0,'missing_imprint_2'])
-                st.write(
-                    f"Weeks: **{s_weeks}** · "
-                    f"Missing both: **{s_missing_both}** · "
-                    f"Missing imprint_1: **{s_missing_1}** · "
-                    f"Missing imprint_2: **{s_missing_2}**"
-                )
-
-
-            st.markdown("**Current imprint pairs in the data**")
-            cur_pairs = sql_df(
-                """
-                SELECT DISTINCT
-                  COALESCE(NULLIF(TRIM(imprint_1), ''), '(blank)') AS imprint_1,
-                  COALESCE(NULLIF(TRIM(imprint_2), ''), '(blank)') AS imprint_2
-                FROM t10_entry
-                WHERE show_id = ?
-                ORDER BY imprint_1, imprint_2
-                """,
-                (sel_id,),
-            )
-            st.dataframe(cur_pairs, use_container_width=True, hide_index=True)
-
-            c1, c2 = st.columns(2)
-            with c1:
-                new_imp1 = st.text_input("Set imprint_1 to (optional)", value="", key="imp_set_1").strip()
-            with c2:
-                new_imp2 = st.text_input("Set imprint_2 to (optional)", value="", key="imp_set_2").strip()
-
-            mode = st.radio(
-                "Apply mode",
-                ["Fill missing only", "Overwrite existing (dangerous)"],
-                index=0,
-                horizontal=True,
-                key="imp_set_mode",
-            )
-
-            if mode == "Fill missing only":
-                st.caption("Tip: leave a field blank to avoid changing that imprint column.")
-                fill_both = st.checkbox(
-                    "Fill weeks where BOTH imprints are blank",
-                    value=True,
-                    key="imp_set_fill_both",
-                )
-                fill1 = st.checkbox(
-                    "Also fill imprint_1 when blank (even if imprint_2 is present)",
-                    value=False,
-                    key="imp_set_fill1",
-                )
-                fill2 = st.checkbox(
-                    "Also fill imprint_2 when blank (even if imprint_1 is present)",
-                    value=False,
-                    key="imp_set_fill2",
-                )
-                confirm_ok = True
-            else:
-                confirm_ok = st.checkbox(
-                    "I understand this will overwrite imprints for ALL weeks of this show.",
-                    value=False,
-                    key="imp_set_confirm_overwrite",
-                )
-                fill_both = fill1 = fill2 = False  # not used
-
-            if st.button("Apply imprint update", type="primary", key="imp_set_apply"):
-                if not confirm_ok:
-                    st.warning("Please confirm overwrite to proceed.")
-                elif not (new_imp1 or new_imp2):
-                    st.warning("Enter at least one imprint value to apply.")
-                else:
-                    con = get_con()
-                    try:
-                        cur = con.cursor()
-                        cur.execute("BEGIN;")
-
-                        # Helper: conditions
-                        cond_both_blank = (
-                            "(imprint_1 IS NULL OR TRIM(imprint_1) = '') "
-                            "AND (imprint_2 IS NULL OR TRIM(imprint_2) = '')"
-                        )
-                        cond_i1_blank_i2_present = (
-                            "(imprint_1 IS NULL OR TRIM(imprint_1) = '') "
-                            "AND (imprint_2 IS NOT NULL AND TRIM(imprint_2) <> '')"
-                        )
-                        cond_i2_blank_i1_present = (
-                            "(imprint_2 IS NULL OR TRIM(imprint_2) = '') "
-                            "AND (imprint_1 IS NOT NULL AND TRIM(imprint_1) <> '')"
-                        )
-
-                        if mode == "Fill missing only":
-                            if fill_both:
-                                if new_imp1:
-                                    cur.execute(
-                                        f"UPDATE t10_entry SET imprint_1 = ? WHERE show_id = ? AND {cond_both_blank}",
-                                        (new_imp1, sel_id),
-                                    )
-                                if new_imp2:
-                                    cur.execute(
-                                        f"UPDATE t10_entry SET imprint_2 = ? WHERE show_id = ? AND {cond_both_blank}",
-                                        (new_imp2, sel_id),
-                                    )
-
-                            if fill1 and new_imp1:
-                                cur.execute(
-                                    f"UPDATE t10_entry SET imprint_1 = ? WHERE show_id = ? AND {cond_i1_blank_i2_present}",
-                                    (new_imp1, sel_id),
-                                )
-
-                            if fill2 and new_imp2:
-                                cur.execute(
-                                    f"UPDATE t10_entry SET imprint_2 = ? WHERE show_id = ? AND {cond_i2_blank_i1_present}",
-                                    (new_imp2, sel_id),
-                                )
-                        else:
-                            # Overwrite (only columns provided)
-                            if new_imp1:
-                                cur.execute(
-                                    "UPDATE t10_entry SET imprint_1 = ? WHERE show_id = ?",
-                                    (new_imp1, sel_id),
-                                )
-                            if new_imp2:
-                                cur.execute(
-                                    "UPDATE t10_entry SET imprint_2 = ? WHERE show_id = ?",
-                                    (new_imp2, sel_id),
-                                )
-
-                        # Normalize whitespace; remove exact duplicates only (keeps distinct pairs)
-                        cur.execute("UPDATE t10_entry SET imprint_1 = TRIM(imprint_1) WHERE imprint_1 IS NOT NULL;")
-                        cur.execute("UPDATE t10_entry SET imprint_2 = TRIM(imprint_2) WHERE imprint_2 IS NOT NULL;")
-                        cur.execute(
-                            """
-                            UPDATE t10_entry
-                            SET imprint_2 = NULL
-                            WHERE show_id = ?
-                              AND imprint_1 IS NOT NULL AND TRIM(imprint_1) <> ''
-                              AND imprint_2 IS NOT NULL AND TRIM(imprint_2) <> ''
-                              AND imprint_1 = imprint_2
-                            """,
-                            (sel_id,),
-                        )
-
-                        con.commit()
-                    finally:
-                        con.close()
-
-                    try:
-                        sql_df.clear()
-                    except Exception:
-                        pass
-                    try:
-                        fetch_distinct_imprints.clear()
-                    except Exception:
-                        pass
-                    st.success("Imprints updated.")
-                    st.rerun()
-
-    st.markdown('---')
-    
-    st.markdown('---')
-    st.markdown("### Export show list (show_id)")
-    export_show_df = sql_df("SELECT show_id, canonical_title FROM show ORDER BY show_id")
-    st.caption("Download a simple lookup of show_id ↔ canonical_title. (This is based on the `show` table.)")
-
-    csv_bytes = export_show_df.to_csv(index=False).encode("utf-8")
-    st.download_button(
-        "Download show_ids.csv",
-        data=csv_bytes,
-        file_name="show_ids.csv",
-        mime="text/csv",
-        key="dl_show_ids_csv",
-    )
-
-    # Excel (optional)
-    try:
-        import openpyxl  # type: ignore  # noqa: F401
-
-        xlsx_buf = io.BytesIO()
-        with pd.ExcelWriter(xlsx_buf, engine="openpyxl") as writer:
-            export_show_df.to_excel(writer, index=False, sheet_name="show_ids")
-        st.download_button(
-            "Download show_ids.xlsx",
-            data=xlsx_buf.getvalue(),
-            file_name="show_ids.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            key="dl_show_ids_xlsx",
-        )
-    except Exception:
-        st.info("Excel export requires `openpyxl`. Install it in your venv with: `pip install openpyxl`")
-    st.markdown("### View aliases for a show")
-    show_for_aliases = st.selectbox("Show", titles, key="alias_list_show")
-    show_id = int(shows.loc[shows["canonical_title"] == show_for_aliases, "show_id"].iloc[0])
-    alias_df = sql_df("SELECT alias_title FROM show_alias WHERE show_id = ? ORDER BY alias_title", (show_id,))
-    st.dataframe(alias_df, use_container_width=True)
-    
-    
-# ----------------------------
-# Main
 # ----------------------------
 def main():
     st.set_page_config(page_title=APP_TITLE, layout="wide")
     st.title(APP_TITLE)
     st.caption("SQLite + FTS search, per-show analytics, company analytics, and movement/grossing charts. (Ties supported.)")
 
-    # Make the top tab bar horizontally scrollable (so you can reach "Admin" on smaller screens)
-    st.markdown(
-        """
-        <style>
-        /* Streamlit tabs: allow horizontal scrolling instead of wrapping/cropping */
-        div[data-baseweb="tab-list"] {
-            overflow-x: auto;
-            overflow-y: hidden;
-            flex-wrap: nowrap !important;
-            scrollbar-width: thin; /* Firefox */
-        }
-        div[data-baseweb="tab-list"] > div {
-            flex-wrap: nowrap !important;
-        }
-        div[data-baseweb="tab-list"] button {
-            white-space: nowrap;
-        }
-        </style>
-        """,
-        unsafe_allow_html=True,
-    )
+    # Keep Admin last.
+    tabs = st.tabs([
+        "Search",
+        "Show Detail",
+        "Compare Two Shows",
+        "Companies",
+        "Analytics",
+        "Gross Races",
+        "Grossing Milestones",
+        "Streak Analytics",
+        "Holidays",
+        "Records and Achievements",
+        "Admin",
+    ])
 
-    # Original tabs + 2 new tabs inserted before Admin (so Admin stays last)
-    tabs = st.tabs(["Search", "Show Detail", "Compare Two Shows", "Companies", "Analytics", "Gross Races", "Grossing Milestones", "Grossing Trends", "Streak Analytics", "Holidays", "Records and Achievements", "Admin"])
     with tabs[0]:
         tab_search()
     with tabs[1]:
@@ -3759,14 +2700,12 @@ def main():
     with tabs[6]:
         tab_grossing_milestones()
     with tabs[7]:
-        tab_grossing_trends()
-    with tabs[8]:
         tab_streak_analytics()
-    with tabs[9]:
+    with tabs[8]:
         tab_holidays()
-    with tabs[10]:
+    with tabs[9]:
         tab_records_achievements()
-    with tabs[11]:
+    with tabs[10]:
         tab_admin()
 
 
