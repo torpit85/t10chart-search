@@ -88,6 +88,17 @@ def load_lists() -> tuple[pd.DataFrame, pd.DataFrame]:
     """)
     return shows, companies
 
+@st.cache_data(show_spinner=False)
+def load_imprint2_list() -> pd.DataFrame:
+    """Distinct Imprint 2 values for selector (normalize blanks to '(None)')."""
+    return sql_df(
+        """
+        SELECT DISTINCT COALESCE(NULLIF(TRIM(imprint_2),''),'(None)') AS imprint_2
+        FROM t10_entry
+        ORDER BY imprint_2
+        """
+    )
+
 
 # ----------------------------
 # Data fetchers
@@ -323,6 +334,39 @@ def fetch_company_entries(company: str, filters: FilterSpec, limit: int = 2000) 
     return df
 
 
+
+
+def fetch_imprint2_entries(imprint2: str, filters: FilterSpec, limit: int = 2000) -> pd.DataFrame:
+    """Entries for Imprint 2 selection. Normalizes blanks to '(None)'."""
+    where, params = build_where(filters, "e")
+    sql = f"""
+    SELECT
+      e.week_ending,
+      e.week_number,
+      e.rank,
+      e.pos,
+      s.canonical_title,
+      e.raw_title,
+      e.imprint_1,
+      e.imprint_2,
+      e.gross_millions AS base_gross_millions,
+      COALESCE(gb.bonus_millions, 0) AS bonus_millions,
+      (e.gross_millions + COALESCE(gb.bonus_millions, 0)) AS gross_millions
+    FROM t10_entry e
+    LEFT JOIN gross_bonus gb
+      ON gb.week_ending = e.week_ending
+     AND gb.show_id = e.show_id
+    JOIN show s ON s.show_id = e.show_id
+    WHERE COALESCE(NULLIF(TRIM(e.imprint_2),''),'(None)') = ?
+      AND {where}
+    ORDER BY e.week_ending DESC, e.rank ASC, e.pos ASC
+    LIMIT ?
+    """
+    df = sql_df(sql, tuple([imprint2] + params + [int(limit)]))
+    if not df.empty:
+        df["week_ending"] = _as_date_str(df["week_ending"])
+        df["imprint_2"] = df["imprint_2"].fillna("").astype(str)
+    return df
 # ----------------------------
 # Plot helpers (matplotlib only)
 # ----------------------------
@@ -1021,10 +1065,12 @@ def tab_compare_two_shows():
             plt.close(fig)
 
 
+
 def tab_companies():
-    st.subheader("Company view (Imprint 1)")
-    _, companies = load_lists()
-    company = st.selectbox("Company (Imprint 1)", companies["company"].tolist())
+    st.subheader("Companies")
+
+    _, companies1 = load_lists()
+    companies2 = load_imprint2_list()
 
     with st.sidebar:
         st.header("Company filters")
@@ -1034,18 +1080,44 @@ def tab_companies():
 
     filters = FilterSpec(date_min.strip() or None, date_max.strip() or None, int(rank_min), int(rank_max))
 
-    stat = sql_df("SELECT * FROM v_company_stats WHERE company = ?", (company,))
-    if not stat.empty:
-        s = stat.iloc[0].to_dict()
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Entries", int(s["entries"]))
-        c2.metric("Unique shows", int(s["unique_shows"]))
-        c3.metric("Total gross (M)", float(s["total_gross_millions"]))
-        c4.metric("Avg gross (M)", None if pd.isna(s["avg_gross_millions"]) else float(s["avg_gross_millions"]))
+    t1, t2 = st.tabs(["Imprint 1", "Imprint 2"])
 
-    df = fetch_company_entries(company, filters)
-    st.dataframe(df, use_container_width=True)
+    with t1:
+        st.markdown("#### Imprint 1")
+        company = st.selectbox("Company (Imprint 1)", companies1["company"].tolist(), key="company_imprint1")
 
+        stat = sql_df("SELECT * FROM v_company_stats WHERE company = ?", (company,))
+        if not stat.empty:
+            s = stat.iloc[0].to_dict()
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Entries", int(s["entries"]))
+            c2.metric("Unique shows", int(s["unique_shows"]))
+            c3.metric("Total gross (M)", float(s["total_gross_millions"]))
+            c4.metric("Avg gross (M)", None if pd.isna(s["avg_gross_millions"]) else float(s["avg_gross_millions"]))
+
+        df = fetch_company_entries(company, filters)
+        st.dataframe(df, use_container_width=True)
+
+    with t2:
+        st.markdown("#### Imprint 2")
+        imprint2 = st.selectbox("Company (Imprint 2)", companies2["imprint_2"].tolist(), key="company_imprint2")
+
+        df2 = fetch_imprint2_entries(imprint2, filters)
+        if df2.empty:
+            st.info("No rows found for that Imprint 2 (or filters are too restrictive).")
+        else:
+            total_gross = float(df2["gross_millions"].sum())
+            entries = int(len(df2))
+            unique_shows = int(df2["canonical_title"].nunique())
+            avg_gross = (total_gross / entries) if entries else None
+
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Entries", entries)
+            c2.metric("Unique shows", unique_shows)
+            c3.metric("Total gross (M)", total_gross)
+            c4.metric("Avg gross (M)", avg_gross)
+
+        st.dataframe(df2, use_container_width=True)
 
 def tab_analytics():
     st.subheader("Analytics (grossing + movement)")
@@ -1271,62 +1343,6 @@ def _load_gross_races_base(db_path: str, db_mtime: float) -> pd.DataFrame:
     df["week_ending_dt"] = pd.to_datetime(df["week_ending"], errors="coerce")
     return df
 
-@st.cache_data(show_spinner=False)
-def _load_show_meta_for_gross_races(db_path: str, db_mtime: float) -> pd.DataFrame:
-    """Per-show metadata for gross races (imprints + debut date). db_mtime busts cache on DB updates."""
-    con = sqlite3.connect(db_path)
-    try:
-        df = pd.read_sql_query(
-            """
-            SELECT
-              e.show_id,
-              date(e.week_ending) AS week_ending,
-              e.imprint_1,
-              e.imprint_2
-            FROM t10_entry e
-            """,
-            con,
-        )
-    finally:
-        con.close()
-
-    if df.empty:
-        return pd.DataFrame(columns=["show_id", "imprint_1", "imprint_2", "debut_date"])
-
-    df["week_ending"] = _as_date_str(df["week_ending"])
-    df["week_ending_dt"] = pd.to_datetime(df["week_ending"], errors="coerce")
-    df = df.dropna(subset=["show_id", "week_ending_dt"]).copy()
-
-    # Debut date = first chart appearance (overall, not limited to gross-tracking era)
-    debut = df.groupby("show_id")["week_ending_dt"].min()
-
-    # Latest non-empty imprint values per show (imprints can be missing on some rows)
-    work = df.sort_values(["show_id", "week_ending_dt"], ascending=[True, False]).copy()
-
-    def _first_nonempty(series: pd.Series) -> Any:
-        s = series.astype("string").fillna(pd.NA).str.strip()
-        s = s.replace({"": pd.NA})
-        s = s.dropna()
-        return s.iloc[0] if len(s) else pd.NA
-
-    imp1 = work.groupby("show_id")["imprint_1"].apply(_first_nonempty)
-    imp2 = work.groupby("show_id")["imprint_2"].apply(_first_nonempty)
-
-    meta = pd.DataFrame(
-        {
-            "show_id": debut.index.astype(int),
-            "debut_date": debut.dt.strftime("%Y-%m-%d").astype("string"),
-            "imprint_1": imp1.astype("string"),
-            "imprint_2": imp2.astype("string"),
-        }
-    ).reset_index(drop=True)
-
-    meta["imprint_1"] = meta["imprint_1"].fillna("(Unknown)").astype(str).str.strip()
-    meta["imprint_2"] = meta["imprint_2"].fillna("").astype(str).str.strip()
-    meta["debut_date"] = meta["debut_date"].fillna("").astype(str).str.strip()
-    return meta
-
-
 def _plot_multi_line(dates: list[pd.Timestamp], series_by_label: dict[str, pd.Series], xlabel: str, ylabel: str):
     fig = plt.figure()
     for label, y in series_by_label.items():
@@ -1521,28 +1537,17 @@ def tab_gross_races():
     latest_dt = pd.to_datetime(base["week_ending_dt"].max())
     latest_date = latest_dt.date()
 
-
-    meta = _load_show_meta_for_gross_races(str(DB_PATH), db_mtime)
-
     # -------------------------
     # 1) All-Time Gross Races Chart (unlimited rank)
     # -------------------------
-
     st.markdown("### All-Time Gross Races Chart")
-    all_time = (
-        base.groupby(["show_id", "canonical_title"], as_index=False)["gross_millions"]
-        .sum()
-    )
-    all_time = all_time.merge(meta, on="show_id", how="left")
+    all_time = base.groupby("canonical_title", as_index=False)["gross_millions"].sum()
     all_time = all_time[all_time["gross_millions"] > 0].copy()
     all_time = all_time.sort_values("gross_millions", ascending=False).reset_index(drop=True)
     all_time.insert(0, "rank", np.arange(1, len(all_time) + 1))
 
-    # Display: rank/title + imprints + debut + total
-    all_time_disp = all_time[["rank", "canonical_title", "imprint_1", "imprint_2", "debut_date", "gross_millions"]].copy()
-
     st.caption("Unlimited rank: every show with any gross is included.")
-    st.dataframe(all_time_disp, use_container_width=True, hide_index=True)
+    st.dataframe(all_time, use_container_width=True, hide_index=True)
 
     with st.expander("Optional: visualize the leaders (bar chart)"):
         top_plot = st.slider("How many shows to display in the bar chart", 5, min(200, int(len(all_time))), min(50, int(len(all_time))))
@@ -1572,11 +1577,9 @@ def tab_gross_races():
     else:
         # Leaderboard as-of date
         last = ydf.sort_values(["show_id", "week_ending_dt"]).groupby(["show_id", "canonical_title"], as_index=False).tail(1)
-        leaders = last[["show_id", "canonical_title", "cum_gross_millions"]].copy()
-        leaders = leaders.merge(meta[["show_id", "imprint_1", "imprint_2"]], on="show_id", how="left")
+        leaders = last[["canonical_title", "cum_gross_millions"]].copy()
         leaders = leaders.sort_values("cum_gross_millions", ascending=False).reset_index(drop=True)
         leaders.insert(0, "rank", np.arange(1, len(leaders) + 1))
-        leaders = leaders[["rank", "canonical_title", "imprint_1", "imprint_2", "cum_gross_millions"]]
 
         st.caption(f"Leaderboard for **{pick_dt.year}** (through **{pick_dt.isoformat()}**)")
         st.dataframe(leaders, use_container_width=True, hide_index=True)
@@ -1621,15 +1624,9 @@ def tab_gross_races():
             .groupby(["show_id", "canonical_title"], as_index=False)
             .tail(1)
         )
-        leadersm = lastm[["show_id", "canonical_title", "cum_gross_millions"]].copy()
-
-        leadersm = leadersm.merge(meta[["show_id", "imprint_1", "imprint_2"]], on="show_id", how="left")
-
+        leadersm = lastm[["canonical_title", "cum_gross_millions"]].copy()
         leadersm = leadersm.sort_values("cum_gross_millions", ascending=False).reset_index(drop=True)
-
         leadersm.insert(0, "rank", np.arange(1, len(leadersm) + 1))
-
-        leadersm = leadersm[["rank", "canonical_title", "imprint_1", "imprint_2", "cum_gross_millions"]]
 
         month_label = _month_28_cycle_label(cycle_start)
         st.caption(f"Leaderboard for **{month_label}** (cycle **{cycle_start.date().isoformat()}** → **{cycle_end.date().isoformat()}**, through **{pick_m_ts.date().isoformat()}**)")
@@ -1713,15 +1710,9 @@ def tab_gross_races():
         return
 
     lastq = qdf.sort_values(["show_id", "week_ending_dt"]).groupby(["show_id", "canonical_title"], as_index=False).tail(1)
-    leaders_q = lastq[["show_id", "canonical_title", "cum_gross_millions"]].copy()
-
-    leaders_q = leaders_q.merge(meta[["show_id", "imprint_1", "imprint_2"]], on="show_id", how="left")
-
+    leaders_q = lastq[["canonical_title", "cum_gross_millions"]].copy()
     leaders_q = leaders_q.sort_values("cum_gross_millions", ascending=False).reset_index(drop=True)
-
     leaders_q.insert(0, "rank", np.arange(1, len(leaders_q) + 1))
-
-    leaders_q = leaders_q[["rank", "canonical_title", "imprint_1", "imprint_2", "cum_gross_millions"]]
 
     st.caption(f"Leaderboard for **Q{int(quarter)} {int(year_pick)}** (through **{wk_dt.date().isoformat()}**)")
     st.dataframe(leaders_q, use_container_width=True, hide_index=True)
@@ -2664,7 +2655,7 @@ def _load_records_base(db_path: str, db_mtime: float) -> pd.DataFrame:
               e.show_id,
               s.canonical_title AS canonical_title,
               COALESCE(e.imprint_1,'(Unknown)') AS imprint_1,
-              e.imprint_2,
+              COALESCE(NULLIF(TRIM(e.imprint_2),''),'(None)') AS imprint_2,
               e.gross_millions AS gross_millions
             FROM t10_entry e
             JOIN show s ON s.show_id = e.show_id
@@ -2717,48 +2708,71 @@ def _fmt_date(x: Any) -> str:
         return str(x)
 
 
-def _record_progression(unique_week_winners: pd.DataFrame, latest_week_number: float | None, latest_dt: pd.Timestamp | None) -> pd.DataFrame:
-    """Given one winner per week (no ties), return a record progression table (strictly increasing gross)."""
+
+def _record_progression(
+    unique_week_winners: pd.DataFrame,
+    latest_week_number: float | None,
+    latest_dt: pd.Timestamp | None
+) -> pd.DataFrame:
+    """Given one winner per week (no ties), return a record progression table (strictly increasing gross).
+
+    If available, carries through show_id / imprint_1 / imprint_2 from the winning rows.
+    """
+    out_cols = [
+        "show_id",
+        "canonical_title",
+        "imprint_1",
+        "imprint_2",
+        "week_ending",
+        "gross_millions",
+        "length_weeks",
+        "broken_week",
+        "broken_by",
+    ]
+
     if unique_week_winners.empty:
-        return pd.DataFrame(columns=[
-            "canonical_title", "week_ending", "gross_millions", "length_weeks", "broken_week", "broken_by"
-        ])
+        return pd.DataFrame(columns=out_cols)
 
     df = unique_week_winners.copy()
     df = df.sort_values(["week_ending_dt"]).reset_index(drop=True)
+
     df["prev_record"] = df["gross_millions"].cummax().shift(1).fillna(-np.inf)
     events = df[df["gross_millions"] > df["prev_record"]].copy()
     if events.empty:
-        return pd.DataFrame(columns=[
-            "canonical_title", "week_ending", "gross_millions", "length_weeks", "broken_week", "broken_by"
-        ])
+        return pd.DataFrame(columns=out_cols)
 
-    events["broken_week"] = events["week_ending"].shift(-1)
-    events["broken_by"] = events["canonical_title"].shift(-1)
-    events["next_week_number"] = events["week_number"].shift(-1)
+    # Next event (record breaker)
     events["next_week_ending_dt"] = events["week_ending_dt"].shift(-1)
+    events["broken_week"] = events["next_week_ending_dt"].dt.strftime("%Y-%m-%d")
+    events["broken_by"] = events["canonical_title"].shift(-1)
 
     def _len_weeks(row: pd.Series) -> int | None:
-        wn = row.get("week_number")
-        nxt = row.get("next_week_number")
-        if pd.notna(wn) and pd.notna(nxt):
-            return int(nxt - wn)
-        # fallback: date math
+        cur_wn = row.get("week_number")
         cur_dt = row.get("week_ending_dt")
         nxt_dt = row.get("next_week_ending_dt")
+
         if pd.notna(cur_dt) and pd.notna(nxt_dt):
             return int(round((pd.to_datetime(nxt_dt) - pd.to_datetime(cur_dt)).days / 7.0))
-        # last record: use latest
-        if pd.notna(wn) and latest_week_number is not None and pd.notna(latest_week_number):
-            return int(latest_week_number - wn + 1)
+
+        # Last record: use latest week info
+        if pd.notna(cur_wn) and latest_week_number is not None and pd.notna(latest_week_number):
+            return int(float(latest_week_number) - float(cur_wn) + 1)
+
         if pd.notna(cur_dt) and latest_dt is not None and pd.notna(latest_dt):
             return int(round((pd.to_datetime(latest_dt) - pd.to_datetime(cur_dt)).days / 7.0)) + 1
+
         return None
 
     events["length_weeks"] = events.apply(_len_weeks, axis=1)
-    out = events[["canonical_title", "week_ending", "gross_millions", "length_weeks", "broken_week", "broken_by"]].copy()
-    return out
 
+    # Build output with optional columns
+    base_cols = [c for c in ["show_id", "canonical_title", "imprint_1", "imprint_2", "week_ending", "gross_millions", "length_weeks", "broken_week", "broken_by"] if c in events.columns]
+    out = events[base_cols].copy()
+    for c in out_cols:
+        if c not in out.columns:
+            out[c] = None
+    out = out[out_cols]
+    return out
 
 def tab_records_achievements():
     st.subheader("Records and Achievements")
@@ -2850,6 +2864,8 @@ def tab_records_achievements():
         agg = (
             at_rank.groupby(["show_id", "canonical_title"], as_index=False)
             .agg(
+                imprint_1=("imprint_1", "first"),
+                imprint_2=("imprint_2", "first"),
                 weeks_at_rank=("week_ending", "nunique"),
                 first_week=("week_ending_dt", "min"),
                 last_week=("week_ending_dt", "max"),
@@ -2862,13 +2878,13 @@ def tab_records_achievements():
         disp = pd.DataFrame({
             "Rank": agg["Rank"],
             "Show": agg["canonical_title"],
+            "Imprint 1": agg["imprint_1"],
+            "Imprint 2": agg["imprint_2"],
             f"Total Career Weeks at #{rank_pick}": agg["weeks_at_rank"],
             f"First Career #{rank_pick}": agg["first_week"].apply(_fmt_date),
             f"Last #{rank_pick}": agg["last_week"].apply(_fmt_date),
         })
         st.dataframe(disp, use_container_width=True, hide_index=True)
-
-    st.divider()
 
     # -------------------------
     # 2) #1 week grossing record (progression)
@@ -2886,6 +2902,8 @@ def tab_records_achievements():
             disp = pd.DataFrame({
                 "#": np.arange(1, len(prog) + 1),
                 "Show": prog["canonical_title"],
+                "Imprint 1": prog["imprint_1"],
+                "Imprint 2": prog["imprint_2"],
                 "Total Length (in weeks)": prog["length_weeks"].astype("Int64"),
                 "Week Record Set": prog["week_ending"].apply(_fmt_date),
                 "Week Record Broken": prog["broken_week"].apply(_fmt_date),
@@ -2911,6 +2929,8 @@ def tab_records_achievements():
             disp = pd.DataFrame({
                 "#": np.arange(1, len(prog) + 1),
                 "Show": prog["canonical_title"],
+                "Imprint 1": prog["imprint_1"],
+                "Imprint 2": prog["imprint_2"],
                 "Total Length (in weeks)": prog["length_weeks"].astype("Int64"),
                 "Week Record Set": prog["week_ending"].apply(_fmt_date),
                 "Week Record Broken": prog["broken_week"].apply(_fmt_date),
@@ -3010,6 +3030,13 @@ def tab_records_achievements():
                     completed_week = weeks[-1]
                     title = title_lookup.get(sid, str(sid))
 
+                    # Imprints for the primary show (use the completed week's #1 row when available)
+                    prim = base[(base["week_ending"].eq(completed_week)) & (base["show_id"].eq(sid)) & (base["rank"].eq(1))]
+                    if prim.empty:
+                        prim = base[base["show_id"].eq(sid)].head(1)
+                    imp1 = str(prim.iloc[0]["imprint_1"]) if not prim.empty else ""
+                    imp2 = str(prim.iloc[0]["imprint_2"]) if (not prim.empty) and ("imprint_2" in prim.columns) else ""
+
                     # #2 show on completed week (may not exist if ranks skip due to tie-at-#1)
                     sec = base[(base["week_ending"].eq(completed_week)) & (base["rank"].eq(2))]
                     sec_title = str(sec.iloc[0]["canonical_title"]) if not sec.empty else ""
@@ -3047,6 +3074,8 @@ def tab_records_achievements():
                     hat_rows.append(
                         {
                             "#1 Show/#2 Show": pair,
+                            "Imprint 1": imp1,
+                            "Imprint 2": imp2,
                             "Hat Trick Status": status,
                             "Hat Trick Week": _fmt_date(completed_week),
                             "Total Grosses (in millions)": fmt_millions(gross3) if gross3 is not None else "",
@@ -3060,7 +3089,7 @@ def tab_records_achievements():
         else:
             hat = hat.sort_values(["_completed_dt", "#1 Show/#2 Show"]).reset_index(drop=True)
             hat.insert(0, "#", np.arange(1, len(hat) + 1))
-            disp = hat[["#", "#1 Show/#2 Show", "Hat Trick Status", "Hat Trick Week", "Total Grosses (in millions)"]].copy()
+            disp = hat[["#", "#1 Show/#2 Show", "Imprint 1", "Imprint 2", "Hat Trick Status", "Hat Trick Week", "Total Grosses (in millions)"]].copy()
             st.dataframe(disp, use_container_width=True, hide_index=True)
 
     st.divider()
@@ -3079,6 +3108,8 @@ def tab_records_achievements():
         pos_rows.append({
             "Rank": int(r),
             "Show": str(w["canonical_title"]),
+            "Imprint 1": str(w.get("imprint_1", "")),
+            "Imprint 2": str(w.get("imprint_2", "")),
             "Week": _fmt_date(w["week_ending"]),
             "Grosses (in millions)": fmt_millions(w["gross_millions"]),
         })
@@ -3102,9 +3133,12 @@ def tab_records_achievements():
 
         # For each year, find the first week each show hit #1 in that year
         first_in_year = (
-            tmp.groupby(["year", "show_id", "canonical_title"], as_index=False)["week_ending_dt"]
-            .min()
-            .rename(columns={"week_ending_dt": "first_n1"})
+            tmp.groupby(["year", "show_id", "canonical_title"], as_index=False)
+            .agg(
+                first_n1=("week_ending_dt", "min"),
+                imprint_1=("imprint_1", "first"),
+                imprint_2=("imprint_2", "first"),
+            )
             .sort_values(["year", "first_n1", "canonical_title"])
             .reset_index(drop=True)
         )
@@ -3139,31 +3173,67 @@ def tab_records_achievements():
     # -------------------------
     # 7) Most weeks at #1 by imprint (Imprint 1)
     # -------------------------
-    st.markdown("### Most #1's by imprint (Imprint 1)")
+
+    # -------------------------
+    # 7) Most weeks at #1 by imprint (Imprint 1 + Imprint 2 combined)
+    # -------------------------
+    st.markdown("### Most #1's by imprint")
     if n1.empty:
         st.info("No #1 rows found.")
     else:
-        imp = (
-            n1.groupby("imprint_1", as_index=False)
-            .agg(
-                total_weeks_at_1=("week_ending", "nunique"),
-                first_1=("week_ending_dt", "min"),
-                last_1=("week_ending_dt", "max"),
-            )
-            .sort_values(["total_weeks_at_1", "first_1", "imprint_1"], ascending=[False, True, True])
-            .reset_index(drop=True)
+        def _norm_imp(v: Any) -> str | None:
+            if v is None:
+                return None
+            s = str(v).strip()
+            if not s:
+                return None
+            low = s.lower()
+            if low in {"(none)", "<none>", "none", "(unknown)", "unknown"}:
+                return None
+            return s
+
+        imp_pairs = n1[["week_ending", "week_ending_dt", "imprint_1", "imprint_2"]].copy()
+        imp_pairs["imp1"] = imp_pairs["imprint_1"].map(_norm_imp)
+        imp_pairs["imp2"] = imp_pairs["imprint_2"].map(_norm_imp)
+
+        # De-duplicate within a row (same imprint in both columns shouldn't double-count)
+        imp_pairs["imprints"] = imp_pairs.apply(
+            lambda r: sorted({x for x in [r["imp1"], r["imp2"]] if x is not None}),
+            axis=1,
         )
-        imp.insert(0, "Rank", np.arange(1, len(imp) + 1))
-        disp = pd.DataFrame({
-            "Rank": imp["Rank"],
-            "Imprint": imp["imprint_1"],
-            "Total Weeks at #1": imp["total_weeks_at_1"],
-            "First Career #1": imp["first_1"].apply(_fmt_date),
-            "Last #1": imp["last_1"].apply(_fmt_date),
-        })
-        st.dataframe(disp, use_container_width=True, hide_index=True)
+
+        imp_long = (
+            imp_pairs[["week_ending", "week_ending_dt", "imprints"]]
+            .explode("imprints")
+            .dropna(subset=["imprints"])
+            .rename(columns={"imprints": "imprint"})
+        )
+
+        if imp_long.empty:
+            st.info("No imprint data found for #1 rows.")
+        else:
+            imp = (
+                imp_long.groupby("imprint", as_index=False)
+                .agg(
+                    total_weeks_at_1=("week_ending", "nunique"),
+                    first_1=("week_ending_dt", "min"),
+                    last_1=("week_ending_dt", "max"),
+                )
+                .sort_values(["total_weeks_at_1", "first_1", "imprint"], ascending=[False, True, True])
+                .reset_index(drop=True)
+            )
+            imp.insert(0, "Rank", np.arange(1, len(imp) + 1))
+            disp = pd.DataFrame({
+                "Rank": imp["Rank"],
+                "Imprint": imp["imprint"],
+                "#1 Weeks": imp["total_weeks_at_1"],
+                "Earliest #1": imp["first_1"].apply(_fmt_date),
+                "Latest #1": imp["last_1"].apply(_fmt_date),
+            })
+            st.dataframe(disp, use_container_width=True, hide_index=True)
 
     st.divider()
+
 
     # -------------------------
     # 8) All #1 debuts
@@ -3177,6 +3247,8 @@ def tab_records_achievements():
         disp = pd.DataFrame({
             "#": deb["#"],
             "Show": deb["canonical_title"],
+            "Imprint 1": deb["imprint_1"],
+            "Imprint 2": deb["imprint_2"],
             "Week #": deb["week_number"].astype("Int64"),
             "Debut": deb["week_ending"].apply(_fmt_date),
             "Grosses (in millions)": deb["gross_millions"].apply(fmt_millions),
@@ -3206,6 +3278,8 @@ def tab_records_achievements():
                 rows.append({
                     "Month": mlabel if j == 0 else "",
                     "Show": r["canonical_title"],
+                    "Imprint 1": r.get("imprint_1", ""),
+                    "Imprint 2": r.get("imprint_2", ""),
                     "Week Record Set": _fmt_date(r["week_ending"]),
                     "Grosses (in millions)": fmt_millions(r["gross_millions"]),
                 })
@@ -3235,6 +3309,8 @@ def tab_records_achievements():
                 rows.append({
                     "Month": mlabel if j == 0 else "",
                     "Show": r["canonical_title"],
+                    "Imprint 1": r.get("imprint_1", ""),
+                    "Imprint 2": r.get("imprint_2", ""),
                     "Week Record Set": _fmt_date(r["week_ending"]),
                     "Grosses (in millions)": fmt_millions(r["gross_millions"]),
                 })
