@@ -2670,6 +2670,34 @@ def main():
     st.title(APP_TITLE)
     st.caption("SQLite + FTS search, per-show analytics, company analytics, and movement/grossing charts. (Ties supported.)")
 
+    # Make the top tab bar horizontally scrollable (so you can reach "Admin" on smaller screens)
+    st.markdown(
+        """
+        <style>
+        /* Streamlit tabs: allow horizontal scrolling instead of wrapping/cropping */
+        .stTabs [data-baseweb="tab-list"],
+        div[data-baseweb="tab-list"] {
+            overflow-x: auto !important;
+            overflow-y: hidden !important;
+            flex-wrap: nowrap !important;
+            white-space: nowrap !important;
+            scrollbar-width: thin; /* Firefox */
+        }
+        .stTabs [data-baseweb="tab-list"]::-webkit-scrollbar,
+        div[data-baseweb="tab-list"]::-webkit-scrollbar {
+            height: 8px;
+        }
+        .stTabs [data-baseweb="tab-list"] button,
+        div[data-baseweb="tab-list"] button {
+            white-space: nowrap !important;
+            flex: 0 0 auto !important;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
     # Keep Admin last.
     tabs = st.tabs([
         "Search",
