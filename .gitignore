@@ -40,3 +40,4 @@ app_*fixed*.py
 app_*v*.py
 app_*_final.py
 t10.sqlite.bak_*
+local_archive/
