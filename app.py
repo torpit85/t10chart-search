@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import sqlite3
+import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Optional, Callable
@@ -726,12 +727,47 @@ def holiday_week_ending_for_date(all_week_endings: list[date], holiday_dt: date,
 # New tab: Monthly T-25 (SMPS)
 # ----------------------------
 @st.cache_data(show_spinner=False)
-def _compute_show_month_metrics(db_path: str, db_mtime: float) -> pd.DataFrame:
+def _load_smps_weekly_base(db_path: str, db_mtime: float, include_bonuses: bool) -> pd.DataFrame:
+    """Weekly gross base for SMPS.
+
+    If include_bonuses is True, use the same base as Gross Races (weekly gross plus
+    annual/quarter bonuses via gross_bonus). If False, use only t10_entry weekly gross
+    rows (no gross_bonus union).
+    """
+    if include_bonuses:
+        return _load_gross_races_base(db_path, db_mtime)
+
+    con = sqlite3.connect(db_path)
+    try:
+        df = pd.read_sql_query(
+            """
+            SELECT
+              date(e.week_ending) AS week_ending,
+              e.show_id AS show_id,
+              s.canonical_title AS canonical_title,
+              SUM(COALESCE(e.gross_millions, 0.0)) AS base_gross_millions,
+              0.0 AS bonus_millions,
+              SUM(COALESCE(e.gross_millions, 0.0)) AS gross_millions
+            FROM t10_entry e
+            JOIN show s ON s.show_id = e.show_id
+            WHERE e.gross_millions IS NOT NULL
+            GROUP BY date(e.week_ending), e.show_id, s.canonical_title
+            ORDER BY e.show_id, date(e.week_ending)
+            """,
+            con,
+        )
+    finally:
+        con.close()
+    return df
+
+
+@st.cache_data(show_spinner=False)
+def _compute_show_month_metrics(db_path: str, db_mtime: float, include_bonuses: bool) -> pd.DataFrame:
     """Per-show monthly aggregates for SMPS.
 
-    Uses the same weekly gross base as Gross Races (weekly + all bonuses).
+    Uses a weekly gross base that can optionally include gross bonuses.
     """
-    base = _load_gross_races_base(db_path, db_mtime)
+    base = _load_smps_weekly_base(db_path, db_mtime, include_bonuses)
     if base.empty:
         return pd.DataFrame(
             columns=[
@@ -825,9 +861,9 @@ def _compute_show_month_metrics(db_path: str, db_mtime: float) -> pd.DataFrame:
 
 
 @st.cache_data(show_spinner=False)
-def _compute_smps_history(db_path: str, db_mtime: float) -> dict[str, pd.DataFrame]:
+def _compute_smps_history(db_path: str, db_mtime: float, include_bonuses: bool) -> dict[str, pd.DataFrame]:
     """Compute SMPS_v1 charts for every chart-month (Apr 2001 → latest)."""
-    metrics = _compute_show_month_metrics(db_path, db_mtime)
+    metrics = _compute_show_month_metrics(db_path, db_mtime, include_bonuses)
     if metrics.empty:
         return {}
 
@@ -840,6 +876,29 @@ def _compute_smps_history(db_path: str, db_mtime: float) -> dict[str, pd.DataFra
 
     # Index by month for fast access
     by_month: dict[str, pd.DataFrame] = {m: metrics[metrics["month"] == m].copy() for m in months}
+
+    # Dynamic Share cap per month:
+    # For each chart-month, compute the highest single-show month_gross_millions on record
+    # *up to and including* that month. Round that record up to the nearest 100M, and
+    # treat it as the denominator that yields the full 50 Share points.
+    #
+    # This makes older eras comparable by scaling Share against the historical ceiling
+    # that existed at the time.
+    month_max: dict[str, float] = {}
+    for mm in months:
+        mm_df = by_month.get(mm)
+        if mm_df is None or mm_df.empty:
+            month_max[mm] = 0.0
+        else:
+            month_max[mm] = float(pd.to_numeric(mm_df["month_gross_millions"], errors="coerce").fillna(0.0).max())
+
+    share_cap_by_month: dict[str, float] = {}
+    running_record = 0.0
+    for mm in months:
+        running_record = max(running_record, float(month_max.get(mm, 0.0)))
+        # No rounding: use the running record as-is (keep a safe, non-zero minimum).
+        cap = running_record if running_record > 0 else 100.0
+        share_cap_by_month[mm] = float(cap)
 
 
     # Meta lookups (loaded once):
@@ -919,8 +978,11 @@ def _compute_smps_history(db_path: str, db_mtime: float) -> dict[str, pd.DataFra
             mg = float(gross.get(sid, 0.0))
             pg = float(prevg.get(sid, 0.0))
             # Share (ratio-based, top-heavy)
-            # r = clamp(mg/2500, 0..1), PtsShare = 50 * r^1.4
-            share_raw = (mg / 2500.0) if mg > 0 else 0.0
+            # Dynamic denom per month: "highest single-show month gross on record up to this month",
+            # as-is (no rounding).
+            # r = clamp(mg/share_cap, 0..1), PtsShare = 50 * r^1.4
+            share_cap = float(share_cap_by_month.get(m, 100.0))
+            share_raw = (mg / share_cap) if (mg > 0 and share_cap > 0) else 0.0
             if share_raw < 0.0:
                 share_raw = 0.0
             elif share_raw > 1.0:
@@ -991,8 +1053,8 @@ def _compute_smps_history(db_path: str, db_mtime: float) -> dict[str, pd.DataFra
         # but prevents "auto-#1" Breakout wins caused by pg≈0/denominator effects.
         #
         # Taper rule (linear):
-        #   share_raw <= 0.50 -> 0% of Breakout points  (<= 1250M)
-        #   share_raw >= 0.80 -> 100% of Breakout points (>= 2000M)
+        #   share_raw <= 0.50 -> 0% of Breakout points  (<= 50% of the month’s Share cap)
+        #   share_raw >= 0.80 -> 100% of Breakout points (>= 80% of the month’s Share cap)
         #   between -> linear ramp
         s0, s1 = 0.50, 0.80
         denom = (s1 - s0) if (s1 - s0) != 0 else 1.0
@@ -1138,8 +1200,15 @@ def _write_smps_to_db(month: str, chart_df: pd.DataFrame) -> None:
 def tab_monthly_smps_t25():
     st.subheader("Monthly T-25 (SMPS)")
     st.caption(
-        "SMPS_v1 = Share (50; ratio-based to 2500M with exponent 1.4) + Breakout (30) + Heat (20) + carryover (0-gross months only) + continuity bonus (active incumbents). "
+        "SMPS_v1 = Share (50; ratio-based to the running record monthly max (no rounding) with exponent 1.4) + Breakout (30) + Heat (20) + carryover (0-gross months only) + continuity bonus (active incumbents). "
         "Floors use PERCENTILE.INC (10th percentile). Zombie rule: 4 consecutive 0-gross chart-months => ineligible."
+    )
+
+    include_bonuses = st.checkbox(
+        "Include gross bonuses in SMPS month gross (and Share cap)",
+        value=False,
+        key="smps_include_bonuses",
+        help="If checked, SMPS month gross includes annual/quarter bonuses from gross_bonus (like Gross Races). If unchecked, SMPS uses only the weekly gross in t10_entry.",
     )
 
     if not DB_PATH.exists():
@@ -1147,7 +1216,7 @@ def tab_monthly_smps_t25():
         return
 
     db_mtime = DB_PATH.stat().st_mtime
-    hist = _compute_smps_history(str(DB_PATH), db_mtime)
+    hist = _compute_smps_history(str(DB_PATH), db_mtime, include_bonuses)
     if not hist:
         st.info("No SMPS history could be computed from the current DB.")
         return
