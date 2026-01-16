@@ -841,6 +841,7 @@ def _compute_smps_history(db_path: str, db_mtime: float) -> dict[str, pd.DataFra
     # Index by month for fast access
     by_month: dict[str, pd.DataFrame] = {m: metrics[metrics["month"] == m].copy() for m in months}
 
+
     # Meta lookups (loaded once):
     # - Titles come from the show table so carryover-only candidates always have names.
     # - Imprints come from the same helper used by Gross Races.
@@ -850,20 +851,22 @@ def _compute_smps_history(db_path: str, db_mtime: float) -> dict[str, pd.DataFra
     finally:
         con.close()
 
-    show_titles = show_titles.drop_duplicates('show_id') if not show_titles.empty else pd.DataFrame(columns=['show_id','canonical_title'])
+    show_titles = (
+        show_titles.drop_duplicates('show_id')
+        if not show_titles.empty
+        else pd.DataFrame(columns=['show_id', 'canonical_title'])
+    )
 
     _imp = _load_show_meta_for_gross_races(db_path, db_mtime)
     if _imp is None or _imp.empty:
-        imprint_meta = pd.DataFrame(columns=['show_id','imprint_1','imprint_2'])
+        imprint_meta = pd.DataFrame(columns=['show_id', 'imprint_1', 'imprint_2'])
     else:
-        cols = [c for c in ['show_id','imprint_1','imprint_2'] if c in _imp.columns]
+        cols = [c for c in ['show_id', 'imprint_1', 'imprint_2'] if c in _imp.columns]
         imprint_meta = _imp[cols].drop_duplicates('show_id').copy()
         if 'imprint_1' not in imprint_meta.columns:
             imprint_meta['imprint_1'] = ''
         if 'imprint_2' not in imprint_meta.columns:
             imprint_meta['imprint_2'] = ''
-
-
 
     inactive: dict[int, int] = {}  # show_id -> consecutive zero-gross months (candidate-only)
     prev_chart: Optional[pd.DataFrame] = None
@@ -899,7 +902,7 @@ def _compute_smps_history(db_path: str, db_mtime: float) -> dict[str, pd.DataFra
 
         candidates = {sid for sid in candidates if not is_zombie(sid)}
 
-        # Month total for share% uses only shows that grossed this month
+        # Month total (no longer used for Share scoring; kept for reference/other diagnostics)
         total_month_gross = sum(gross.get(sid, 0.0) for sid in grossing_ids)
         total_month_gross = float(total_month_gross) if total_month_gross > 0 else 0.0
 
@@ -915,10 +918,14 @@ def _compute_smps_history(db_path: str, db_mtime: float) -> dict[str, pd.DataFra
         for sid in candidates:
             mg = float(gross.get(sid, 0.0))
             pg = float(prevg.get(sid, 0.0))
-
-            # Share
-            share_raw = (mg / total_month_gross) if (total_month_gross > 0 and mg > 0) else 0.0
-            pts_share = 40.0 * share_raw
+            # Share (ratio-based, top-heavy)
+            # r = clamp(mg/2500, 0..1), PtsShare = 50 * r^1.4
+            share_raw = (mg / 2500.0) if mg > 0 else 0.0
+            if share_raw < 0.0:
+                share_raw = 0.0
+            elif share_raw > 1.0:
+                share_raw = 1.0
+            pts_share = 50.0 * (share_raw ** 1.4)
 
             # Momentum components only apply when the show grossed this month
             if mg > 0:
@@ -962,8 +969,8 @@ def _compute_smps_history(db_path: str, db_mtime: float) -> dict[str, pd.DataFra
         if not mom_df.empty:
             mom_df["breakout_score"] = _rank01(mom_df["breakout_raw"])
             mom_df["heat_score"] = _rank01(mom_df["heat_raw"])
-            mom_df["points_breakout"] = 45.0 * mom_df["breakout_score"]
-            mom_df["points_heat"] = 15.0 * mom_df["heat_score"]
+            mom_df["points_breakout"] = 30.0 * mom_df["breakout_score"]
+            mom_df["points_heat"] = 20.0 * mom_df["heat_score"]
 
             df = df.merge(
                 mom_df[["show_id", "points_breakout", "points_heat"]],
@@ -976,6 +983,30 @@ def _compute_smps_history(db_path: str, db_mtime: float) -> dict[str, pd.DataFra
 
         df["points_breakout"] = pd.to_numeric(df.get("points_breakout"), errors="coerce").fillna(0.0)
         df["points_heat"] = pd.to_numeric(df.get("points_heat"), errors="coerce").fillna(0.0)
+
+
+        # --- Debut/re-entry guardrails (reduce #1 debuts unless the month is truly monstrous) ---
+        # If a show was not on last month's SMPS Top 25, taper its Breakout points unless it
+        # commands a big enough Share of the month. This keeps true mega-launches eligible for #1,
+        # but prevents "auto-#1" Breakout wins caused by pg≈0/denominator effects.
+        #
+        # Taper rule (linear):
+        #   share_raw <= 0.50 -> 0% of Breakout points  (<= 1250M)
+        #   share_raw >= 0.80 -> 100% of Breakout points (>= 2000M)
+        #   between -> linear ramp
+        s0, s1 = 0.50, 0.80
+        denom = (s1 - s0) if (s1 - s0) != 0 else 1.0
+        df["is_debut_or_reentry"] = ~df["show_id"].astype(int).isin(list(prev_ids))
+        df["debut_breakout_factor"] = ((df["share_raw"] - s0) / denom).clip(lower=0.0, upper=1.0)
+        _mask_debut = df["is_debut_or_reentry"] & (df["month_gross_millions"] > 0)
+        df.loc[_mask_debut, "points_breakout"] = df.loc[_mask_debut, "points_breakout"] * df.loc[_mask_debut, "debut_breakout_factor"]
+
+        # Continuity bonus: active incumbents get a small inertia bump to reduce leapfrogging by re-entries.
+        # (Only applies when the show grosses this month.)
+        df["points_continuity"] = 0.0
+        if prev_pts:
+            _mask_inc = (df["month_gross_millions"] > 0) & df["show_id"].astype(int).isin(list(prev_pts.keys()))
+            df.loc[_mask_inc, "points_continuity"] = df.loc[_mask_inc, "show_id"].astype(int).map(prev_pts).fillna(0.0) * 0.10
 
         # Carryover for 0-gross months (prev SMPS Top 25 only), decays by inactive streak
         def _carry(sid: int, mg: float) -> float:
@@ -995,6 +1026,7 @@ def _compute_smps_history(db_path: str, db_mtime: float) -> dict[str, pd.DataFra
             + df["points_breakout"]
             + df["points_heat"]
             + df["points_carryover"]
+            + df.get("points_continuity", 0.0)
         )
 
         # Attach titles/imprints
@@ -1106,7 +1138,7 @@ def _write_smps_to_db(month: str, chart_df: pd.DataFrame) -> None:
 def tab_monthly_smps_t25():
     st.subheader("Monthly T-25 (SMPS)")
     st.caption(
-        "SMPS_v1 = Share (40) + Breakout (45) + Heat (15) + continuity carryover (0-gross months only). "
+        "SMPS_v1 = Share (50; ratio-based to 2500M with exponent 1.4) + Breakout (30) + Heat (20) + carryover (0-gross months only) + continuity bonus (active incumbents). "
         "Floors use PERCENTILE.INC (10th percentile). Zombie rule: 4 consecutive 0-gross chart-months => ineligible."
     )
 
@@ -1132,7 +1164,7 @@ def tab_monthly_smps_t25():
     # Display
     disp = chart.copy()
 
-    # Add last-month position + months-on-chart (SMPS)
+    # Add last-month position + total appearances (Months on Chart) + NEW/RE status (SMPS)
     pick_idx = months.index(pick)
     prev_pos_map = {}
     if pick_idx > 0:
@@ -1142,21 +1174,42 @@ def tab_monthly_smps_t25():
             prev_pos_map = dict(zip(prev_chart["show_id"].astype(int), prev_chart["position"].astype(int)))
 
     from collections import Counter
-    cnt = Counter()
-    for mm in months[: pick_idx + 1]:
+    cnt_before = Counter()
+    for mm in months[:pick_idx]:
         cdf = hist.get(mm)
         if cdf is None or cdf.empty:
             continue
-        cnt.update(cdf["show_id"].astype(int).tolist())
+        cnt_before.update(cdf["show_id"].astype(int).tolist())
 
-    disp["Last Mo Pos"] = disp["show_id"].astype(int).map(prev_pos_map)
-    disp["Months on Chart"] = disp["show_id"].astype(int).map(cnt).fillna(0).astype(int)
-    disp["Share %"] = (disp["share_raw"] * 100.0).round(2)
+    disp["Last Mo Pos"] = disp["show_id"].astype(int).apply(lambda sid: prev_pos_map.get(int(sid)))
+    disp["Months on Chart"] = disp["show_id"].astype(int).map(cnt_before).fillna(0).astype(int) + 1
+
+    # NEW/RE flags folded into Last Mo Pos: if not on last month, NEW if first-ever appearance; else RE
+    _lastmo_missing = disp["Last Mo Pos"].isna()
+    _seen_before = disp["show_id"].astype(int).map(cnt_before).fillna(0).astype(int) > 0
+    disp.loc[_lastmo_missing & (~_seen_before), "Last Mo Pos"] = "NEW"
+    disp.loc[_lastmo_missing & (_seen_before), "Last Mo Pos"] = "RE"
+
+    # Remove any .0 decimals from numeric last-month positions (keep NEW/RE as-is)
+    def _fmt_last_mo_pos(v):
+        if isinstance(v, str):
+            return v
+        if pd.isna(v):
+            return v
+        try:
+            return str(int(v))
+        except Exception:
+            return v
+
+    disp["Last Mo Pos"] = disp["Last Mo Pos"].apply(_fmt_last_mo_pos)
+
+    disp["Share Ratio"] = disp["share_raw"].round(3)
     disp["Month Gross"] = disp["month_gross_millions"].round(2)
     disp["Pts Share"] = disp["points_share"].round(2)
     disp["Pts Breakout"] = disp["points_breakout"].round(2)
     disp["Pts Heat"] = disp["points_heat"].round(2)
     disp["Pts Carryover"] = disp["points_carryover"].round(2)
+    disp["Pts Continuity"] = pd.to_numeric(disp.get("points_continuity"), errors="coerce").fillna(0.0).round(2)
     disp["Pts Total"] = disp["points_total"].round(2)
 
     show_cols = [
@@ -1167,7 +1220,7 @@ def tab_monthly_smps_t25():
         "imprint_1",
         "imprint_2",
         "Month Gross",
-        "Share %",
+        "Share Ratio",
         "breakout_raw",
         "heat_raw",
         "inactive_streak",
@@ -1175,6 +1228,7 @@ def tab_monthly_smps_t25():
         "Pts Breakout",
         "Pts Heat",
         "Pts Carryover",
+        "Pts Continuity",
         "Pts Total",
     ]
 
