@@ -77,6 +77,142 @@ def sql_execmany(sql: str, rows: Iterable[tuple[Any, ...]]) -> None:
     finally:
         con.close()
 
+
+# ----------------------------
+# SMPS (Share–Momentum Point System) helpers
+# ----------------------------
+SMPS_METHOD_VERSION = "SMPS_v1"
+SMPS_START_MONTH = "2001-04"  # first monthly chart in the grossing era
+SMPS_OFFICIAL_DUAL_END_MONTH = "2025-01"  # Apr 2001 → Jan 2025: Official + SMPS
+
+
+def _ym_from_year_month(year: int, month: int) -> str:
+    return f"{int(year):04d}-{int(month):02d}"
+
+
+def _ym_add(ym: str, delta_months: int) -> str:
+    """Add delta_months to a YYYY-MM string."""
+    y, m = ym.split("-")
+    yi = int(y)
+    mi = int(m)
+    idx = yi * 12 + (mi - 1) + int(delta_months)
+    ny = idx // 12
+    nm = (idx % 12) + 1
+    return _ym_from_year_month(ny, nm)
+
+
+def _percentile_inc(values: Iterable[float], p: float, *, ignore_nonpositive: bool = True) -> Optional[float]:
+    """Excel-like PERCENTILE.INC with linear interpolation (no numpy needed)."""
+    vals = []
+    for v in values:
+        if v is None:
+            continue
+        try:
+            fv = float(v)
+        except Exception:
+            continue
+        if ignore_nonpositive and fv <= 0:
+            continue
+        vals.append(fv)
+    if not vals:
+        return None
+    vals.sort()
+    n = len(vals)
+    if p <= 0:
+        return vals[0]
+    if p >= 100:
+        return vals[-1]
+    k = float(p) / 100.0
+    r = 1.0 + (n - 1) * k  # 1-based
+    lo = int(np.floor(r))
+    hi = int(np.ceil(r))
+    frac = r - lo
+    lo_i = lo - 1
+    hi_i = hi - 1
+    if hi_i == lo_i:
+        return vals[lo_i]
+    return vals[lo_i] + (vals[hi_i] - vals[lo_i]) * frac
+
+
+def _p10_inc(values: Iterable[float], *, ignore_nonpositive: bool = True) -> float:
+    v = _percentile_inc(values, 10.0, ignore_nonpositive=ignore_nonpositive)
+    return max(float(v) if v is not None else 1.0, 1.0)
+
+
+def _chart_month_series(week_ending_dt: pd.Series) -> pd.Series:
+    """Vectorized chart-month mapping for weekly week_ending dates (cutoff day 28).
+
+    Rule:
+      - if day <= 28: chart_month = next month
+      - else: chart_month = month after next
+
+    Returns YYYY-MM strings.
+    """
+    dt = pd.to_datetime(week_ending_dt, errors="coerce")
+    y = dt.dt.year.astype("Int64")
+    m = dt.dt.month.astype("Int64")
+    d = dt.dt.day.astype("Int64")
+
+    add = np.where(d <= 28, 1, 2)
+    idx = (y.astype("int64") * 12) + (m.astype("int64") - 1) + add
+    ny = (idx // 12).astype(int)
+    nm = (idx % 12 + 1).astype(int)
+
+    out = pd.Series([_ym_from_year_month(a, b) for a, b in zip(ny, nm)], index=week_ending_dt.index)
+    return out
+
+
+def _ensure_smps_schema() -> None:
+    """Create SMPS tables if missing."""
+    con = get_con()
+    try:
+        cur = con.cursor()
+        cur.execute("BEGIN;")
+
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS monthly_chart (
+              month TEXT NOT NULL,
+              chart_type TEXT NOT NULL,
+              method_version TEXT,
+              position INTEGER NOT NULL,
+              show_id INTEGER NOT NULL,
+              month_gross_millions REAL,
+              points_total REAL,
+              points_share REAL,
+              points_breakout REAL,
+              points_heat REAL,
+              points_carryover REAL,
+              inactive_streak INTEGER,
+              created_at TEXT NOT NULL DEFAULT (datetime('now')),
+              PRIMARY KEY (month, chart_type, method_version, position),
+              UNIQUE (month, chart_type, method_version, show_id)
+            );
+            """
+        )
+
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS show_month (
+              month TEXT NOT NULL,
+              show_id INTEGER NOT NULL,
+              method_version TEXT NOT NULL DEFAULT 'SMPS_v1',
+              month_gross_millions REAL NOT NULL,
+              weeks_in_month INTEGER NOT NULL,
+              first2_avg_millions REAL,
+              last2_avg_millions REAL,
+              prev_month_gross_millions REAL,
+              inactive_streak INTEGER,
+              created_at TEXT NOT NULL DEFAULT (datetime('now')),
+              PRIMARY KEY (month, show_id, method_version)
+            );
+            """
+        )
+
+        con.commit()
+    finally:
+        con.close()
+
 @st.cache_data(show_spinner=False)
 def load_lists() -> tuple[pd.DataFrame, pd.DataFrame]:
     shows = sql_df("SELECT show_id, canonical_title FROM show ORDER BY canonical_title")
@@ -584,6 +720,494 @@ def holiday_week_ending_for_date(all_week_endings: list[date], holiday_dt: date,
 
 
 
+
+
+# ----------------------------
+# New tab: Monthly T-25 (SMPS)
+# ----------------------------
+@st.cache_data(show_spinner=False)
+def _compute_show_month_metrics(db_path: str, db_mtime: float) -> pd.DataFrame:
+    """Per-show monthly aggregates for SMPS.
+
+    Uses the same weekly gross base as Gross Races (weekly + all bonuses).
+    """
+    base = _load_gross_races_base(db_path, db_mtime)
+    if base.empty:
+        return pd.DataFrame(
+            columns=[
+                "month",
+                "month_ord",
+                "show_id",
+                "canonical_title",
+                "imprint_1",
+                "imprint_2",
+                "month_gross_millions",
+                "weeks_in_month",
+                "first2_avg_millions",
+                "last2_avg_millions",
+                "prev_month_gross_millions",
+            ]
+        )
+
+    meta = _load_show_meta_for_gross_races(db_path, db_mtime)
+    if not meta.empty:
+        base = base.merge(meta[["show_id", "imprint_1", "imprint_2"]], on="show_id", how="left")
+    else:
+        base["imprint_1"] = ""
+        base["imprint_2"] = ""
+
+    base["imprint_1"] = base["imprint_1"].fillna("")
+    base["imprint_2"] = base["imprint_2"].fillna("")
+
+    # Ensure we have a datetime column for week ending
+    if "week_ending_dt" not in base.columns:
+        if "week_ending" in base.columns:
+            base["week_ending_dt"] = pd.to_datetime(base["week_ending"], errors="coerce")
+        else:
+            raise KeyError("Expected 'week_ending' or 'week_ending_dt' in base dataframe.")
+
+    base = base.dropna(subset=["week_ending_dt"]).copy()
+
+    base = base[base["week_ending_dt"].dt.date >= GROSS_TRACKING_START].copy()
+
+    # chart-month mapping (cutoff day 28)
+    base["month"] = _chart_month_series(base["week_ending_dt"])
+
+    # Special rule: April 2001 uses only Mar 17 + Mar 24, 2001 weeks
+    base = base[
+        ~(
+            (base["month"] == "2001-04")
+            & (~base["week_ending"].isin(["2001-03-17", "2001-03-24"]))
+        )
+    ].copy()
+
+    # month ordering helper
+    y = base["month"].str.slice(0, 4).astype(int)
+    m = base["month"].str.slice(5, 7).astype(int)
+    base["month_ord"] = y * 12 + (m - 1)
+
+    base["gross_millions"] = pd.to_numeric(base["gross_millions"], errors="coerce").fillna(0.0)
+
+    # Aggregate per show/month
+    def _agg_one(g: pd.DataFrame) -> pd.Series:
+        g = g.sort_values("week_ending_dt")
+        arr = g["gross_millions"].to_numpy(dtype=float)
+        n = len(arr)
+        if n == 0:
+            f2 = 0.0
+            l2 = 0.0
+        elif n == 1:
+            f2 = float(arr[0])
+            l2 = float(arr[0])
+        else:
+            f2 = float(arr[:2].mean())
+            l2 = float(arr[-2:].mean())
+        return pd.Series(
+            {
+                "month_gross_millions": float(arr.sum()),
+                "weeks_in_month": int(n),
+                "first2_avg_millions": f2,
+                "last2_avg_millions": l2,
+            }
+        )
+
+    agg = (
+        base.groupby(["month", "month_ord", "show_id", "canonical_title", "imprint_1", "imprint_2"], as_index=False)
+        .apply(_agg_one)
+        .reset_index(drop=True)
+    )
+
+    # Prev-month gross per show
+    agg = agg.sort_values(["show_id", "month_ord"]).reset_index(drop=True)
+    agg["prev_month_gross_millions"] = agg.groupby("show_id")["month_gross_millions"].shift(1).fillna(0.0)
+
+    return agg
+
+
+@st.cache_data(show_spinner=False)
+def _compute_smps_history(db_path: str, db_mtime: float) -> dict[str, pd.DataFrame]:
+    """Compute SMPS_v1 charts for every chart-month (Apr 2001 → latest)."""
+    metrics = _compute_show_month_metrics(db_path, db_mtime)
+    if metrics.empty:
+        return {}
+
+    # Available months from the data
+    months = sorted(metrics["month"].unique().tolist())
+    # Ensure we start at the first SMPS month
+    if SMPS_START_MONTH in months:
+        start_idx = months.index(SMPS_START_MONTH)
+        months = months[start_idx:]
+
+    # Index by month for fast access
+    by_month: dict[str, pd.DataFrame] = {m: metrics[metrics["month"] == m].copy() for m in months}
+
+    # Meta lookups (loaded once):
+    # - Titles come from the show table so carryover-only candidates always have names.
+    # - Imprints come from the same helper used by Gross Races.
+    con = sqlite3.connect(db_path)
+    try:
+        show_titles = pd.read_sql_query("SELECT show_id, canonical_title FROM show", con)
+    finally:
+        con.close()
+
+    show_titles = show_titles.drop_duplicates('show_id') if not show_titles.empty else pd.DataFrame(columns=['show_id','canonical_title'])
+
+    _imp = _load_show_meta_for_gross_races(db_path, db_mtime)
+    if _imp is None or _imp.empty:
+        imprint_meta = pd.DataFrame(columns=['show_id','imprint_1','imprint_2'])
+    else:
+        cols = [c for c in ['show_id','imprint_1','imprint_2'] if c in _imp.columns]
+        imprint_meta = _imp[cols].drop_duplicates('show_id').copy()
+        if 'imprint_1' not in imprint_meta.columns:
+            imprint_meta['imprint_1'] = ''
+        if 'imprint_2' not in imprint_meta.columns:
+            imprint_meta['imprint_2'] = ''
+
+
+
+    inactive: dict[int, int] = {}  # show_id -> consecutive zero-gross months (candidate-only)
+    prev_chart: Optional[pd.DataFrame] = None
+
+    out: dict[str, pd.DataFrame] = {}
+
+    for m in months:
+        mdf = by_month.get(m)
+        if mdf is None:
+            continue
+
+        # Dicts for quick lookup
+        gross = {int(r.show_id): float(r.month_gross_millions) for r in mdf.itertuples(index=False)}
+        f2 = {int(r.show_id): float(r.first2_avg_millions) for r in mdf.itertuples(index=False)}
+        l2 = {int(r.show_id): float(r.last2_avg_millions) for r in mdf.itertuples(index=False)}
+        prevg = {int(r.show_id): float(r.prev_month_gross_millions) for r in mdf.itertuples(index=False)}
+
+        grossing_ids = {sid for sid, g in gross.items() if g > 0}
+        prev_ids: set[int] = set(prev_chart["show_id"].astype(int).tolist()) if prev_chart is not None else set()
+        candidates = set(grossing_ids) | set(prev_ids)
+
+        # Update inactive streaks for candidates
+        for sid in list(candidates):
+            g = gross.get(sid, 0.0)
+            if g > 0:
+                inactive[sid] = 0
+            else:
+                inactive[sid] = int(inactive.get(sid, 0)) + 1
+
+        # Zombie rule: ineligible if 4+ consecutive zero-gross months
+        def is_zombie(sid: int) -> bool:
+            return (gross.get(sid, 0.0) <= 0) and (inactive.get(sid, 0) >= 4)
+
+        candidates = {sid for sid in candidates if not is_zombie(sid)}
+
+        # Month total for share% uses only shows that grossed this month
+        total_month_gross = sum(gross.get(sid, 0.0) for sid in grossing_ids)
+        total_month_gross = float(total_month_gross) if total_month_gross > 0 else 0.0
+
+        # Floors for breakout + heat
+        F = _p10_inc([prevg.get(sid, 0.0) for sid in candidates], ignore_nonpositive=True)
+        FW = _p10_inc([f2.get(sid, 0.0) for sid in candidates], ignore_nonpositive=True)
+
+        rows = []
+        prev_pts = {}
+        if prev_chart is not None and not prev_chart.empty:
+            prev_pts = {int(r.show_id): float(r.points_total) for r in prev_chart.itertuples(index=False)}
+
+        for sid in candidates:
+            mg = float(gross.get(sid, 0.0))
+            pg = float(prevg.get(sid, 0.0))
+
+            # Share
+            share_raw = (mg / total_month_gross) if (total_month_gross > 0 and mg > 0) else 0.0
+            pts_share = 40.0 * share_raw
+
+            # Momentum components only apply when the show grossed this month
+            if mg > 0:
+                breakout_raw = (mg - pg) / max(pg, F)
+                f2v = float(f2.get(sid, 0.0))
+                l2v = float(l2.get(sid, 0.0))
+                heat_raw = (l2v - f2v) / max(f2v, FW)
+            else:
+                breakout_raw = 0.0
+                heat_raw = 0.0
+
+            rows.append(
+                {
+                    "show_id": int(sid),
+                    "month_gross_millions": mg,
+                    "prev_month_gross_millions": pg,
+                    "share_raw": share_raw,
+                    "breakout_raw": breakout_raw,
+                    "heat_raw": heat_raw,
+                    "inactive_streak": int(inactive.get(sid, 0)),
+                    "points_share": pts_share,
+                }
+            )
+
+        df = pd.DataFrame(rows)
+        if df.empty:
+            out[m] = df
+            prev_chart = df
+            continue
+
+        # Rank-based momentum scoring (0..1) among *grossing* shows only
+        grossing_mask = df["month_gross_millions"] > 0
+        mom_df = df[grossing_mask].copy()
+
+        def _rank01(s: pd.Series) -> pd.Series:
+            if len(s) <= 1:
+                return pd.Series([1.0] * len(s), index=s.index)
+            r = s.rank(method="average", ascending=True)
+            return (r - 1.0) / (len(s) - 1.0)
+
+        if not mom_df.empty:
+            mom_df["breakout_score"] = _rank01(mom_df["breakout_raw"])
+            mom_df["heat_score"] = _rank01(mom_df["heat_raw"])
+            mom_df["points_breakout"] = 45.0 * mom_df["breakout_score"]
+            mom_df["points_heat"] = 15.0 * mom_df["heat_score"]
+
+            df = df.merge(
+                mom_df[["show_id", "points_breakout", "points_heat"]],
+                on="show_id",
+                how="left",
+            )
+        else:
+            df["points_breakout"] = 0.0
+            df["points_heat"] = 0.0
+
+        df["points_breakout"] = pd.to_numeric(df.get("points_breakout"), errors="coerce").fillna(0.0)
+        df["points_heat"] = pd.to_numeric(df.get("points_heat"), errors="coerce").fillna(0.0)
+
+        # Carryover for 0-gross months (prev SMPS Top 25 only), decays by inactive streak
+        def _carry(sid: int, mg: float) -> float:
+            if mg > 0:
+                return 0.0
+            if sid not in prev_pts:
+                return 0.0
+            k = int(inactive.get(sid, 0))
+            if k < 1 or k > 3:
+                return 0.0
+            return float(prev_pts[sid]) * 0.30 * (0.55 ** k)
+
+        df["points_carryover"] = df.apply(lambda r: _carry(int(r["show_id"]), float(r["month_gross_millions"])), axis=1)
+
+        df["points_total"] = (
+            df["points_share"]
+            + df["points_breakout"]
+            + df["points_heat"]
+            + df["points_carryover"]
+        )
+
+        # Attach titles/imprints
+        # Use show table titles so carryover-only candidates do not show up as (Unknown).
+        df = df.merge(show_titles, on="show_id", how="left", suffixes=("", "_show"))
+        if "canonical_title_show" in df.columns:
+            if "canonical_title" in df.columns:
+                df["canonical_title"] = df["canonical_title"].fillna(df["canonical_title_show"])
+            else:
+                df = df.rename(columns={"canonical_title_show": "canonical_title"})
+            df = df.drop(columns=["canonical_title_show"], errors="ignore")
+
+        # Imprints: fill from imprint_meta for any show_ids that are missing them this month
+        if imprint_meta is not None and not imprint_meta.empty:
+            df = df.merge(imprint_meta, on="show_id", how="left", suffixes=("", "_imp"))
+            for col in ("imprint_1", "imprint_2"):
+                imp_col = f"{col}_imp"
+                if imp_col in df.columns:
+                    if col in df.columns:
+                        df[col] = df[col].fillna(df[imp_col])
+                    else:
+                        df[col] = df[imp_col]
+                    df = df.drop(columns=[imp_col], errors="ignore")
+
+        if "canonical_title" not in df.columns:
+            df["canonical_title"] = pd.NA
+        if "imprint_1" not in df.columns:
+            df["imprint_1"] = ""
+        if "imprint_2" not in df.columns:
+            df["imprint_2"] = ""
+        df["canonical_title"] = df["canonical_title"].fillna("(Unknown)")
+        df["imprint_1"] = df["imprint_1"].fillna("")
+        df["imprint_2"] = df["imprint_2"].fillna("")
+
+        # Tie-breaks: total_pts, breakout_raw, heat_raw, month_gross, title
+        df = df.sort_values(
+            ["points_total", "breakout_raw", "heat_raw", "month_gross_millions", "canonical_title"],
+            ascending=[False, False, False, False, True],
+        ).reset_index(drop=True)
+
+        df.insert(0, "position", np.arange(1, len(df) + 1))
+        chart = df.head(25).copy()
+
+        # Keep only needed columns for chart storage
+        chart["month"] = m
+        chart["chart_type"] = "SMPS"
+        chart["method_version"] = SMPS_METHOD_VERSION
+
+        out[m] = chart
+        prev_chart = chart[[
+            "show_id",
+            "points_total",
+        ]].copy()
+
+    return out
+
+
+def _write_smps_to_db(month: str, chart_df: pd.DataFrame) -> None:
+    """Persist one month of SMPS chart results into SQLite."""
+    if chart_df.empty:
+        return
+
+    _ensure_smps_schema()
+
+    con = get_con()
+    try:
+        cur = con.cursor()
+        cur.execute("BEGIN;")
+        cur.execute(
+            "DELETE FROM monthly_chart WHERE month = ? AND chart_type = 'SMPS' AND method_version = ?;",
+            (month, SMPS_METHOD_VERSION),
+        )
+
+        rows = []
+        for r in chart_df.itertuples(index=False):
+            rows.append(
+                (
+                    str(r.month),
+                    "SMPS",
+                    SMPS_METHOD_VERSION,
+                    int(r.position),
+                    int(r.show_id),
+                    float(getattr(r, "month_gross_millions", 0.0)),
+                    float(getattr(r, "points_total", 0.0)),
+                    float(getattr(r, "points_share", 0.0)),
+                    float(getattr(r, "points_breakout", 0.0)),
+                    float(getattr(r, "points_heat", 0.0)),
+                    float(getattr(r, "points_carryover", 0.0)),
+                    int(getattr(r, "inactive_streak", 0)),
+                )
+            )
+
+        cur.executemany(
+            """
+            INSERT INTO monthly_chart(
+              month, chart_type, method_version, position, show_id,
+              month_gross_millions,
+              points_total, points_share, points_breakout, points_heat, points_carryover,
+              inactive_streak
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?);
+            """,
+            rows,
+        )
+        con.commit()
+    finally:
+        con.close()
+
+
+def tab_monthly_smps_t25():
+    st.subheader("Monthly T-25 (SMPS)")
+    st.caption(
+        "SMPS_v1 = Share (40) + Breakout (45) + Heat (15) + continuity carryover (0-gross months only). "
+        "Floors use PERCENTILE.INC (10th percentile). Zombie rule: 4 consecutive 0-gross chart-months => ineligible."
+    )
+
+    if not DB_PATH.exists():
+        st.error(f"Database not found at {DB_PATH}.")
+        return
+
+    db_mtime = DB_PATH.stat().st_mtime
+    hist = _compute_smps_history(str(DB_PATH), db_mtime)
+    if not hist:
+        st.info("No SMPS history could be computed from the current DB.")
+        return
+
+    months = sorted(hist.keys())
+
+    # Default month: latest
+    pick = st.selectbox("Chart month", options=months, index=len(months) - 1, key="smps_month_pick")
+    chart = hist.get(pick)
+    if chart is None or chart.empty:
+        st.info("No chart rows for that month.")
+        return
+
+    # Display
+    disp = chart.copy()
+
+    # Add last-month position + months-on-chart (SMPS)
+    pick_idx = months.index(pick)
+    prev_pos_map = {}
+    if pick_idx > 0:
+        prev_m = months[pick_idx - 1]
+        prev_chart = hist.get(prev_m)
+        if prev_chart is not None and not prev_chart.empty:
+            prev_pos_map = dict(zip(prev_chart["show_id"].astype(int), prev_chart["position"].astype(int)))
+
+    from collections import Counter
+    cnt = Counter()
+    for mm in months[: pick_idx + 1]:
+        cdf = hist.get(mm)
+        if cdf is None or cdf.empty:
+            continue
+        cnt.update(cdf["show_id"].astype(int).tolist())
+
+    disp["Last Mo Pos"] = disp["show_id"].astype(int).map(prev_pos_map)
+    disp["Months on Chart"] = disp["show_id"].astype(int).map(cnt).fillna(0).astype(int)
+    disp["Share %"] = (disp["share_raw"] * 100.0).round(2)
+    disp["Month Gross"] = disp["month_gross_millions"].round(2)
+    disp["Pts Share"] = disp["points_share"].round(2)
+    disp["Pts Breakout"] = disp["points_breakout"].round(2)
+    disp["Pts Heat"] = disp["points_heat"].round(2)
+    disp["Pts Carryover"] = disp["points_carryover"].round(2)
+    disp["Pts Total"] = disp["points_total"].round(2)
+
+    show_cols = [
+        "position",
+        "canonical_title",
+        "Last Mo Pos",
+        "Months on Chart",
+        "imprint_1",
+        "imprint_2",
+        "Month Gross",
+        "Share %",
+        "breakout_raw",
+        "heat_raw",
+        "inactive_streak",
+        "Pts Share",
+        "Pts Breakout",
+        "Pts Heat",
+        "Pts Carryover",
+        "Pts Total",
+    ]
+
+    st.dataframe(
+        disp[show_cols].rename(
+            columns={
+                "position": "Pos",
+                "canonical_title": "Show",
+                "imprint_1": "Imprint 1",
+                "imprint_2": "Imprint 2",
+                "breakout_raw": "BreakoutRaw",
+                "heat_raw": "HeatRaw",
+            }
+        ),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    c1, c2 = st.columns([1, 2])
+    with c1:
+        if st.button("Write this SMPS month to DB", key="smps_write_one"):
+            _write_smps_to_db(pick, chart)
+            st.success(f"Saved SMPS {pick} to monthly_chart.")
+
+    with c2:
+        with st.expander("Backfill: write ALL SMPS months to DB (SMPS_v1)"):
+            st.warning("This writes/overwrites SMPS_v1 rows in monthly_chart for every month in history.")
+            if st.button("Run full SMPS backfill", key="smps_write_all"):
+                prog = st.progress(0)
+                for i, m2 in enumerate(months, start=1):
+                    _write_smps_to_db(m2, hist[m2])
+                    prog.progress(int(i * 100 / max(1, len(months))))
+                st.success("Backfill complete.")
 # ----------------------------
 # New tab: Grossing Milestones
 # ----------------------------
@@ -3417,6 +4041,7 @@ def main():
         "Companies",
         "Analytics",
         "Gross Races",
+        "Monthly T-25 (SMPS)",
         "Grossing Milestones",
         "Grossing Trends",
         "Streak Analytics",
@@ -3438,16 +4063,18 @@ def main():
     with tabs[5]:
         tab_gross_races()
     with tabs[6]:
-        tab_grossing_milestones()
+        tab_monthly_smps_t25()
     with tabs[7]:
-        tab_grossing_trends()
+        tab_grossing_milestones()
     with tabs[8]:
-        tab_streak_analytics()
+        tab_grossing_trends()
     with tabs[9]:
-        tab_holidays()
+        tab_streak_analytics()
     with tabs[10]:
-        tab_records_achievements()
+        tab_holidays()
     with tabs[11]:
+        tab_records_achievements()
+    with tabs[12]:
         tab_admin()
 
 
