@@ -1064,15 +1064,15 @@ def _compute_smps_history(db_path: str, db_mtime: float, include_bonuses: bool) 
         # commands a big enough Share of the month. This keeps true mega-launches eligible for #1,
         # but prevents "auto-#1" Breakout wins caused by pg≈0/denominator effects.
         #
-        # Taper rule (nonlinear power ramp, exponent 1.5):
+        # Taper rule (nonlinear power ramp, exponent 1.25):
         #   share_raw <= 0.40 -> 0% of Breakout points  (<= 40% of Cap(m))
-        #   share_raw >= 0.64 -> 100% of Breakout points (>= 64% of Cap(m))
-        #   between -> ramp in [0..1] then apply power exponent 1.5
-        s0, s1 = 0.40, 0.64
+        #   share_raw >= 0.75 -> 100% of Breakout points (>= 75% of Cap(m))
+        #   between -> ramp in [0..1] then apply power exponent 1.25
+        s0, s1 = 0.40, 0.75
         denom = (s1 - s0) if (s1 - s0) != 0 else 1.0
         df["is_debut_or_reentry"] = ~df["show_id"].astype(int).isin(list(prev_ids))
         _u = ((df["share_raw"] - s0) / denom).clip(lower=0.0, upper=1.0)
-        df["debut_breakout_factor"] = _u ** 1.5
+        df["debut_breakout_factor"] = _u ** 1.25
         _mask_debut = df["is_debut_or_reentry"] & (df["month_gross_millions"] > 0)
         df.loc[_mask_debut, "points_breakout"] = df.loc[_mask_debut, "points_breakout"] * df.loc[_mask_debut, "debut_breakout_factor"]
 
@@ -1290,8 +1290,8 @@ def tab_monthly_smps_t25():
     disp["Pts Share"] = disp["points_share"].round(2)
     disp["Pts Breakout"] = disp["points_breakout"].round(2)
     disp["Pts Heat"] = disp["points_heat"].round(2)
-    disp["Pts Carryover"] = disp["points_carryover"].round(2)
     disp["Pts Continuity"] = pd.to_numeric(disp.get("points_continuity"), errors="coerce").fillna(0.0).round(2)
+    disp["Pts Carryover"] = disp["points_carryover"].round(2)
     disp["Pts Total"] = disp["points_total"].round(2)
 
     show_cols = [
@@ -1305,12 +1305,11 @@ def tab_monthly_smps_t25():
         "Share Ratio",
         "breakout_raw",
         "heat_raw",
-        "inactive_streak",
         "Pts Share",
         "Pts Breakout",
         "Pts Heat",
-        "Pts Carryover",
         "Pts Continuity",
+        "Pts Carryover",
         "Pts Total",
     ]
 
