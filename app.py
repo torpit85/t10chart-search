@@ -879,8 +879,8 @@ def _compute_smps_history(db_path: str, db_mtime: float, include_bonuses: bool) 
 
     # Dynamic Share cap per month:
     # For each chart-month, compute the highest single-show month_gross_millions on record
-    # *up to and including* that month. Round that record up to the nearest 100M, and
-    # treat it as the denominator that yields the full 50 Share points.
+    # *up to and including* that month. No rounding.
+    # Share uses an 80% normalization: month_gross >= 0.80 * Cap(m) yields the full 50 Share points.
     #
     # This makes older eras comparable by scaling Share against the historical ceiling
     # that existed at the time.
@@ -978,16 +978,28 @@ def _compute_smps_history(db_path: str, db_mtime: float, include_bonuses: bool) 
             mg = float(gross.get(sid, 0.0))
             pg = float(prevg.get(sid, 0.0))
             # Share (ratio-based, top-heavy)
-            # Dynamic denom per month: "highest single-show month gross on record up to this month",
-            # as-is (no rounding).
-            # r = clamp(mg/share_cap, 0..1), PtsShare = 50 * r^1.4
+            # Dynamic denom per month: Cap(m) = running record (through month m) of the highest
+            # single-show month gross (no rounding).
+            #
+            # New regime: keep the same raw share ratio basis r = clamp(MG/Cap(m), 0..1), but
+            # grant full Share points at 80% of Cap(m) by rescaling r -> r_scaled = clamp(r/0.80, 0..1).
+            #
+            # Displayed "Share Ratio" uses the raw ratio r (MG/Cap).
             share_cap = float(share_cap_by_month.get(m, 100.0))
-            share_raw = (mg / share_cap) if (mg > 0 and share_cap > 0) else 0.0
+            share_raw = (mg / share_cap) if (mg > 0 and share_cap > 0) else 0.0  # r = MG/Cap(m)
             if share_raw < 0.0:
                 share_raw = 0.0
             elif share_raw > 1.0:
                 share_raw = 1.0
-            pts_share = 50.0 * (share_raw ** 1.4)
+
+            share_scaled = share_raw / 0.80
+            if share_scaled < 0.0:
+                share_scaled = 0.0
+            elif share_scaled > 1.0:
+                share_scaled = 1.0
+
+            # Nonlinear top-heavy ramp (power exponent 1.5)
+            pts_share = 50.0 * (share_scaled ** 1.5)
 
             # Momentum components only apply when the show grossed this month
             if mg > 0:
@@ -1052,14 +1064,15 @@ def _compute_smps_history(db_path: str, db_mtime: float, include_bonuses: bool) 
         # commands a big enough Share of the month. This keeps true mega-launches eligible for #1,
         # but prevents "auto-#1" Breakout wins caused by pg≈0/denominator effects.
         #
-        # Taper rule (linear):
-        #   share_raw <= 0.50 -> 0% of Breakout points  (<= 50% of the month’s Share cap)
-        #   share_raw >= 0.80 -> 100% of Breakout points (>= 80% of the month’s Share cap)
-        #   between -> linear ramp
-        s0, s1 = 0.50, 0.80
+        # Taper rule (nonlinear power ramp, exponent 1.5):
+        #   share_raw <= 0.40 -> 0% of Breakout points  (<= 40% of Cap(m))
+        #   share_raw >= 0.64 -> 100% of Breakout points (>= 64% of Cap(m))
+        #   between -> ramp in [0..1] then apply power exponent 1.5
+        s0, s1 = 0.40, 0.64
         denom = (s1 - s0) if (s1 - s0) != 0 else 1.0
         df["is_debut_or_reentry"] = ~df["show_id"].astype(int).isin(list(prev_ids))
-        df["debut_breakout_factor"] = ((df["share_raw"] - s0) / denom).clip(lower=0.0, upper=1.0)
+        _u = ((df["share_raw"] - s0) / denom).clip(lower=0.0, upper=1.0)
+        df["debut_breakout_factor"] = _u ** 1.5
         _mask_debut = df["is_debut_or_reentry"] & (df["month_gross_millions"] > 0)
         df.loc[_mask_debut, "points_breakout"] = df.loc[_mask_debut, "points_breakout"] * df.loc[_mask_debut, "debut_breakout_factor"]
 
@@ -3578,6 +3591,66 @@ def _record_progression(
     out = out[out_cols]
     return out
 
+
+
+def _monthly_record_progression(unique_month_winners: pd.DataFrame, latest_month_ord: int | None) -> pd.DataFrame:
+    """Record progression for monthly single-show gross totals.
+
+    Input should contain one row per chart-month (ties removed), ordered by month.
+    Columns expected: month, month_ord, show_id, canonical_title, imprint_1, imprint_2, gross_millions
+
+    Output includes:
+      - length_months: how many chart-months the record stood (inclusive of the record month)
+      - broken_month: the next record-set month (or blank for the current record)
+      - broken_by: show that broke it (or blank)
+    """
+    out_cols = [
+        "show_id",
+        "canonical_title",
+        "imprint_1",
+        "imprint_2",
+        "month",
+        "gross_millions",
+        "length_months",
+        "broken_month",
+        "broken_by",
+    ]
+
+    if unique_month_winners is None or unique_month_winners.empty:
+        return pd.DataFrame(columns=out_cols)
+
+    df = unique_month_winners.copy()
+    df = df.sort_values(["month_ord", "month", "canonical_title"], ascending=[True, True, True]).reset_index(drop=True)
+
+    df["prev_record"] = pd.to_numeric(df["gross_millions"], errors="coerce").fillna(0.0).cummax().shift(1).fillna(-np.inf)
+    events = df[pd.to_numeric(df["gross_millions"], errors="coerce").fillna(0.0) > df["prev_record"]].copy()
+    if events.empty:
+        return pd.DataFrame(columns=out_cols)
+
+    events["next_month"] = events["month"].shift(-1)
+    events["next_month_ord"] = events["month_ord"].shift(-1)
+    events["broken_month"] = events["next_month"].fillna("")
+    events["broken_by"] = events["canonical_title"].shift(-1).fillna("")
+
+    def _len_months(row: pd.Series) -> int | None:
+        cur_ord = row.get("month_ord")
+        nxt_ord = row.get("next_month_ord")
+        if pd.notna(cur_ord) and pd.notna(nxt_ord):
+            return int(nxt_ord) - int(cur_ord)
+        if pd.notna(cur_ord) and latest_month_ord is not None:
+            return int(latest_month_ord) - int(cur_ord) + 1
+        return None
+
+    events["length_months"] = events.apply(_len_months, axis=1)
+
+    base_cols = [c for c in ["show_id", "canonical_title", "imprint_1", "imprint_2", "month", "gross_millions", "length_months", "broken_month", "broken_by"] if c in events.columns]
+    out = events[base_cols].copy()
+    for c in out_cols:
+        if c not in out.columns:
+            out[c] = None
+    out = out[out_cols]
+    return out
+
 def tab_records_achievements():
     st.subheader("Records and Achievements")
     st.caption("Grosses on this page use weekly gross only (no gross bonuses).")
@@ -3714,6 +3787,65 @@ def tab_records_achievements():
                 "Grosses (in millions)": prog["gross_millions"].apply(fmt_millions),
             })
             st.dataframe(disp, use_container_width=True, hide_index=True)
+
+    
+
+    # -------------------------
+    # 2b) Single-show monthly grossing record (progression)
+    # -------------------------
+    st.markdown("### List of shows holding single-show monthly grossing record")
+
+    # Compute chart-month totals (cutoff day 28) using weekly gross only.
+    m_base = base_gross.copy()
+    m_base["month"] = _chart_month_series(m_base["week_ending_dt"])
+
+    # Special rule: April 2001 uses only Mar 17 + Mar 24, 2001 weeks
+    m_base = m_base[
+        ~(
+            (m_base["month"] == "2001-04")
+            & (~m_base["week_ending"].isin(["2001-03-17", "2001-03-24"]))
+        )
+    ].copy()
+
+    if m_base.empty:
+        st.info("No gross rows available for monthly aggregation.")
+    else:
+        # month ordering
+        y = m_base["month"].str.slice(0, 4).astype(int)
+        mo = m_base["month"].str.slice(5, 7).astype(int)
+        m_base["month_ord"] = y * 12 + (mo - 1)
+
+        month_totals = (
+            m_base.groupby(["month", "month_ord", "show_id", "canonical_title", "imprint_1", "imprint_2"], as_index=False)
+            .agg(gross_millions=("gross_millions", "sum"))
+        )
+
+        # Unique #1 per month (exclude ties)
+        mx = month_totals.groupby("month", as_index=False)["gross_millions"].max().rename(columns={"gross_millions": "max_gross"})
+        cand = month_totals.merge(mx, on="month", how="inner")
+        cand = cand[cand["gross_millions"].eq(cand["max_gross"])].copy()
+        counts = cand.groupby("month")["show_id"].size()
+        uniq_months = counts[counts.eq(1)].index.tolist()
+        uniq = cand[cand["month"].isin(uniq_months)].drop(columns=["max_gross"]).copy()
+
+        latest_month_ord = int(month_totals["month_ord"].max()) if not month_totals.empty else None
+        prog_m = _monthly_record_progression(uniq, latest_month_ord)
+
+        if prog_m.empty:
+            st.info("No monthly record progression found (possible ties or no gross data).")
+        else:
+            prog_m = prog_m.reset_index(drop=True)
+            disp_m = pd.DataFrame({
+                "#": np.arange(1, len(prog_m) + 1),
+                "Show": prog_m["canonical_title"],
+                "Imprint 1": prog_m["imprint_1"],
+                "Imprint 2": prog_m["imprint_2"],
+                "Total Length (in months)": prog_m["length_months"].astype("Int64"),
+                "Month Record Set": prog_m["month"],
+                "Month Record Broken": prog_m["broken_month"],
+                "Grosses (in millions)": prog_m["gross_millions"].apply(fmt_millions),
+            })
+            st.dataframe(disp_m, use_container_width=True, hide_index=True)
 
     st.divider()
 
