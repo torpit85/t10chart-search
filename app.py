@@ -3440,6 +3440,28 @@ def tab_admin():
                         # Normalize whitespace
                         cur.execute("UPDATE t10_entry SET imprint_1 = TRIM(imprint_1) WHERE imprint_1 IS NOT NULL;")
                         cur.execute("UPDATE t10_entry SET imprint_2 = TRIM(imprint_2) WHERE imprint_2 IS NOT NULL;")
+                        # Scrub placeholder strings so '(blank)' isn't stored as real data (per-show)
+                        cur.execute(
+                            """
+                            UPDATE t10_entry
+                            SET imprint_1 = NULL
+                            WHERE show_id = ?
+                              AND imprint_1 IS NOT NULL
+                              AND lower(TRIM(imprint_1)) IN ('(blank)', 'blank', '')
+                            """,
+                            (sel_id,),
+                        )
+                        cur.execute(
+                            """
+                            UPDATE t10_entry
+                            SET imprint_2 = NULL
+                            WHERE show_id = ?
+                              AND imprint_2 IS NOT NULL
+                              AND lower(TRIM(imprint_2)) IN ('(blank)', 'blank', '')
+                            """,
+                            (sel_id,),
+                        )
+
 
                         # If imprint_1 empty but imprint_2 filled, shift up
                         cur.execute(
@@ -3515,15 +3537,15 @@ def tab_admin():
                   COUNT(*) AS weeks,
                   SUM(CASE
                         WHEN (imprint_1 IS NULL OR TRIM(imprint_1) = '')
-                         AND (imprint_2 IS NULL OR TRIM(imprint_2) = '')
+                         AND (imprint_2 IS NULL OR TRIM(imprint_2) = '' OR lower(TRIM(imprint_2)) IN ('(blank)','blank'))
                         THEN 1 ELSE 0 END) AS missing_both,
                   SUM(CASE
                         WHEN (imprint_1 IS NULL OR TRIM(imprint_1) = '')
-                         AND (imprint_2 IS NOT NULL AND TRIM(imprint_2) <> '')
+                         AND (imprint_2 IS NOT NULL AND TRIM(imprint_2) <> '' AND lower(TRIM(imprint_2)) NOT IN ('(blank)','blank'))
                         THEN 1 ELSE 0 END) AS missing_imprint_1,
                   SUM(CASE
-                        WHEN (imprint_2 IS NULL OR TRIM(imprint_2) = '')
-                         AND (imprint_1 IS NOT NULL AND TRIM(imprint_1) <> '')
+                        WHEN (imprint_2 IS NULL OR TRIM(imprint_2) = '' OR lower(TRIM(imprint_2)) IN ('(blank)','blank'))
+                         AND (imprint_1 IS NOT NULL AND TRIM(imprint_1) <> '' AND lower(TRIM(imprint_1)) NOT IN ('(blank)','blank'))
                         THEN 1 ELSE 0 END) AS missing_imprint_2
                 FROM t10_entry
                 WHERE show_id = ?
@@ -3571,6 +3593,16 @@ def tab_admin():
                 key="imp_set_mode",
             )
 
+            clear1 = False
+            clear2 = False
+            if mode == "Overwrite existing (dangerous)":
+                c3, c4 = st.columns(2)
+                with c3:
+                    clear1 = st.checkbox("Clear imprint_1 (set blank)", value=False, key="imp_set_clear1")
+                with c4:
+                    clear2 = st.checkbox("Clear imprint_2 (set blank)", value=False, key="imp_set_clear2")
+
+
             if mode == "Fill missing only":
                 st.caption("Tip: leave a field blank to avoid changing that imprint column.")
                 fill_both = st.checkbox(
@@ -3600,8 +3632,8 @@ def tab_admin():
             if st.button("Apply imprint update", type="primary", key="imp_set_apply"):
                 if not confirm_ok:
                     st.warning("Please confirm overwrite to proceed.")
-                elif not (new_imp1 or new_imp2):
-                    st.warning("Enter at least one imprint value to apply.")
+                elif not (new_imp1 or new_imp2 or clear1 or clear2):
+                    st.warning("Enter at least one imprint value to apply, or use the Clear checkbox(es).")
                 else:
                     con = get_con()
                     try:
@@ -3610,16 +3642,16 @@ def tab_admin():
 
                         # Helper: conditions
                         cond_both_blank = (
-                            "(imprint_1 IS NULL OR TRIM(imprint_1) = '') "
-                            "AND (imprint_2 IS NULL OR TRIM(imprint_2) = '')"
+                            "(imprint_1 IS NULL OR TRIM(imprint_1) = '' OR lower(TRIM(imprint_1)) IN ('(blank)','blank')) "
+                            "AND (imprint_2 IS NULL OR TRIM(imprint_2) = '' OR lower(TRIM(imprint_2)) IN ('(blank)','blank'))"
                         )
                         cond_i1_blank_i2_present = (
-                            "(imprint_1 IS NULL OR TRIM(imprint_1) = '') "
-                            "AND (imprint_2 IS NOT NULL AND TRIM(imprint_2) <> '')"
+                            "(imprint_1 IS NULL OR TRIM(imprint_1) = '' OR lower(TRIM(imprint_1)) IN ('(blank)','blank')) "
+                            "AND (imprint_2 IS NOT NULL AND TRIM(imprint_2) <> '' AND lower(TRIM(imprint_2)) NOT IN ('(blank)','blank'))"
                         )
                         cond_i2_blank_i1_present = (
                             "(imprint_2 IS NULL OR TRIM(imprint_2) = '') "
-                            "AND (imprint_1 IS NOT NULL AND TRIM(imprint_1) <> '')"
+                            "AND (imprint_1 IS NOT NULL AND TRIM(imprint_1) <> '' AND lower(TRIM(imprint_1)) NOT IN ('(blank)','blank'))"
                         )
 
                         if mode == "Fill missing only":
@@ -3647,13 +3679,18 @@ def tab_admin():
                                     (new_imp2, sel_id),
                                 )
                         else:
-                            # Overwrite (only columns provided)
-                            if new_imp1:
+                            # Overwrite (allow explicit clearing to true blank/NULL)
+                            if clear1:
+                                cur.execute("UPDATE t10_entry SET imprint_1 = NULL WHERE show_id = ?", (sel_id,))
+                            elif new_imp1:
                                 cur.execute(
                                     "UPDATE t10_entry SET imprint_1 = ? WHERE show_id = ?",
                                     (new_imp1, sel_id),
                                 )
-                            if new_imp2:
+
+                            if clear2:
+                                cur.execute("UPDATE t10_entry SET imprint_2 = NULL WHERE show_id = ?", (sel_id,))
+                            elif new_imp2:
                                 cur.execute(
                                     "UPDATE t10_entry SET imprint_2 = ? WHERE show_id = ?",
                                     (new_imp2, sel_id),
