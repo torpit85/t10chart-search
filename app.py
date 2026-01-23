@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import sqlite3
+import io
 import math
 from dataclasses import dataclass
 from pathlib import Path
@@ -234,6 +235,8 @@ class FilterSpec:
     date_max: str | None
     rank_min: int
     rank_max: int
+    week_number_min: int | None = None
+    week_number_max: int | None = None
 
 def build_where(filters: FilterSpec, table_alias: str = "e") -> tuple[str, list[Any]]:
     where = [f"{table_alias}.rank BETWEEN ? AND ?"]
@@ -244,6 +247,12 @@ def build_where(filters: FilterSpec, table_alias: str = "e") -> tuple[str, list[
     if filters.date_max:
         where.append(f"{table_alias}.week_ending <= ?")
         params.append(filters.date_max)
+    if filters.week_number_min is not None:
+        where.append(f"{table_alias}.week_number >= ?")
+        params.append(int(filters.week_number_min))
+    if filters.week_number_max is not None:
+        where.append(f"{table_alias}.week_number <= ?")
+        params.append(int(filters.week_number_max))
     return " AND ".join(where), params
 
 def fetch_entries(filters: FilterSpec, fts_query: str | None = None, limit: int = 1000) -> pd.DataFrame:
@@ -2267,13 +2276,36 @@ def tab_search():
         date_min = st.text_input("Start date (YYYY-MM-DD)", value="", key="gt_date_min")
         date_max = st.text_input("End date (YYYY-MM-DD)", value="", key="gt_date_max")
         rank_min, rank_max = st.slider("Rank range", 1, 50, (1, 10))
+        week_spec = st.text_input("Week # (single or range)", value="", placeholder="e.g. 2500 or 2400-2600", key="gt_week_num")
         limit = st.slider("Max results", 50, 10000, 1000, step=50)
+
+
+    # Week # filter parsing: accept a single number (exact match) or a range like 2400-2600.
+    week_number_min: int | None = None
+    week_number_max: int | None = None
+    _ws = (week_spec or "").strip()
+    if _ws:
+        try:
+            _ws = _ws.replace("–", "-").replace("—", "-")
+            if "-" in _ws:
+                a, b = [p.strip() for p in _ws.split("-", 1)]
+                if a:
+                    week_number_min = int(a)
+                if b:
+                    week_number_max = int(b)
+            else:
+                week_number_min = week_number_max = int(_ws)
+        except Exception:
+            week_number_min = None
+            week_number_max = None
 
     filters = FilterSpec(
         date_min=date_min.strip() or None,
         date_max=date_max.strip() or None,
         rank_min=int(rank_min),
         rank_max=int(rank_max),
+        week_number_min=week_number_min,
+        week_number_max=week_number_max,
     )
     df = fetch_entries(filters, fts_query=fts, limit=int(limit))
 
@@ -2843,30 +2875,44 @@ def tab_gross_races():
     # 1) All-Time Gross Races Chart (unlimited rank)
     # -------------------------
     st.markdown("### All-Time Gross Races Chart")
-    all_time = base.groupby(["show_id", "canonical_title"], as_index=False)["gross_millions"].sum()
-    all_time = all_time[all_time["gross_millions"] > 0].copy()
 
-    if not meta.empty:
-        all_time = all_time.merge(meta[["show_id", "imprint_1", "imprint_2", "debut_date"]], on="show_id", how="left")
+    pick_all_dt = st.date_input(
+        "As-of date (pick any date to view all-time totals through that date)",
+        value=latest_date,
+        min_value=GROSS_TRACKING_START,
+        max_value=latest_date,
+        key="all_time_race_date",
+    )
+    pick_all_ts = pd.to_datetime(pick_all_dt)
+
+    base_all = base[base["week_ending_dt"] <= pick_all_ts].copy()
+    if base_all.empty:
+        st.info("No gross rows found through the selected date (gross-tracking era filter applied).")
     else:
-        all_time["imprint_1"] = ""
-        all_time["imprint_2"] = ""
-        all_time["debut_date"] = pd.NaT
+        all_time = base_all.groupby(["show_id", "canonical_title"], as_index=False)["gross_millions"].sum()
+        all_time = all_time[all_time["gross_millions"] > 0].copy()
 
-    all_time["imprint_1"] = all_time["imprint_1"].fillna("")
-    all_time["imprint_2"] = all_time["imprint_2"].fillna("")
+        if not meta.empty:
+            all_time = all_time.merge(meta[["show_id", "imprint_1", "imprint_2", "debut_date"]], on="show_id", how="left")
+        else:
+            all_time["imprint_1"] = ""
+            all_time["imprint_2"] = ""
+            all_time["debut_date"] = pd.NaT
 
-    all_time = all_time.sort_values("gross_millions", ascending=False).reset_index(drop=True)
-    all_time.insert(0, "rank", np.arange(1, len(all_time) + 1))
+        all_time["imprint_1"] = all_time["imprint_1"].fillna("")
+        all_time["imprint_2"] = all_time["imprint_2"].fillna("")
 
-    st.caption("Unlimited rank: every show with any gross is included.")
-    all_time_disp = all_time[["rank", "canonical_title", "imprint_1", "imprint_2", "debut_date", "gross_millions"]].copy()
-    st.dataframe(all_time_disp, use_container_width=True, hide_index=True)
+        all_time = all_time.sort_values("gross_millions", ascending=False).reset_index(drop=True)
+        all_time.insert(0, "rank", np.arange(1, len(all_time) + 1))
 
-    with st.expander("Optional: visualize the leaders (bar chart)"):
-        top_plot = st.slider("How many shows to display in the bar chart", 5, min(200, int(len(all_time))), min(50, int(len(all_time))))
-        top_block = all_time.head(int(top_plot)).copy()
-        plot_barh(top_block["canonical_title"][::-1], top_block["gross_millions"][::-1], "Total Gross (Millions)", "Show")
+        st.caption(f"Unlimited rank: every show with any gross is included. (Through **{pick_all_dt.isoformat()}**)")
+        all_time_disp = all_time[["rank", "canonical_title", "imprint_1", "imprint_2", "debut_date", "gross_millions"]].copy()
+        st.dataframe(all_time_disp, use_container_width=True, hide_index=True)
+
+        with st.expander("Optional: visualize the leaders (bar chart)"):
+            top_plot = st.slider("How many shows to display in the bar chart", 5, min(200, int(len(all_time))), min(50, int(len(all_time))))
+            top_block = all_time.head(int(top_plot)).copy()
+            plot_barh(top_block["canonical_title"][::-1], top_block["gross_millions"][::-1], "Total Gross (Millions)", "Show")
 
     st.divider()
 
@@ -3347,7 +3393,8 @@ def tab_admin():
             load_lists.clear()
             st.success(f"Merged '{merge}' into '{keep}'.")
 
-    
+    st.markdown('---')
+    st.markdown('')
     st.markdown("### Merge imprint labels (relabel imprint_1 / imprint_2)")
     with st.expander("Merge/rename an imprint", expanded=False):
         st.caption("Replaces one imprint label with another across all weeks (both imprint_1 and imprint_2).")
@@ -3436,6 +3483,8 @@ def tab_admin():
                     st.rerun()
 
 
+
+    
     # Safety: refresh lists here so titles/shows are always defined (and up-to-date)
     try:
         shows, _ = load_lists()
@@ -3447,16 +3496,241 @@ def tab_admin():
         else []
     )
 
+    st.markdown("### Set imprints for a show")
+    with st.expander("Add / fix imprints for one show", expanded=False):
+        st.caption(
+            "Set imprint_1 and/or imprint_2 for a specific show across its weeks. "
+            "This keeps both imprints when they differ (no forced consolidation)."
+        )
+
+        if not titles:
+            st.info("No shows found.")
+        else:
+            sel_title = st.selectbox("Show", titles, key="imp_set_show")
+            sel_id = int(shows.loc[shows["canonical_title"] == sel_title, "show_id"].iloc[0])
+
+            stats = sql_df(
+                """
+                SELECT
+                  COUNT(*) AS weeks,
+                  SUM(CASE
+                        WHEN (imprint_1 IS NULL OR TRIM(imprint_1) = '')
+                         AND (imprint_2 IS NULL OR TRIM(imprint_2) = '')
+                        THEN 1 ELSE 0 END) AS missing_both,
+                  SUM(CASE
+                        WHEN (imprint_1 IS NULL OR TRIM(imprint_1) = '')
+                         AND (imprint_2 IS NOT NULL AND TRIM(imprint_2) <> '')
+                        THEN 1 ELSE 0 END) AS missing_imprint_1,
+                  SUM(CASE
+                        WHEN (imprint_2 IS NULL OR TRIM(imprint_2) = '')
+                         AND (imprint_1 IS NOT NULL AND TRIM(imprint_1) <> '')
+                        THEN 1 ELSE 0 END) AS missing_imprint_2
+                FROM t10_entry
+                WHERE show_id = ?
+                """,
+                (sel_id,),
+            )
+            if not stats.empty:
+                s_weeks = 0 if pd.isna(stats.loc[0,'weeks']) else int(stats.loc[0,'weeks'])
+                s_missing_both = 0 if pd.isna(stats.loc[0,'missing_both']) else int(stats.loc[0,'missing_both'])
+                s_missing_1 = 0 if pd.isna(stats.loc[0,'missing_imprint_1']) else int(stats.loc[0,'missing_imprint_1'])
+                s_missing_2 = 0 if pd.isna(stats.loc[0,'missing_imprint_2']) else int(stats.loc[0,'missing_imprint_2'])
+                st.write(
+                    f"Weeks: **{s_weeks}** · "
+                    f"Missing both: **{s_missing_both}** · "
+                    f"Missing imprint_1: **{s_missing_1}** · "
+                    f"Missing imprint_2: **{s_missing_2}**"
+                )
+
+
+            st.markdown("**Current imprint pairs in the data**")
+            cur_pairs = sql_df(
+                """
+                SELECT DISTINCT
+                  COALESCE(NULLIF(TRIM(imprint_1), ''), '(blank)') AS imprint_1,
+                  COALESCE(NULLIF(TRIM(imprint_2), ''), '(blank)') AS imprint_2
+                FROM t10_entry
+                WHERE show_id = ?
+                ORDER BY imprint_1, imprint_2
+                """,
+                (sel_id,),
+            )
+            st.dataframe(cur_pairs, use_container_width=True, hide_index=True)
+
+            c1, c2 = st.columns(2)
+            with c1:
+                new_imp1 = st.text_input("Set imprint_1 to (optional)", value="", key="imp_set_1").strip()
+            with c2:
+                new_imp2 = st.text_input("Set imprint_2 to (optional)", value="", key="imp_set_2").strip()
+
+            mode = st.radio(
+                "Apply mode",
+                ["Fill missing only", "Overwrite existing (dangerous)"],
+                index=0,
+                horizontal=True,
+                key="imp_set_mode",
+            )
+
+            if mode == "Fill missing only":
+                st.caption("Tip: leave a field blank to avoid changing that imprint column.")
+                fill_both = st.checkbox(
+                    "Fill weeks where BOTH imprints are blank",
+                    value=True,
+                    key="imp_set_fill_both",
+                )
+                fill1 = st.checkbox(
+                    "Also fill imprint_1 when blank (even if imprint_2 is present)",
+                    value=False,
+                    key="imp_set_fill1",
+                )
+                fill2 = st.checkbox(
+                    "Also fill imprint_2 when blank (even if imprint_1 is present)",
+                    value=False,
+                    key="imp_set_fill2",
+                )
+                confirm_ok = True
+            else:
+                confirm_ok = st.checkbox(
+                    "I understand this will overwrite imprints for ALL weeks of this show.",
+                    value=False,
+                    key="imp_set_confirm_overwrite",
+                )
+                fill_both = fill1 = fill2 = False  # not used
+
+            if st.button("Apply imprint update", type="primary", key="imp_set_apply"):
+                if not confirm_ok:
+                    st.warning("Please confirm overwrite to proceed.")
+                elif not (new_imp1 or new_imp2):
+                    st.warning("Enter at least one imprint value to apply.")
+                else:
+                    con = get_con()
+                    try:
+                        cur = con.cursor()
+                        cur.execute("BEGIN;")
+
+                        # Helper: conditions
+                        cond_both_blank = (
+                            "(imprint_1 IS NULL OR TRIM(imprint_1) = '') "
+                            "AND (imprint_2 IS NULL OR TRIM(imprint_2) = '')"
+                        )
+                        cond_i1_blank_i2_present = (
+                            "(imprint_1 IS NULL OR TRIM(imprint_1) = '') "
+                            "AND (imprint_2 IS NOT NULL AND TRIM(imprint_2) <> '')"
+                        )
+                        cond_i2_blank_i1_present = (
+                            "(imprint_2 IS NULL OR TRIM(imprint_2) = '') "
+                            "AND (imprint_1 IS NOT NULL AND TRIM(imprint_1) <> '')"
+                        )
+
+                        if mode == "Fill missing only":
+                            if fill_both:
+                                if new_imp1:
+                                    cur.execute(
+                                        f"UPDATE t10_entry SET imprint_1 = ? WHERE show_id = ? AND {cond_both_blank}",
+                                        (new_imp1, sel_id),
+                                    )
+                                if new_imp2:
+                                    cur.execute(
+                                        f"UPDATE t10_entry SET imprint_2 = ? WHERE show_id = ? AND {cond_both_blank}",
+                                        (new_imp2, sel_id),
+                                    )
+
+                            if fill1 and new_imp1:
+                                cur.execute(
+                                    f"UPDATE t10_entry SET imprint_1 = ? WHERE show_id = ? AND {cond_i1_blank_i2_present}",
+                                    (new_imp1, sel_id),
+                                )
+
+                            if fill2 and new_imp2:
+                                cur.execute(
+                                    f"UPDATE t10_entry SET imprint_2 = ? WHERE show_id = ? AND {cond_i2_blank_i1_present}",
+                                    (new_imp2, sel_id),
+                                )
+                        else:
+                            # Overwrite (only columns provided)
+                            if new_imp1:
+                                cur.execute(
+                                    "UPDATE t10_entry SET imprint_1 = ? WHERE show_id = ?",
+                                    (new_imp1, sel_id),
+                                )
+                            if new_imp2:
+                                cur.execute(
+                                    "UPDATE t10_entry SET imprint_2 = ? WHERE show_id = ?",
+                                    (new_imp2, sel_id),
+                                )
+
+                        # Normalize whitespace; remove exact duplicates only (keeps distinct pairs)
+                        cur.execute("UPDATE t10_entry SET imprint_1 = TRIM(imprint_1) WHERE imprint_1 IS NOT NULL;")
+                        cur.execute("UPDATE t10_entry SET imprint_2 = TRIM(imprint_2) WHERE imprint_2 IS NOT NULL;")
+                        cur.execute(
+                            """
+                            UPDATE t10_entry
+                            SET imprint_2 = NULL
+                            WHERE show_id = ?
+                              AND imprint_1 IS NOT NULL AND TRIM(imprint_1) <> ''
+                              AND imprint_2 IS NOT NULL AND TRIM(imprint_2) <> ''
+                              AND imprint_1 = imprint_2
+                            """,
+                            (sel_id,),
+                        )
+
+                        con.commit()
+                    finally:
+                        con.close()
+
+                    try:
+                        sql_df.clear()
+                    except Exception:
+                        pass
+                    try:
+                        fetch_distinct_imprints.clear()
+                    except Exception:
+                        pass
+                    st.success("Imprints updated.")
+                    st.rerun()
+
+    st.markdown('---')
+    
+    st.markdown('---')
+    st.markdown("### Export show list (show_id)")
+    export_show_df = sql_df("SELECT show_id, canonical_title FROM show ORDER BY show_id")
+    st.caption("Download a simple lookup of show_id ↔ canonical_title. (This is based on the `show` table.)")
+
+    csv_bytes = export_show_df.to_csv(index=False).encode("utf-8")
+    st.download_button(
+        "Download show_ids.csv",
+        data=csv_bytes,
+        file_name="show_ids.csv",
+        mime="text/csv",
+        key="dl_show_ids_csv",
+    )
+
+    # Excel (optional)
+    try:
+        import openpyxl  # type: ignore  # noqa: F401
+
+        xlsx_buf = io.BytesIO()
+        with pd.ExcelWriter(xlsx_buf, engine="openpyxl") as writer:
+            export_show_df.to_excel(writer, index=False, sheet_name="show_ids")
+        st.download_button(
+            "Download show_ids.xlsx",
+            data=xlsx_buf.getvalue(),
+            file_name="show_ids.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="dl_show_ids_xlsx",
+        )
+    except Exception:
+        st.info("Excel export requires `openpyxl`. Install it in your venv with: `pip install openpyxl`")
     st.markdown("### View aliases for a show")
     show_for_aliases = st.selectbox("Show", titles, key="alias_list_show")
     show_id = int(shows.loc[shows["canonical_title"] == show_for_aliases, "show_id"].iloc[0])
     alias_df = sql_df("SELECT alias_title FROM show_alias WHERE show_id = ? ORDER BY alias_title", (show_id,))
     st.dataframe(alias_df, use_container_width=True)
-
-
+    
+    
 # ----------------------------
 # Main
-@st.cache_data(show_spinner=False)
+# ----------------------------
 def _load_records_base(db_path: str, db_mtime: float) -> pd.DataFrame:
     """Load chart rows for record calculations (weekly gross only; no gross bonuses). db_mtime busts cache."""
     con = sqlite3.connect(db_path)
