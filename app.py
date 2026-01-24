@@ -193,6 +193,23 @@ def _ensure_smps_schema() -> None:
             """
         )
 
+        # Additive schema upgrades (older DBs / earlier versions)
+        # These columns support DB-cached SMPS browsing/export without recomputing.
+        try:
+            cols = [r[1] for r in cur.execute("PRAGMA table_info(monthly_chart);").fetchall()]
+        except Exception:
+            cols = []
+
+        def _add_col(name: str, ddl: str) -> None:
+            if name in cols:
+                return
+            cur.execute(f"ALTER TABLE monthly_chart ADD COLUMN {ddl};")
+
+        _add_col("share_raw", "share_raw REAL")
+        _add_col("breakout_raw", "breakout_raw REAL")
+        _add_col("heat_raw", "heat_raw REAL")
+        _add_col("points_continuity", "points_continuity REAL")
+
         cur.execute(
             """
             CREATE TABLE IF NOT EXISTS show_month (
@@ -1194,10 +1211,14 @@ def _write_smps_to_db(month: str, chart_df: pd.DataFrame) -> None:
                     int(r.position),
                     int(r.show_id),
                     float(getattr(r, "month_gross_millions", 0.0)),
+                    float(getattr(r, "share_raw", 0.0)),
+                    float(getattr(r, "breakout_raw", 0.0)),
+                    float(getattr(r, "heat_raw", 0.0)),
                     float(getattr(r, "points_total", 0.0)),
                     float(getattr(r, "points_share", 0.0)),
                     float(getattr(r, "points_breakout", 0.0)),
                     float(getattr(r, "points_heat", 0.0)),
+                    float(getattr(r, "points_continuity", 0.0)),
                     float(getattr(r, "points_carryover", 0.0)),
                     int(getattr(r, "inactive_streak", 0)),
                 )
@@ -1208,15 +1229,83 @@ def _write_smps_to_db(month: str, chart_df: pd.DataFrame) -> None:
             INSERT INTO monthly_chart(
               month, chart_type, method_version, position, show_id,
               month_gross_millions,
-              points_total, points_share, points_breakout, points_heat, points_carryover,
+              share_raw, breakout_raw, heat_raw,
+              points_total, points_share, points_breakout, points_heat, points_continuity, points_carryover,
               inactive_streak
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?);
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?);
             """,
             rows,
         )
         con.commit()
     finally:
         con.close()
+
+
+@st.cache_data(show_spinner=False)
+def _load_smps_history_from_db(db_path: str, db_mtime: float) -> dict[str, pd.DataFrame]:
+    """Load cached SMPS charts from monthly_chart (if present).
+
+    Returns a dict[YYYY-MM] -> DataFrame in the same shape expected by the SMPS tab.
+    """
+    _ensure_smps_schema()
+    con = sqlite3.connect(db_path)
+    try:
+        df = pd.read_sql_query(
+            """
+            SELECT
+              month,
+              position,
+              show_id,
+              month_gross_millions,
+              share_raw,
+              breakout_raw,
+              heat_raw,
+              points_total,
+              points_share,
+              points_breakout,
+              points_heat,
+              points_continuity,
+              points_carryover,
+              inactive_streak
+            FROM monthly_chart
+            WHERE chart_type = 'SMPS'
+              AND COALESCE(method_version,'') = ?
+            ORDER BY month, position;
+            """,
+            con,
+            params=(SMPS_METHOD_VERSION,),
+        )
+        titles = pd.read_sql_query("SELECT show_id, canonical_title FROM show", con)
+    finally:
+        con.close()
+
+    if df.empty:
+        return {}
+
+    # Attach titles + imprints for display parity with computed charts.
+    titles = titles.drop_duplicates('show_id') if not titles.empty else pd.DataFrame(columns=['show_id', 'canonical_title'])
+    df = df.merge(titles, on='show_id', how='left')
+
+    _imp = _load_show_meta_for_gross_races(db_path, db_mtime)
+    if _imp is not None and not _imp.empty:
+        cols = [c for c in ['show_id', 'imprint_1', 'imprint_2'] if c in _imp.columns]
+        imp = _imp[cols].drop_duplicates('show_id').copy()
+        df = df.merge(imp, on='show_id', how='left')
+    else:
+        df['imprint_1'] = ''
+        df['imprint_2'] = ''
+
+    df['canonical_title'] = df['canonical_title'].fillna('(Unknown)')
+    df['imprint_1'] = df.get('imprint_1', '').fillna('')
+    df['imprint_2'] = df.get('imprint_2', '').fillna('')
+
+    out: dict[str, pd.DataFrame] = {}
+    for m, g in df.groupby('month'):
+        g = g.sort_values('position').reset_index(drop=True)
+        g['chart_type'] = 'SMPS'
+        g['method_version'] = SMPS_METHOD_VERSION
+        out[str(m)] = g
+    return out
 
 
 def tab_monthly_smps_t25():
@@ -1238,7 +1327,13 @@ def tab_monthly_smps_t25():
         return
 
     db_mtime = DB_PATH.stat().st_mtime
-    hist = _compute_smps_history(str(DB_PATH), db_mtime, include_bonuses)
+    # Prefer cached SMPS charts from SQLite when available (fast), otherwise compute.
+    # Cache currently applies to the default (bonuses OFF) regime.
+    hist = {}
+    if not include_bonuses:
+        hist = _load_smps_history_from_db(str(DB_PATH), db_mtime)
+    if not hist:
+        hist = _compute_smps_history(str(DB_PATH), db_mtime, include_bonuses)
     if not hist:
         st.info("No SMPS history could be computed from the current DB.")
         return
@@ -1337,6 +1432,87 @@ def tab_monthly_smps_t25():
         hide_index=True,
     )
 
+    # Exports
+    exp_cols = disp[show_cols].rename(
+        columns={
+            "position": "Pos",
+            "canonical_title": "Show",
+            "imprint_1": "Imprint 1",
+            "imprint_2": "Imprint 2",
+            "breakout_raw": "BreakoutRaw",
+            "heat_raw": "HeatRaw",
+        }
+    )
+    csv_bytes = exp_cols.to_csv(index=False).encode("utf-8")
+    st.download_button(
+        "Download this SMPS month (CSV)",
+        data=csv_bytes,
+        file_name=f"SMPS_{pick}.csv",
+        mime="text/csv",
+        key="smps_dl_month",
+    )
+
+    # Optional: full-history export (current computation/cached view)
+    with st.expander("Download full SMPS history (CSV)"):
+        all_rows = []
+        for mm in months:
+            cdf = hist.get(mm)
+            if cdf is None or cdf.empty:
+                continue
+            tmp = cdf.copy()
+            all_rows.append(tmp)
+        if all_rows:
+            all_df = pd.concat(all_rows, ignore_index=True)
+            keep = [
+                "month",
+                "position",
+                "show_id",
+                "canonical_title",
+                "imprint_1",
+                "imprint_2",
+                "month_gross_millions",
+                "share_raw",
+                "breakout_raw",
+                "heat_raw",
+                "points_share",
+                "points_breakout",
+                "points_heat",
+                "points_continuity",
+                "points_carryover",
+                "points_total",
+                "inactive_streak",
+            ]
+            keep = [c for c in keep if c in all_df.columns]
+            out_df = all_df[keep].rename(
+                columns={
+                    "month": "Month",
+                    "position": "Pos",
+                    "canonical_title": "Show",
+                    "imprint_1": "Imprint 1",
+                    "imprint_2": "Imprint 2",
+                    "month_gross_millions": "Month Gross",
+                    "share_raw": "Share Ratio",
+                    "breakout_raw": "BreakoutRaw",
+                    "heat_raw": "HeatRaw",
+                    "points_share": "Pts Share",
+                    "points_breakout": "Pts Breakout",
+                    "points_heat": "Pts Heat",
+                    "points_continuity": "Pts Continuity",
+                    "points_carryover": "Pts Carryover",
+                    "points_total": "Pts Total",
+                    "inactive_streak": "Inactive Streak",
+                }
+            )
+            st.download_button(
+                "Download all SMPS months (CSV)",
+                data=out_df.to_csv(index=False).encode("utf-8"),
+                file_name=f"SMPS_history_{months[0]}_to_{months[-1]}.csv",
+                mime="text/csv",
+                key="smps_dl_all",
+            )
+        else:
+            st.info("No SMPS history available to export.")
+
     c1, c2 = st.columns([1, 2])
     with c1:
         if st.button("Write this SMPS month to DB", key="smps_write_one"):
@@ -1344,14 +1520,90 @@ def tab_monthly_smps_t25():
             st.success(f"Saved SMPS {pick} to monthly_chart.")
 
     with c2:
-        with st.expander("Backfill: write ALL SMPS months to DB (SMPS_v1)"):
-            st.warning("This writes/overwrites SMPS_v1 rows in monthly_chart for every month in history.")
+        with st.expander("Backfill: write SMPS months to DB (SMPS_v1)"):
+            st.warning("This writes/overwrites SMPS_v1 rows in monthly_chart.")
+
+            b1, b2 = st.columns(2)
+            with b1:
+                start_m = st.selectbox("Start month", options=months, index=0, key="smps_bk_start")
+            with b2:
+                end_m = st.selectbox("End month", options=months, index=len(months) - 1, key="smps_bk_end")
+
+            # Normalize range
+            m_sorted = months
+            i0 = m_sorted.index(start_m)
+            i1 = m_sorted.index(end_m)
+            if i0 > i1:
+                i0, i1 = i1, i0
+            sel_months = m_sorted[i0 : i1 + 1]
+
+            if st.button("Run SMPS backfill for selected range", key="smps_write_range"):
+                prog = st.progress(0)
+                for i, m2 in enumerate(sel_months, start=1):
+                    # Ensure we have computed data even if we're currently browsing cached results
+                    if m2 not in hist or hist[m2].empty or include_bonuses:
+                        # Compute full history once; this is cached by db_mtime + include_bonuses
+                        computed = _compute_smps_history(str(DB_PATH), db_mtime, include_bonuses)
+                        hist.update(computed)
+                    _write_smps_to_db(m2, hist[m2])
+                    prog.progress(int(i * 100 / max(1, len(sel_months))))
+                st.success("Backfill complete.")
+
             if st.button("Run full SMPS backfill", key="smps_write_all"):
                 prog = st.progress(0)
+                # Ensure we have computed data for all months
+                computed = _compute_smps_history(str(DB_PATH), db_mtime, include_bonuses)
                 for i, m2 in enumerate(months, start=1):
-                    _write_smps_to_db(m2, hist[m2])
+                    _write_smps_to_db(m2, computed[m2])
                     prog.progress(int(i * 100 / max(1, len(months))))
                 st.success("Backfill complete.")
+
+            # Export the full cached history as a flat CSV (month + position rows)
+            try:
+                all_rows = []
+                for mm in months:
+                    dfm = hist.get(mm)
+                    if dfm is None or dfm.empty:
+                        continue
+                    tmp = dfm.copy()
+                    tmp["month"] = mm
+                    all_rows.append(tmp)
+                if all_rows:
+                    full = pd.concat(all_rows, ignore_index=True)
+                    # Match the on-screen column set
+                    full_disp = full.copy()
+                    full_disp["Last Mo Pos"] = ""
+                    full_disp["Months on Chart"] = pd.NA
+                    full_disp["Share Ratio"] = pd.to_numeric(full_disp.get("share_raw"), errors="coerce").fillna(0.0).round(3)
+                    full_disp["Month Gross"] = pd.to_numeric(full_disp.get("month_gross_millions"), errors="coerce").fillna(0.0).round(2)
+                    full_disp["Pts Share"] = pd.to_numeric(full_disp.get("points_share"), errors="coerce").fillna(0.0).round(2)
+                    full_disp["Pts Breakout"] = pd.to_numeric(full_disp.get("points_breakout"), errors="coerce").fillna(0.0).round(2)
+                    full_disp["Pts Heat"] = pd.to_numeric(full_disp.get("points_heat"), errors="coerce").fillna(0.0).round(2)
+                    full_disp["Pts Continuity"] = pd.to_numeric(full_disp.get("points_continuity"), errors="coerce").fillna(0.0).round(2)
+                    full_disp["Pts Carryover"] = pd.to_numeric(full_disp.get("points_carryover"), errors="coerce").fillna(0.0).round(2)
+                    full_disp["Pts Total"] = pd.to_numeric(full_disp.get("points_total"), errors="coerce").fillna(0.0).round(2)
+
+                    full_cols = ["month"] + show_cols
+                    full_csv = full_disp[full_cols].rename(
+                        columns={
+                            "position": "Pos",
+                            "canonical_title": "Show",
+                            "imprint_1": "Imprint 1",
+                            "imprint_2": "Imprint 2",
+                            "breakout_raw": "BreakoutRaw",
+                            "heat_raw": "HeatRaw",
+                        }
+                    ).to_csv(index=False).encode("utf-8")
+                    st.download_button(
+                        "Download SMPS history (CSV)",
+                        data=full_csv,
+                        file_name="SMPS_history.csv",
+                        mime="text/csv",
+                        key="smps_dl_history",
+                    )
+            except Exception:
+                # Export is optional; don't break the tab if something goes sideways.
+                pass
 # ----------------------------
 # New tab: Grossing Milestones
 # ----------------------------
