@@ -193,23 +193,6 @@ def _ensure_smps_schema() -> None:
             """
         )
 
-        # Additive schema upgrades (older DBs / earlier versions)
-        # These columns support DB-cached SMPS browsing/export without recomputing.
-        try:
-            cols = [r[1] for r in cur.execute("PRAGMA table_info(monthly_chart);").fetchall()]
-        except Exception:
-            cols = []
-
-        def _add_col(name: str, ddl: str) -> None:
-            if name in cols:
-                return
-            cur.execute(f"ALTER TABLE monthly_chart ADD COLUMN {ddl};")
-
-        _add_col("share_raw", "share_raw REAL")
-        _add_col("breakout_raw", "breakout_raw REAL")
-        _add_col("heat_raw", "heat_raw REAL")
-        _add_col("points_continuity", "points_continuity REAL")
-
         cur.execute(
             """
             CREATE TABLE IF NOT EXISTS show_month (
@@ -452,7 +435,9 @@ def fetch_show_weekly_ledger(show_id: int) -> pd.DataFrame:
 
 
 
-def fetch_company_entries(company: str, filters: FilterSpec, limit: int = 2000) -> pd.DataFrame:
+def fetch_company_entries(company: str, filters: FilterSpec, imprint_col: str = "imprint_1", limit: int = 2000) -> pd.DataFrame:
+    if imprint_col not in ("imprint_1", "imprint_2"):
+        raise ValueError("imprint_col must be 'imprint_1' or 'imprint_2'")
     where, params = build_where(filters, "e")
     sql = f"""
     SELECT
@@ -474,7 +459,7 @@ def fetch_company_entries(company: str, filters: FilterSpec, limit: int = 2000) 
       GROUP BY show_id, week_ending
     ) gb ON gb.show_id = e.show_id AND gb.week_ending = e.week_ending
     JOIN show s ON s.show_id = e.show_id
-    WHERE COALESCE(e.imprint_1,'(Unknown)') = ?
+    WHERE COALESCE(e.{imprint_col},'(Unknown)') = ?
       AND {where}
     ORDER BY e.week_ending DESC, e.rank ASC, e.pos ASC
     LIMIT ?
@@ -483,6 +468,48 @@ def fetch_company_entries(company: str, filters: FilterSpec, limit: int = 2000) 
     if not df.empty:
         df["week_ending"] = _as_date_str(df["week_ending"])
     return df
+
+@st.cache_data(show_spinner=False)
+def fetch_company_list(imprint_col: str) -> list[str]:
+    """Distinct company names from the chosen imprint column (with '(Unknown)' for blanks)."""
+    if imprint_col not in ("imprint_1", "imprint_2"):
+        raise ValueError("imprint_col must be 'imprint_1' or 'imprint_2'")
+    df = sql_df(
+        f"""
+        SELECT DISTINCT COALESCE(NULLIF(TRIM({imprint_col}), ''), '(Unknown)') AS company
+        FROM t10_entry
+        WHERE week_ending IS NOT NULL
+        ORDER BY company
+        """
+    )
+    return df["company"].tolist() if (df is not None and not df.empty and "company" in df.columns) else ["(Unknown)"]
+
+
+def fetch_company_stats(company: str, filters: FilterSpec, imprint_col: str = "imprint_1") -> pd.DataFrame:
+    """Company summary stats (entries/unique shows/total+avg gross), computed on the fly."""
+    if imprint_col not in ("imprint_1", "imprint_2"):
+        raise ValueError("imprint_col must be 'imprint_1' or 'imprint_2'")
+
+    where, params = build_where(filters, "e")
+    sql = f"""
+    WITH bonus_by_row AS (
+      SELECT show_id, week_ending, SUM(bonus_millions) AS bonus_millions
+      FROM gross_bonus
+      GROUP BY show_id, week_ending
+    )
+    SELECT
+      COUNT(*) AS entries,
+      COUNT(DISTINCT e.show_id) AS unique_shows,
+      SUM(e.gross_millions + COALESCE(b.bonus_millions, 0)) AS total_gross_millions,
+      AVG(e.gross_millions + COALESCE(b.bonus_millions, 0)) AS avg_gross_millions
+    FROM t10_entry e
+    LEFT JOIN bonus_by_row b ON b.show_id = e.show_id AND b.week_ending = e.week_ending
+    WHERE COALESCE(e.{imprint_col}, '(Unknown)') = ?
+      AND {where}
+    """
+    return sql_df(sql, tuple([company] + params))
+
+
 
 
 # ----------------------------
@@ -1004,28 +1031,20 @@ def _compute_smps_history(db_path: str, db_mtime: float, include_bonuses: bool) 
             mg = float(gross.get(sid, 0.0))
             pg = float(prevg.get(sid, 0.0))
             # Share (ratio-based, top-heavy)
-            # Dynamic denom per month: Cap(m) = running record (through month m) of the highest
-            # single-show month gross (no rounding).
-            #
-            # New regime: keep the same raw share ratio basis r = clamp(MG/Cap(m), 0..1), but
-            # grant full Share points at 80% of Cap(m) by rescaling r -> r_scaled = clamp(r/0.80, 0..1).
-            #
-            # Displayed "Share Ratio" uses the raw ratio r (MG/Cap).
+            # Dynamic denom per month: "highest single-show month gross on record up to this month",
+            # as-is (no rounding).
+            # share_raw = clamp(mg/(0.80*Cap(m)), 0..1), PtsShare = 50 * share_raw^1.5
             share_cap = float(share_cap_by_month.get(m, 100.0))
-            share_raw = (mg / share_cap) if (mg > 0 and share_cap > 0) else 0.0  # r = MG/Cap(m)
+            # New share-ratio regime: 80% of Cap(m) yields a full Share ratio of 1.0.
+            # share_full = 0.80 * Cap(m)
+            share_full = 0.80 * share_cap if share_cap > 0 else 100.0
+            share_raw = (mg / share_full) if (mg > 0 and share_full > 0) else 0.0
             if share_raw < 0.0:
                 share_raw = 0.0
             elif share_raw > 1.0:
                 share_raw = 1.0
-
-            share_scaled = share_raw / 0.80
-            if share_scaled < 0.0:
-                share_scaled = 0.0
-            elif share_scaled > 1.0:
-                share_scaled = 1.0
-
             # Nonlinear top-heavy ramp (power exponent 1.5)
-            pts_share = 50.0 * (share_scaled ** 1.5)
+            pts_share = 50.0 * (share_raw ** 1.5)
 
             # Momentum components only apply when the show grossed this month
             if mg > 0:
@@ -1090,15 +1109,15 @@ def _compute_smps_history(db_path: str, db_mtime: float, include_bonuses: bool) 
         # commands a big enough Share of the month. This keeps true mega-launches eligible for #1,
         # but prevents "auto-#1" Breakout wins caused by pg≈0/denominator effects.
         #
-        # Taper rule (nonlinear power ramp, exponent 1.25):
-        #   share_raw <= 0.40 -> 0% of Breakout points  (<= 40% of Cap(m))
-        #   share_raw >= 0.75 -> 100% of Breakout points (>= 75% of Cap(m))
-        #   between -> ramp in [0..1] then apply power exponent 1.25
-        s0, s1 = 0.40, 0.75
+        # Taper rule (nonlinear power ramp, exponent 1.5):
+        #   share_raw <= 0.50 -> 0% of Breakout points  (<= 40% of Cap(m))
+        #   share_raw >= 0.80 -> 100% of Breakout points (>= 64% of Cap(m))
+        #   between -> ramp in [0..1] then apply power exponent 1.5
+        s0, s1 = 0.50, 0.80
         denom = (s1 - s0) if (s1 - s0) != 0 else 1.0
         df["is_debut_or_reentry"] = ~df["show_id"].astype(int).isin(list(prev_ids))
         _u = ((df["share_raw"] - s0) / denom).clip(lower=0.0, upper=1.0)
-        df["debut_breakout_factor"] = _u ** 1.25
+        df["debut_breakout_factor"] = _u ** 1.5
         _mask_debut = df["is_debut_or_reentry"] & (df["month_gross_millions"] > 0)
         df.loc[_mask_debut, "points_breakout"] = df.loc[_mask_debut, "points_breakout"] * df.loc[_mask_debut, "debut_breakout_factor"]
 
@@ -1211,14 +1230,10 @@ def _write_smps_to_db(month: str, chart_df: pd.DataFrame) -> None:
                     int(r.position),
                     int(r.show_id),
                     float(getattr(r, "month_gross_millions", 0.0)),
-                    float(getattr(r, "share_raw", 0.0)),
-                    float(getattr(r, "breakout_raw", 0.0)),
-                    float(getattr(r, "heat_raw", 0.0)),
                     float(getattr(r, "points_total", 0.0)),
                     float(getattr(r, "points_share", 0.0)),
                     float(getattr(r, "points_breakout", 0.0)),
                     float(getattr(r, "points_heat", 0.0)),
-                    float(getattr(r, "points_continuity", 0.0)),
                     float(getattr(r, "points_carryover", 0.0)),
                     int(getattr(r, "inactive_streak", 0)),
                 )
@@ -1229,83 +1244,15 @@ def _write_smps_to_db(month: str, chart_df: pd.DataFrame) -> None:
             INSERT INTO monthly_chart(
               month, chart_type, method_version, position, show_id,
               month_gross_millions,
-              share_raw, breakout_raw, heat_raw,
-              points_total, points_share, points_breakout, points_heat, points_continuity, points_carryover,
+              points_total, points_share, points_breakout, points_heat, points_carryover,
               inactive_streak
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?);
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?);
             """,
             rows,
         )
         con.commit()
     finally:
         con.close()
-
-
-@st.cache_data(show_spinner=False)
-def _load_smps_history_from_db(db_path: str, db_mtime: float) -> dict[str, pd.DataFrame]:
-    """Load cached SMPS charts from monthly_chart (if present).
-
-    Returns a dict[YYYY-MM] -> DataFrame in the same shape expected by the SMPS tab.
-    """
-    _ensure_smps_schema()
-    con = sqlite3.connect(db_path)
-    try:
-        df = pd.read_sql_query(
-            """
-            SELECT
-              month,
-              position,
-              show_id,
-              month_gross_millions,
-              share_raw,
-              breakout_raw,
-              heat_raw,
-              points_total,
-              points_share,
-              points_breakout,
-              points_heat,
-              points_continuity,
-              points_carryover,
-              inactive_streak
-            FROM monthly_chart
-            WHERE chart_type = 'SMPS'
-              AND COALESCE(method_version,'') = ?
-            ORDER BY month, position;
-            """,
-            con,
-            params=(SMPS_METHOD_VERSION,),
-        )
-        titles = pd.read_sql_query("SELECT show_id, canonical_title FROM show", con)
-    finally:
-        con.close()
-
-    if df.empty:
-        return {}
-
-    # Attach titles + imprints for display parity with computed charts.
-    titles = titles.drop_duplicates('show_id') if not titles.empty else pd.DataFrame(columns=['show_id', 'canonical_title'])
-    df = df.merge(titles, on='show_id', how='left')
-
-    _imp = _load_show_meta_for_gross_races(db_path, db_mtime)
-    if _imp is not None and not _imp.empty:
-        cols = [c for c in ['show_id', 'imprint_1', 'imprint_2'] if c in _imp.columns]
-        imp = _imp[cols].drop_duplicates('show_id').copy()
-        df = df.merge(imp, on='show_id', how='left')
-    else:
-        df['imprint_1'] = ''
-        df['imprint_2'] = ''
-
-    df['canonical_title'] = df['canonical_title'].fillna('(Unknown)')
-    df['imprint_1'] = df.get('imprint_1', '').fillna('')
-    df['imprint_2'] = df.get('imprint_2', '').fillna('')
-
-    out: dict[str, pd.DataFrame] = {}
-    for m, g in df.groupby('month'):
-        g = g.sort_values('position').reset_index(drop=True)
-        g['chart_type'] = 'SMPS'
-        g['method_version'] = SMPS_METHOD_VERSION
-        out[str(m)] = g
-    return out
 
 
 def tab_monthly_smps_t25():
@@ -1327,13 +1274,7 @@ def tab_monthly_smps_t25():
         return
 
     db_mtime = DB_PATH.stat().st_mtime
-    # Prefer cached SMPS charts from SQLite when available (fast), otherwise compute.
-    # Cache currently applies to the default (bonuses OFF) regime.
-    hist = {}
-    if not include_bonuses:
-        hist = _load_smps_history_from_db(str(DB_PATH), db_mtime)
-    if not hist:
-        hist = _compute_smps_history(str(DB_PATH), db_mtime, include_bonuses)
+    hist = _compute_smps_history(str(DB_PATH), db_mtime, include_bonuses)
     if not hist:
         st.info("No SMPS history could be computed from the current DB.")
         return
@@ -1394,8 +1335,8 @@ def tab_monthly_smps_t25():
     disp["Pts Share"] = disp["points_share"].round(2)
     disp["Pts Breakout"] = disp["points_breakout"].round(2)
     disp["Pts Heat"] = disp["points_heat"].round(2)
-    disp["Pts Continuity"] = pd.to_numeric(disp.get("points_continuity"), errors="coerce").fillna(0.0).round(2)
     disp["Pts Carryover"] = disp["points_carryover"].round(2)
+    disp["Pts Continuity"] = pd.to_numeric(disp.get("points_continuity"), errors="coerce").fillna(0.0).round(2)
     disp["Pts Total"] = disp["points_total"].round(2)
 
     show_cols = [
@@ -1409,11 +1350,12 @@ def tab_monthly_smps_t25():
         "Share Ratio",
         "breakout_raw",
         "heat_raw",
+        "inactive_streak",
         "Pts Share",
         "Pts Breakout",
         "Pts Heat",
-        "Pts Continuity",
         "Pts Carryover",
+        "Pts Continuity",
         "Pts Total",
     ]
 
@@ -1432,87 +1374,6 @@ def tab_monthly_smps_t25():
         hide_index=True,
     )
 
-    # Exports
-    exp_cols = disp[show_cols].rename(
-        columns={
-            "position": "Pos",
-            "canonical_title": "Show",
-            "imprint_1": "Imprint 1",
-            "imprint_2": "Imprint 2",
-            "breakout_raw": "BreakoutRaw",
-            "heat_raw": "HeatRaw",
-        }
-    )
-    csv_bytes = exp_cols.to_csv(index=False).encode("utf-8")
-    st.download_button(
-        "Download this SMPS month (CSV)",
-        data=csv_bytes,
-        file_name=f"SMPS_{pick}.csv",
-        mime="text/csv",
-        key="smps_dl_month",
-    )
-
-    # Optional: full-history export (current computation/cached view)
-    with st.expander("Download full SMPS history (CSV)"):
-        all_rows = []
-        for mm in months:
-            cdf = hist.get(mm)
-            if cdf is None or cdf.empty:
-                continue
-            tmp = cdf.copy()
-            all_rows.append(tmp)
-        if all_rows:
-            all_df = pd.concat(all_rows, ignore_index=True)
-            keep = [
-                "month",
-                "position",
-                "show_id",
-                "canonical_title",
-                "imprint_1",
-                "imprint_2",
-                "month_gross_millions",
-                "share_raw",
-                "breakout_raw",
-                "heat_raw",
-                "points_share",
-                "points_breakout",
-                "points_heat",
-                "points_continuity",
-                "points_carryover",
-                "points_total",
-                "inactive_streak",
-            ]
-            keep = [c for c in keep if c in all_df.columns]
-            out_df = all_df[keep].rename(
-                columns={
-                    "month": "Month",
-                    "position": "Pos",
-                    "canonical_title": "Show",
-                    "imprint_1": "Imprint 1",
-                    "imprint_2": "Imprint 2",
-                    "month_gross_millions": "Month Gross",
-                    "share_raw": "Share Ratio",
-                    "breakout_raw": "BreakoutRaw",
-                    "heat_raw": "HeatRaw",
-                    "points_share": "Pts Share",
-                    "points_breakout": "Pts Breakout",
-                    "points_heat": "Pts Heat",
-                    "points_continuity": "Pts Continuity",
-                    "points_carryover": "Pts Carryover",
-                    "points_total": "Pts Total",
-                    "inactive_streak": "Inactive Streak",
-                }
-            )
-            st.download_button(
-                "Download all SMPS months (CSV)",
-                data=out_df.to_csv(index=False).encode("utf-8"),
-                file_name=f"SMPS_history_{months[0]}_to_{months[-1]}.csv",
-                mime="text/csv",
-                key="smps_dl_all",
-            )
-        else:
-            st.info("No SMPS history available to export.")
-
     c1, c2 = st.columns([1, 2])
     with c1:
         if st.button("Write this SMPS month to DB", key="smps_write_one"):
@@ -1520,90 +1381,14 @@ def tab_monthly_smps_t25():
             st.success(f"Saved SMPS {pick} to monthly_chart.")
 
     with c2:
-        with st.expander("Backfill: write SMPS months to DB (SMPS_v1)"):
-            st.warning("This writes/overwrites SMPS_v1 rows in monthly_chart.")
-
-            b1, b2 = st.columns(2)
-            with b1:
-                start_m = st.selectbox("Start month", options=months, index=0, key="smps_bk_start")
-            with b2:
-                end_m = st.selectbox("End month", options=months, index=len(months) - 1, key="smps_bk_end")
-
-            # Normalize range
-            m_sorted = months
-            i0 = m_sorted.index(start_m)
-            i1 = m_sorted.index(end_m)
-            if i0 > i1:
-                i0, i1 = i1, i0
-            sel_months = m_sorted[i0 : i1 + 1]
-
-            if st.button("Run SMPS backfill for selected range", key="smps_write_range"):
-                prog = st.progress(0)
-                for i, m2 in enumerate(sel_months, start=1):
-                    # Ensure we have computed data even if we're currently browsing cached results
-                    if m2 not in hist or hist[m2].empty or include_bonuses:
-                        # Compute full history once; this is cached by db_mtime + include_bonuses
-                        computed = _compute_smps_history(str(DB_PATH), db_mtime, include_bonuses)
-                        hist.update(computed)
-                    _write_smps_to_db(m2, hist[m2])
-                    prog.progress(int(i * 100 / max(1, len(sel_months))))
-                st.success("Backfill complete.")
-
+        with st.expander("Backfill: write ALL SMPS months to DB (SMPS_v1)"):
+            st.warning("This writes/overwrites SMPS_v1 rows in monthly_chart for every month in history.")
             if st.button("Run full SMPS backfill", key="smps_write_all"):
                 prog = st.progress(0)
-                # Ensure we have computed data for all months
-                computed = _compute_smps_history(str(DB_PATH), db_mtime, include_bonuses)
                 for i, m2 in enumerate(months, start=1):
-                    _write_smps_to_db(m2, computed[m2])
+                    _write_smps_to_db(m2, hist[m2])
                     prog.progress(int(i * 100 / max(1, len(months))))
                 st.success("Backfill complete.")
-
-            # Export the full cached history as a flat CSV (month + position rows)
-            try:
-                all_rows = []
-                for mm in months:
-                    dfm = hist.get(mm)
-                    if dfm is None or dfm.empty:
-                        continue
-                    tmp = dfm.copy()
-                    tmp["month"] = mm
-                    all_rows.append(tmp)
-                if all_rows:
-                    full = pd.concat(all_rows, ignore_index=True)
-                    # Match the on-screen column set
-                    full_disp = full.copy()
-                    full_disp["Last Mo Pos"] = ""
-                    full_disp["Months on Chart"] = pd.NA
-                    full_disp["Share Ratio"] = pd.to_numeric(full_disp.get("share_raw"), errors="coerce").fillna(0.0).round(3)
-                    full_disp["Month Gross"] = pd.to_numeric(full_disp.get("month_gross_millions"), errors="coerce").fillna(0.0).round(2)
-                    full_disp["Pts Share"] = pd.to_numeric(full_disp.get("points_share"), errors="coerce").fillna(0.0).round(2)
-                    full_disp["Pts Breakout"] = pd.to_numeric(full_disp.get("points_breakout"), errors="coerce").fillna(0.0).round(2)
-                    full_disp["Pts Heat"] = pd.to_numeric(full_disp.get("points_heat"), errors="coerce").fillna(0.0).round(2)
-                    full_disp["Pts Continuity"] = pd.to_numeric(full_disp.get("points_continuity"), errors="coerce").fillna(0.0).round(2)
-                    full_disp["Pts Carryover"] = pd.to_numeric(full_disp.get("points_carryover"), errors="coerce").fillna(0.0).round(2)
-                    full_disp["Pts Total"] = pd.to_numeric(full_disp.get("points_total"), errors="coerce").fillna(0.0).round(2)
-
-                    full_cols = ["month"] + show_cols
-                    full_csv = full_disp[full_cols].rename(
-                        columns={
-                            "position": "Pos",
-                            "canonical_title": "Show",
-                            "imprint_1": "Imprint 1",
-                            "imprint_2": "Imprint 2",
-                            "breakout_raw": "BreakoutRaw",
-                            "heat_raw": "HeatRaw",
-                        }
-                    ).to_csv(index=False).encode("utf-8")
-                    st.download_button(
-                        "Download SMPS history (CSV)",
-                        data=full_csv,
-                        file_name="SMPS_history.csv",
-                        mime="text/csv",
-                        key="smps_dl_history",
-                    )
-            except Exception:
-                # Export is optional; don't break the tab if something goes sideways.
-                pass
 # ----------------------------
 # New tab: Grossing Milestones
 # ----------------------------
@@ -2531,7 +2316,6 @@ def tab_search():
         week_spec = st.text_input("Week # (single or range)", value="", placeholder="e.g. 2500 or 2400-2600", key="gt_week_num")
         limit = st.slider("Max results", 50, 10000, 1000, step=50)
 
-
     # Week # filter parsing: accept a single number (exact match) or a range like 2400-2600.
     week_number_min: int | None = None
     week_number_max: int | None = None
@@ -2632,6 +2416,66 @@ def tab_show_detail():
             st.caption("No ledger rows found for this show.")
         else:
             st.dataframe(led, use_container_width=True, hide_index=True)
+    with st.expander("All-Time Gross Races rank history (every chart week since debut/era start)"):
+        # We compute the show's all-time rank as-of *every* chart week in the grossing era,
+        # because other shows can keep grossing after this show disappears from the weekly chart.
+        hist_mode = st.radio(
+            "History view",
+            ["All weeks", "Rank changes only"],
+            index=0,
+            horizontal=True,
+            key=f"show_rankhist_mode_{show_id}",
+        )
+        db_mtime = DB_PATH.stat().st_mtime if DB_PATH.exists() else 0.0
+        base = _load_gross_races_base(str(DB_PATH), db_mtime)
+
+        if base.empty:
+            st.caption("No gross races base rows found (cannot compute all-time ranks).")
+        else:
+            weeks = pd.to_datetime(base["week_ending"], errors="coerce").dropna().dt.normalize()
+
+            # Start the history at the show's debut (first chart week) if it debuted after the grossing era began.
+            # If it debuted before the grossing era, start at the grossing era start (2001-03-17).
+            debut_df = sql_df(
+                "SELECT MIN(date(week_ending)) AS debut FROM t10_entry WHERE show_id = ?;",
+                (int(show_id),),
+            )
+            debut_str = None
+            if debut_df is not None and not debut_df.empty:
+                debut_str = debut_df.loc[0, "debut"]
+            debut_ts = pd.to_datetime(debut_str, errors="coerce")
+            start_ts = pd.Timestamp(GROSS_TRACKING_START)
+            if debut_ts is not None and not pd.isna(debut_ts):
+                start_ts = max(start_ts, debut_ts.normalize())
+
+            weeks = weeks[weeks >= start_ts]
+            weeks = sorted(pd.unique(weeks).tolist())
+
+            # Apply the same date window as the Show detail filters (if set)
+            tmin = pd.to_datetime(filters.date_min, errors="coerce") if filters.date_min else None
+            tmax = pd.to_datetime(filters.date_max, errors="coerce") if filters.date_max else None
+            if tmin is not None and not pd.isna(tmin):
+                weeks = [w for w in weeks if w >= tmin.normalize()]
+            if tmax is not None and not pd.isna(tmax):
+                weeks = [w for w in weeks if w <= tmax.normalize()]
+
+            rt = _alltime_rank_table_for_show_weeks(str(DB_PATH), db_mtime, show_id, weeks)
+
+            if rt.empty:
+                st.caption("No all-time rank rows could be computed for the selected weeks.")
+            else:
+                rt2 = rt.copy()
+                rt2["rank"] = pd.to_numeric(rt2["rank"], errors="coerce").astype("Int64")
+                rt2["rank_change"] = pd.to_numeric(rt2["rank_change"], errors="coerce").astype("Int64")
+                rt2["total_gross_millions"] = pd.to_numeric(rt2["total_gross_millions"], errors="coerce")
+                if hist_mode == "Rank changes only":
+                    # Keep the first row, then only weeks where the rank changed vs the prior week.
+                    ch = pd.to_numeric(rt2["rank_change"], errors="coerce").fillna(0)
+                    keep = (ch != 0)
+                    if len(rt2) > 0:
+                        keep.iloc[0] = True
+                    rt2 = rt2.loc[keep].copy()
+                st.dataframe(rt2, use_container_width=True, hide_index=True)
 
     df = fetch_show_entries(show_id, filters)
     st.dataframe(df, use_container_width=True)
@@ -2786,9 +2630,18 @@ def tab_compare_two_shows():
 
 
 def tab_companies():
-    st.subheader("Company view (Imprint 1)")
-    _, companies = load_lists()
-    company = st.selectbox("Company (Imprint 1)", companies["company"].tolist())
+    company_mode = st.radio("Company field", ["Imprint 1", "Imprint 2"], horizontal=True, index=0)
+    imprint_col = "imprint_1" if company_mode == "Imprint 1" else "imprint_2"
+
+    st.subheader(f"Company view ({company_mode})")
+
+    if company_mode == "Imprint 1":
+        _, companies = load_lists()
+        company_list = companies["company"].tolist()
+    else:
+        company_list = fetch_company_list(imprint_col)
+
+    company = st.selectbox(f"Company ({company_mode})", company_list)
 
     with st.sidebar:
         st.header("Company filters")
@@ -2798,16 +2651,17 @@ def tab_companies():
 
     filters = FilterSpec(date_min.strip() or None, date_max.strip() or None, int(rank_min), int(rank_max))
 
-    stat = sql_df("SELECT * FROM v_company_stats WHERE company = ?", (company,))
+    stat = fetch_company_stats(company, filters, imprint_col=imprint_col)
     if not stat.empty:
         s = stat.iloc[0].to_dict()
         c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Entries", int(s["entries"]))
-        c2.metric("Unique shows", int(s["unique_shows"]))
-        c3.metric("Total gross (M)", float(s["total_gross_millions"]))
-        c4.metric("Avg gross (M)", None if pd.isna(s["avg_gross_millions"]) else float(s["avg_gross_millions"]))
+        c1.metric("Entries", int(s.get("entries", 0) or 0))
+        c2.metric("Unique shows", int(s.get("unique_shows", 0) or 0))
+        c3.metric("Total gross (M)", float(s.get("total_gross_millions", 0.0) or 0.0))
+        av = s.get("avg_gross_millions")
+        c4.metric("Avg gross (M)", None if pd.isna(av) else float(av))
 
-    df = fetch_company_entries(company, filters)
+    df = fetch_company_entries(company, filters, imprint_col=imprint_col)
     st.dataframe(df, use_container_width=True)
 
 
@@ -2827,7 +2681,6 @@ def tab_analytics():
     where, params = build_where(filters, "e")
     df = sql_df(f"""
         SELECT
-          e.show_id,
           e.week_ending,
           e.week_number,
           e.rank,
@@ -2899,28 +2752,6 @@ def tab_analytics():
     w2 = weekly.copy()
     w2["roll"] = w2["gross_millions"].rolling(win, min_periods=max(1, win // 3)).mean()
     plot_line_dates(w2["week_ending"], w2["roll"], "Week Ending", f"{win}-week avg gross (Millions)")
-
-    if st.checkbox("Show Top Weekly Averages"):
-        # Weekly average = total weekly gross / number of grossing shows that week (within the current filters).
-        counts = (
-            dg[dg[gross_col].fillna(0.0) > 0.0]
-            .groupby("week_ending", as_index=False)["show_id"]
-            .nunique()
-            .rename(columns={"show_id": "num_shows"})
-        )
-        wa = weekly.merge(counts, on="week_ending", how="left")
-        wa["num_shows"] = wa["num_shows"].fillna(0).astype(int)
-        wa["weekly_avg_millions"] = np.where(
-            wa["num_shows"] > 0,
-            wa["gross_millions"] / wa["num_shows"],
-            0.0,
-        )
-        wa = wa.sort_values("weekly_avg_millions", ascending=False)
-        st.dataframe(
-            wa[["week_ending", "gross_millions", "num_shows", "weekly_avg_millions"]].head(20),
-            use_container_width=True,
-        )
-
 
     st.markdown("### Rank vs Gross (scatter)")
     plot_scatter(dg["rank"].astype(float), dg[gross_col].astype(float), "Rank", gross_label)
@@ -2998,6 +2829,58 @@ def _load_gross_races_base(db_path: str, db_mtime: float) -> pd.DataFrame:
     if df.empty:
         return df
     return df
+
+
+@st.cache_data(show_spinner=False)
+def _alltime_rank_table_for_show_weeks(db_path: str, db_mtime: float, show_id: int, weeks: list[pd.Timestamp]) -> pd.DataFrame:
+    """All-Time Gross Races rank for a show as-of selected weeks (grossing-era only, includes bonuses)."""
+    if not weeks:
+        return pd.DataFrame(columns=["rank", "rank_change", "week_ending", "total_gross_millions"])
+
+    base = _load_gross_races_base(db_path, db_mtime).copy()
+    if base.empty:
+        return pd.DataFrame(columns=["rank", "rank_change", "week_ending", "total_gross_millions"])
+
+    base["week_ending_dt"] = pd.to_datetime(base["week_ending"], errors="coerce")
+    base = base[base["week_ending_dt"] >= pd.Timestamp(GROSS_TRACKING_START)].copy()
+    base = base.dropna(subset=["week_ending_dt"]).copy()
+
+    pivot = base.pivot_table(
+        index="week_ending_dt",
+        columns="show_id",
+        values="gross_millions",
+        aggfunc="sum",
+        fill_value=0.0,
+    ).sort_index()
+    cum = pivot.cumsum()
+
+    if show_id not in cum.columns:
+        return pd.DataFrame(columns=["rank", "rank_change", "week_ending", "total_gross_millions"])
+
+    ranks = cum.rank(axis=1, method="min", ascending=False)
+
+    week_idx = pd.to_datetime(pd.Series(weeks), errors="coerce").dropna().dt.normalize().tolist()
+    week_idx = [w for w in week_idx if w in cum.index]
+    if not week_idx:
+        return pd.DataFrame(columns=["rank", "rank_change", "week_ending", "total_gross_millions"])
+
+    show_cum = cum.loc[week_idx, show_id].astype(float)
+    show_rank = ranks.loc[week_idx, show_id].astype(int)
+
+    out = pd.DataFrame(
+        {
+            "rank": show_rank.tolist(),
+            "week_ending": [w.strftime("%Y-%m-%d") for w in week_idx],
+            "total_gross_millions": show_cum.tolist(),
+        }
+    )
+    prev = out["rank"].shift(1)
+    out["rank_change"] = (prev - out["rank"]).fillna(0).astype(int)
+    out = out[["rank", "rank_change", "week_ending", "total_gross_millions"]]
+    return out
+
+
+
 
 
 
@@ -3194,6 +3077,8 @@ def tab_gross_races():
     # -------------------------
     # 2) Annual Gross Races
     # -------------------------
+    
+
     st.markdown("### Annual Gross Races")
     st.caption("Cumulative grosses reset at the start of each year.")
 
@@ -3668,8 +3553,7 @@ def tab_admin():
             load_lists.clear()
             st.success(f"Merged '{merge}' into '{keep}'.")
 
-    st.markdown('---')
-    st.markdown('')
+    
     st.markdown("### Merge imprint labels (relabel imprint_1 / imprint_2)")
     with st.expander("Merge/rename an imprint", expanded=False):
         st.caption("Replaces one imprint label with another across all weeks (both imprint_1 and imprint_2).")
@@ -3758,8 +3642,6 @@ def tab_admin():
                     st.rerun()
 
 
-
-    
     # Safety: refresh lists here so titles/shows are always defined (and up-to-date)
     try:
         shows, _ = load_lists()
@@ -3982,6 +3864,7 @@ def tab_admin():
     st.markdown('---')
     
     st.markdown('---')
+    st.markdown('---')
     st.markdown("### Export show list (show_id)")
     export_show_df = sql_df("SELECT show_id, canonical_title FROM show ORDER BY show_id")
     st.caption("Download a simple lookup of show_id ↔ canonical_title. (This is based on the `show` table.)")
@@ -4011,16 +3894,17 @@ def tab_admin():
         )
     except Exception:
         st.info("Excel export requires `openpyxl`. Install it in your venv with: `pip install openpyxl`")
+
     st.markdown("### View aliases for a show")
     show_for_aliases = st.selectbox("Show", titles, key="alias_list_show")
     show_id = int(shows.loc[shows["canonical_title"] == show_for_aliases, "show_id"].iloc[0])
     alias_df = sql_df("SELECT alias_title FROM show_alias WHERE show_id = ? ORDER BY alias_title", (show_id,))
     st.dataframe(alias_df, use_container_width=True)
-    
-    
+
+
 # ----------------------------
 # Main
-# ----------------------------
+@st.cache_data(show_spinner=False)
 def _load_records_base(db_path: str, db_mtime: float) -> pd.DataFrame:
     """Load chart rows for record calculations (weekly gross only; no gross bonuses). db_mtime busts cache."""
     con = sqlite3.connect(db_path)
@@ -4665,6 +4549,7 @@ def tab_records_achievements():
                     "Week Hit #1": _fmt_date(r["first_n1"]),
                 })
         disp = pd.DataFrame(rows)
+        disp["Order"] = disp["Order"].astype(str)
         st.dataframe(disp, use_container_width=True, hide_index=True)
 
     st.divider()
