@@ -2446,7 +2446,51 @@ def tab_show_detail():
             debut_ts = pd.to_datetime(debut_str, errors="coerce")
             start_ts = pd.Timestamp(GROSS_TRACKING_START)
             if debut_ts is not None and not pd.isna(debut_ts):
-                start_ts = max(start_ts, debut_ts.normalize())
+                debut_n = debut_ts.normalize()
+                if debut_n >= start_ts:
+                    # Debuted during the grossing era → start at debut week.
+                    start_ts = debut_n
+                else:
+                    # Debuted before the grossing era → start at the first week it actually grossed
+                    # (gross + any bonuses), bounded to the grossing era start.
+                    first_gross_df = sql_df(
+                        """
+                        WITH g AS (
+                          SELECT date(week_ending) AS week_ending,
+                                 COALESCE(gross_millions, 0.0) AS gross
+                          FROM t10_entry
+                          WHERE show_id = ?
+                        ),
+                        b AS (
+                          SELECT date(week_ending) AS week_ending,
+                                 SUM(COALESCE(bonus_millions, 0.0)) AS bonus
+                          FROM gross_bonus
+                          WHERE show_id = ?
+                          GROUP BY date(week_ending)
+                        ),
+                        w AS (
+                          SELECT g.week_ending AS week_ending,
+                                 g.gross + COALESCE(b.bonus, 0.0) AS total
+                          FROM g
+                          LEFT JOIN b ON b.week_ending = g.week_ending
+                          UNION
+                          SELECT b.week_ending AS week_ending,
+                                 COALESCE(b.bonus, 0.0) AS total
+                          FROM b
+                          WHERE b.week_ending NOT IN (SELECT week_ending FROM g)
+                        )
+                        SELECT MIN(week_ending) AS first_gross
+                        FROM w
+                        WHERE date(week_ending) >= date(?) AND total > 0.0;
+                        """,
+                        (int(show_id), int(show_id), str(GROSS_TRACKING_START)),
+                    )
+                    fg_str = None
+                    if first_gross_df is not None and not first_gross_df.empty:
+                        fg_str = first_gross_df.loc[0, "first_gross"]
+                    fg_ts = pd.to_datetime(fg_str, errors="coerce")
+                    if fg_ts is not None and not pd.isna(fg_ts):
+                        start_ts = max(start_ts, fg_ts.normalize())
 
             weeks = weeks[weeks >= start_ts]
             weeks = sorted(pd.unique(weeks).tolist())
