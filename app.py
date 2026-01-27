@@ -1035,16 +1035,30 @@ def _compute_smps_history(db_path: str, db_mtime: float, include_bonuses: bool) 
             # as-is (no rounding).
             # share_raw = clamp(mg/(0.80*Cap(m)), 0..1), PtsShare = 50 * share_raw^1.5
             share_cap = float(share_cap_by_month.get(m, 100.0))
-            # New share-ratio regime: 80% of Cap(m) yields a full Share ratio of 1.0.
-            # share_full = 0.80 * Cap(m)
-            share_full = 0.80 * share_cap if share_cap > 0 else 100.0
-            share_raw = (mg / share_full) if (mg > 0 and share_full > 0) else 0.0
-            if share_raw < 0.0:
-                share_raw = 0.0
-            elif share_raw > 1.0:
-                share_raw = 1.0
-            # Nonlinear top-heavy ramp (power exponent 1.5)
-            pts_share = 50.0 * (share_raw ** 1.5)
+
+            # Share ratio regime:
+            # - Cap(m): running record (up to and including month m) of the highest single-show month gross
+            # - Displayed Share Ratio is the raw ratio vs Cap(m): clamp(MG / Cap(m), 0..1)
+            # - Full 50 Share points at >= 80% of Cap(m), using a nonlinear power curve exponent 1.5:
+            #     share_scaled = clamp(share_ratio / 0.80, 0..1)
+            #     PtsShare = 50 * share_scaled^1.5
+            share_ratio = (mg / share_cap) if (mg > 0 and share_cap > 0) else 0.0
+            if share_ratio < 0.0:
+                share_ratio = 0.0
+            elif share_ratio > 1.0:
+                share_ratio = 1.0
+
+            share_scaled = (share_ratio / 0.80) if share_ratio > 0 else 0.0
+            if share_scaled < 0.0:
+                share_scaled = 0.0
+            elif share_scaled > 1.0:
+                share_scaled = 1.0
+
+            # Nonlinear ramp (power exponent 1.5)
+            pts_share = 50.0 * (share_scaled ** 1.5)
+
+            # Keep the raw ratio in the data (table uses this for "Share Ratio")
+            share_raw = share_ratio
 
             # Momentum components only apply when the show grossed this month
             if mg > 0:
@@ -1105,19 +1119,20 @@ def _compute_smps_history(db_path: str, db_mtime: float, include_bonuses: bool) 
 
 
         # --- Debut/re-entry guardrails (reduce #1 debuts unless the month is truly monstrous) ---
-        # If a show was not on last month's SMPS Top 25, taper its Breakout points unless it
-        # commands a big enough Share of the month. This keeps true mega-launches eligible for #1,
-        # but prevents "auto-#1" Breakout wins caused by pg≈0/denominator effects.
-        #
-        # Taper rule (nonlinear power ramp, exponent 1.5):
-        #   share_raw <= 0.50 -> 0% of Breakout points  (<= 40% of Cap(m))
-        #   share_raw >= 0.80 -> 100% of Breakout points (>= 64% of Cap(m))
-        #   between -> ramp in [0..1] then apply power exponent 1.5
-        s0, s1 = 0.50, 0.80
-        denom = (s1 - s0) if (s1 - s0) != 0 else 1.0
+        # Taper rule uses raw Cap-space ratio (MG / Cap(m)):
+        #   cap_ratio <= 0.40 -> 0% of Breakout points
+        #   cap_ratio >= 0.75 -> 100% of Breakout points
+        #   between -> nonlinear power ramp exponent 1.25
+        r0, r1 = 0.40, 0.75
+        denom = (r1 - r0) if (r1 - r0) != 0 else 1.0
         df["is_debut_or_reentry"] = ~df["show_id"].astype(int).isin(list(prev_ids))
-        _u = ((df["share_raw"] - s0) / denom).clip(lower=0.0, upper=1.0)
-        df["debut_breakout_factor"] = _u ** 1.5
+
+        # cap_ratio is MG / Cap(m) (not the 0.80-normalized Share ratio)
+        cap_ratio = (df["month_gross_millions"] / share_cap_by_month.get(m, 100.0)).replace([float('inf'), -float('inf')], 0.0)
+        cap_ratio = pd.to_numeric(cap_ratio, errors="coerce").fillna(0.0)
+
+        _u = ((cap_ratio - r0) / denom).clip(lower=0.0, upper=1.0)
+        df["debut_breakout_factor"] = _u ** 1.25
         _mask_debut = df["is_debut_or_reentry"] & (df["month_gross_millions"] > 0)
         df.loc[_mask_debut, "points_breakout"] = df.loc[_mask_debut, "points_breakout"] * df.loc[_mask_debut, "debut_breakout_factor"]
 
@@ -1258,7 +1273,7 @@ def _write_smps_to_db(month: str, chart_df: pd.DataFrame) -> None:
 def tab_monthly_smps_t25():
     st.subheader("Monthly T-25 (SMPS)")
     st.caption(
-        "SMPS_v1 = Share (50; ratio-based to the running record monthly max (no rounding) with exponent 1.4) + Breakout (30) + Heat (20) + carryover (0-gross months only) + continuity bonus (active incumbents). "
+        "SMPS_v1 = Share (50; ratio-based to the running record monthly max (no rounding) with exponent 1.5) + Breakout (30) + Heat (20) + carryover (0-gross months only) + continuity bonus (active incumbents). "
         "Floors use PERCENTILE.INC (10th percentile). Zombie rule: 4 consecutive 0-gross chart-months => ineligible."
     )
 
@@ -2446,51 +2461,7 @@ def tab_show_detail():
             debut_ts = pd.to_datetime(debut_str, errors="coerce")
             start_ts = pd.Timestamp(GROSS_TRACKING_START)
             if debut_ts is not None and not pd.isna(debut_ts):
-                debut_n = debut_ts.normalize()
-                if debut_n >= start_ts:
-                    # Debuted during the grossing era → start at debut week.
-                    start_ts = debut_n
-                else:
-                    # Debuted before the grossing era → start at the first week it actually grossed
-                    # (gross + any bonuses), bounded to the grossing era start.
-                    first_gross_df = sql_df(
-                        """
-                        WITH g AS (
-                          SELECT date(week_ending) AS week_ending,
-                                 COALESCE(gross_millions, 0.0) AS gross
-                          FROM t10_entry
-                          WHERE show_id = ?
-                        ),
-                        b AS (
-                          SELECT date(week_ending) AS week_ending,
-                                 SUM(COALESCE(bonus_millions, 0.0)) AS bonus
-                          FROM gross_bonus
-                          WHERE show_id = ?
-                          GROUP BY date(week_ending)
-                        ),
-                        w AS (
-                          SELECT g.week_ending AS week_ending,
-                                 g.gross + COALESCE(b.bonus, 0.0) AS total
-                          FROM g
-                          LEFT JOIN b ON b.week_ending = g.week_ending
-                          UNION
-                          SELECT b.week_ending AS week_ending,
-                                 COALESCE(b.bonus, 0.0) AS total
-                          FROM b
-                          WHERE b.week_ending NOT IN (SELECT week_ending FROM g)
-                        )
-                        SELECT MIN(week_ending) AS first_gross
-                        FROM w
-                        WHERE date(week_ending) >= date(?) AND total > 0.0;
-                        """,
-                        (int(show_id), int(show_id), str(GROSS_TRACKING_START)),
-                    )
-                    fg_str = None
-                    if first_gross_df is not None and not first_gross_df.empty:
-                        fg_str = first_gross_df.loc[0, "first_gross"]
-                    fg_ts = pd.to_datetime(fg_str, errors="coerce")
-                    if fg_ts is not None and not pd.isna(fg_ts):
-                        start_ts = max(start_ts, fg_ts.normalize())
+                start_ts = max(start_ts, debut_ts.normalize())
 
             weeks = weeks[weeks >= start_ts]
             weeks = sorted(pd.unique(weeks).tolist())
