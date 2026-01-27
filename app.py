@@ -3,8 +3,8 @@ from __future__ import annotations
 
 import os
 import sqlite3
-import io
 import math
+import io
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Optional, Callable
@@ -235,8 +235,6 @@ class FilterSpec:
     date_max: str | None
     rank_min: int
     rank_max: int
-    week_number_min: int | None = None
-    week_number_max: int | None = None
 
 def build_where(filters: FilterSpec, table_alias: str = "e") -> tuple[str, list[Any]]:
     where = [f"{table_alias}.rank BETWEEN ? AND ?"]
@@ -247,17 +245,19 @@ def build_where(filters: FilterSpec, table_alias: str = "e") -> tuple[str, list[
     if filters.date_max:
         where.append(f"{table_alias}.week_ending <= ?")
         params.append(filters.date_max)
-    if filters.week_number_min is not None:
-        where.append(f"{table_alias}.week_number >= ?")
-        params.append(int(filters.week_number_min))
-    if filters.week_number_max is not None:
-        where.append(f"{table_alias}.week_number <= ?")
-        params.append(int(filters.week_number_max))
     return " AND ".join(where), params
 
-def fetch_entries(filters: FilterSpec, fts_query: str | None = None, limit: int = 1000) -> pd.DataFrame:
+def fetch_entries(filters: FilterSpec, fts_query: str | None = None, limit: int = 1000, week_min: int | None = None, week_max: int | None = None) -> pd.DataFrame:
     where, params = build_where(filters, "e")
     params2 = list(params)
+
+    # Week number filter (optional)
+    if week_min is not None and week_max is not None:
+        where = f"{where} AND e.week_number BETWEEN ? AND ?"
+        params2.extend([int(week_min), int(week_max)])
+    elif week_min is not None:
+        where = f"{where} AND e.week_number = ?"
+        params2.append(int(week_min))
 
     if fts_query and fts_query.strip():
         sql = f"""
@@ -435,9 +435,7 @@ def fetch_show_weekly_ledger(show_id: int) -> pd.DataFrame:
 
 
 
-def fetch_company_entries(company: str, filters: FilterSpec, imprint_col: str = "imprint_1", limit: int = 2000) -> pd.DataFrame:
-    if imprint_col not in ("imprint_1", "imprint_2"):
-        raise ValueError("imprint_col must be 'imprint_1' or 'imprint_2'")
+def fetch_company_entries(company: str, filters: FilterSpec, limit: int = 2000) -> pd.DataFrame:
     where, params = build_where(filters, "e")
     sql = f"""
     SELECT
@@ -459,7 +457,7 @@ def fetch_company_entries(company: str, filters: FilterSpec, imprint_col: str = 
       GROUP BY show_id, week_ending
     ) gb ON gb.show_id = e.show_id AND gb.week_ending = e.week_ending
     JOIN show s ON s.show_id = e.show_id
-    WHERE COALESCE(e.{imprint_col},'(Unknown)') = ?
+    WHERE COALESCE(e.imprint_1,'(Unknown)') = ?
       AND {where}
     ORDER BY e.week_ending DESC, e.rank ASC, e.pos ASC
     LIMIT ?
@@ -468,48 +466,6 @@ def fetch_company_entries(company: str, filters: FilterSpec, imprint_col: str = 
     if not df.empty:
         df["week_ending"] = _as_date_str(df["week_ending"])
     return df
-
-@st.cache_data(show_spinner=False)
-def fetch_company_list(imprint_col: str) -> list[str]:
-    """Distinct company names from the chosen imprint column (with '(Unknown)' for blanks)."""
-    if imprint_col not in ("imprint_1", "imprint_2"):
-        raise ValueError("imprint_col must be 'imprint_1' or 'imprint_2'")
-    df = sql_df(
-        f"""
-        SELECT DISTINCT COALESCE(NULLIF(TRIM({imprint_col}), ''), '(Unknown)') AS company
-        FROM t10_entry
-        WHERE week_ending IS NOT NULL
-        ORDER BY company
-        """
-    )
-    return df["company"].tolist() if (df is not None and not df.empty and "company" in df.columns) else ["(Unknown)"]
-
-
-def fetch_company_stats(company: str, filters: FilterSpec, imprint_col: str = "imprint_1") -> pd.DataFrame:
-    """Company summary stats (entries/unique shows/total+avg gross), computed on the fly."""
-    if imprint_col not in ("imprint_1", "imprint_2"):
-        raise ValueError("imprint_col must be 'imprint_1' or 'imprint_2'")
-
-    where, params = build_where(filters, "e")
-    sql = f"""
-    WITH bonus_by_row AS (
-      SELECT show_id, week_ending, SUM(bonus_millions) AS bonus_millions
-      FROM gross_bonus
-      GROUP BY show_id, week_ending
-    )
-    SELECT
-      COUNT(*) AS entries,
-      COUNT(DISTINCT e.show_id) AS unique_shows,
-      SUM(e.gross_millions + COALESCE(b.bonus_millions, 0)) AS total_gross_millions,
-      AVG(e.gross_millions + COALESCE(b.bonus_millions, 0)) AS avg_gross_millions
-    FROM t10_entry e
-    LEFT JOIN bonus_by_row b ON b.show_id = e.show_id AND b.week_ending = e.week_ending
-    WHERE COALESCE(e.{imprint_col}, '(Unknown)') = ?
-      AND {where}
-    """
-    return sql_df(sql, tuple([company] + params))
-
-
 
 
 # ----------------------------
@@ -1031,34 +987,28 @@ def _compute_smps_history(db_path: str, db_mtime: float, include_bonuses: bool) 
             mg = float(gross.get(sid, 0.0))
             pg = float(prevg.get(sid, 0.0))
             # Share (ratio-based, top-heavy)
-            # Dynamic denom per month: "highest single-show month gross on record up to this month",
-            # as-is (no rounding).
-            # share_raw = clamp(mg/(0.80*Cap(m)), 0..1), PtsShare = 50 * share_raw^1.5
+            # Dynamic denom per month: Cap(m) = running record (through month m) of the highest
+            # single-show month gross (no rounding).
+            #
+            # New regime: keep the same raw share ratio basis r = clamp(MG/Cap(m), 0..1), but
+            # grant full Share points at 80% of Cap(m) by rescaling r -> r_scaled = clamp(r/0.80, 0..1).
+            #
+            # Displayed "Share Ratio" uses the raw ratio r (MG/Cap).
             share_cap = float(share_cap_by_month.get(m, 100.0))
+            share_raw = (mg / share_cap) if (mg > 0 and share_cap > 0) else 0.0  # r = MG/Cap(m)
+            if share_raw < 0.0:
+                share_raw = 0.0
+            elif share_raw > 1.0:
+                share_raw = 1.0
 
-            # Share ratio regime:
-            # - Cap(m): running record (up to and including month m) of the highest single-show month gross
-            # - Displayed Share Ratio is the raw ratio vs Cap(m): clamp(MG / Cap(m), 0..1)
-            # - Full 50 Share points at >= 80% of Cap(m), using a nonlinear power curve exponent 1.5:
-            #     share_scaled = clamp(share_ratio / 0.80, 0..1)
-            #     PtsShare = 50 * share_scaled^1.5
-            share_ratio = (mg / share_cap) if (mg > 0 and share_cap > 0) else 0.0
-            if share_ratio < 0.0:
-                share_ratio = 0.0
-            elif share_ratio > 1.0:
-                share_ratio = 1.0
-
-            share_scaled = (share_ratio / 0.80) if share_ratio > 0 else 0.0
+            share_scaled = share_raw / 0.80
             if share_scaled < 0.0:
                 share_scaled = 0.0
             elif share_scaled > 1.0:
                 share_scaled = 1.0
 
-            # Nonlinear ramp (power exponent 1.5)
+            # Nonlinear top-heavy ramp (power exponent 1.5)
             pts_share = 50.0 * (share_scaled ** 1.5)
-
-            # Keep the raw ratio in the data (table uses this for "Share Ratio")
-            share_raw = share_ratio
 
             # Momentum components only apply when the show grossed this month
             if mg > 0:
@@ -1119,19 +1069,18 @@ def _compute_smps_history(db_path: str, db_mtime: float, include_bonuses: bool) 
 
 
         # --- Debut/re-entry guardrails (reduce #1 debuts unless the month is truly monstrous) ---
-        # Taper rule uses raw Cap-space ratio (MG / Cap(m)):
-        #   cap_ratio <= 0.40 -> 0% of Breakout points
-        #   cap_ratio >= 0.75 -> 100% of Breakout points
-        #   between -> nonlinear power ramp exponent 1.25
-        r0, r1 = 0.40, 0.75
-        denom = (r1 - r0) if (r1 - r0) != 0 else 1.0
+        # If a show was not on last month's SMPS Top 25, taper its Breakout points unless it
+        # commands a big enough Share of the month. This keeps true mega-launches eligible for #1,
+        # but prevents "auto-#1" Breakout wins caused by pg≈0/denominator effects.
+        #
+        # Taper rule (nonlinear power ramp, exponent 1.25):
+        #   share_raw <= 0.40 -> 0% of Breakout points  (<= 40% of Cap(m))
+        #   share_raw >= 0.75 -> 100% of Breakout points (>= 75% of Cap(m))
+        #   between -> ramp in [0..1] then apply power exponent 1.25
+        s0, s1 = 0.40, 0.75
+        denom = (s1 - s0) if (s1 - s0) != 0 else 1.0
         df["is_debut_or_reentry"] = ~df["show_id"].astype(int).isin(list(prev_ids))
-
-        # cap_ratio is MG / Cap(m) (not the 0.80-normalized Share ratio)
-        cap_ratio = (df["month_gross_millions"] / share_cap_by_month.get(m, 100.0)).replace([float('inf'), -float('inf')], 0.0)
-        cap_ratio = pd.to_numeric(cap_ratio, errors="coerce").fillna(0.0)
-
-        _u = ((cap_ratio - r0) / denom).clip(lower=0.0, upper=1.0)
+        _u = ((df["share_raw"] - s0) / denom).clip(lower=0.0, upper=1.0)
         df["debut_breakout_factor"] = _u ** 1.25
         _mask_debut = df["is_debut_or_reentry"] & (df["month_gross_millions"] > 0)
         df.loc[_mask_debut, "points_breakout"] = df.loc[_mask_debut, "points_breakout"] * df.loc[_mask_debut, "debut_breakout_factor"]
@@ -1273,7 +1222,7 @@ def _write_smps_to_db(month: str, chart_df: pd.DataFrame) -> None:
 def tab_monthly_smps_t25():
     st.subheader("Monthly T-25 (SMPS)")
     st.caption(
-        "SMPS_v1 = Share (50; ratio-based to the running record monthly max (no rounding) with exponent 1.5) + Breakout (30) + Heat (20) + carryover (0-gross months only) + continuity bonus (active incumbents). "
+        "SMPS_v1 = Share (50; ratio-based to the running record monthly max (no rounding) with exponent 1.4) + Breakout (30) + Heat (20) + carryover (0-gross months only) + continuity bonus (active incumbents). "
         "Floors use PERCENTILE.INC (10th percentile). Zombie rule: 4 consecutive 0-gross chart-months => ineligible."
     )
 
@@ -1351,7 +1300,6 @@ def tab_monthly_smps_t25():
     disp["Pts Breakout"] = disp["points_breakout"].round(2)
     disp["Pts Heat"] = disp["points_heat"].round(2)
     disp["Pts Carryover"] = disp["points_carryover"].round(2)
-    disp["Pts Continuity"] = pd.to_numeric(disp.get("points_continuity"), errors="coerce").fillna(0.0).round(2)
     disp["Pts Total"] = disp["points_total"].round(2)
 
     show_cols = [
@@ -1365,12 +1313,10 @@ def tab_monthly_smps_t25():
         "Share Ratio",
         "breakout_raw",
         "heat_raw",
-        "inactive_streak",
         "Pts Share",
         "Pts Breakout",
         "Pts Heat",
         "Pts Carryover",
-        "Pts Continuity",
         "Pts Total",
     ]
 
@@ -1389,6 +1335,110 @@ def tab_monthly_smps_t25():
         hide_index=True,
     )
 
+
+
+    # Export: download this month's SMPS T-25 as .xlsx
+    # (Column order mirrors your legacy .xls layout.)
+    try:
+        export_disp = disp.copy()
+
+        # Peak Position = best (lowest) SMPS monthly rank so far (through the selected month)
+        _pos_frames = []
+        for _mm in months[: pick_idx + 1]:
+            _cdf = hist.get(_mm)
+            if _cdf is None or _cdf.empty:
+                continue
+            if 'show_id' in _cdf.columns and 'position' in _cdf.columns:
+                _pos_frames.append(_cdf[['show_id', 'position']].copy())
+        if _pos_frames:
+            _peak_map = pd.concat(_pos_frames, ignore_index=True).groupby('show_id')['position'].min()
+        else:
+            _peak_map = pd.Series(dtype='float')
+
+        export_disp['This Month'] = export_disp['position'].astype(int)
+        export_disp['Last Month'] = export_disp['Last Mo Pos']
+        export_disp['Peak Position'] = export_disp['show_id'].map(_peak_map).fillna(export_disp['position']).astype(int)
+
+        export_disp['Total Points'] = pd.to_numeric(export_disp.get('points_total'), errors='coerce').fillna(0.0)
+        export_disp['Pts Continuity'] = pd.to_numeric(export_disp.get('points_continuity'), errors='coerce').fillna(0.0)
+
+        export_df = pd.DataFrame({
+            'This Month': export_disp['This Month'],
+            'Last Month': export_disp['Last Month'],
+            'Months on Chart': export_disp['Months on Chart'],
+            'Show': export_disp['canonical_title'],
+            'Imprint 1': export_disp['imprint_1'],
+            'Imprint 2': export_disp['imprint_2'],
+            'Peak Position': export_disp['Peak Position'],
+            'Total Points': export_disp['Total Points'].round(2),
+            '': [''] * len(export_disp),
+            'Share Ratio': export_disp['Share Ratio'],
+            'BreakoutRaw': export_disp['breakout_raw'],
+            'HeatRaw': export_disp['heat_raw'],
+            'Pts Share': export_disp['Pts Share'],
+            'Pts Breakout': export_disp['Pts Breakout'],
+            'Pts Heat': export_disp['Pts Heat'],
+            'Pts Carryover': export_disp['Pts Carryover'],
+            'Pts Continuity': export_disp['Pts Continuity'].round(2),
+        })
+
+        export_df = export_df[[
+            'This Month', 'Last Month', 'Months on Chart', 'Show',
+            'Imprint 1', 'Imprint 2', 'Peak Position', 'Total Points',
+            '',
+            'Share Ratio', 'BreakoutRaw', 'HeatRaw',
+            'Pts Share', 'Pts Breakout', 'Pts Heat', 'Pts Carryover', 'Pts Continuity'
+        ]]
+
+        def _smps_month_xlsx_bytes(df_out: pd.DataFrame) -> bytes:
+            try:
+                import openpyxl  # type: ignore  # noqa: F401
+                from openpyxl.styles import Font, Alignment
+            except Exception:
+                return b''
+
+            bio = io.BytesIO()
+            with pd.ExcelWriter(bio, engine='openpyxl') as writer:
+                df_out.to_excel(writer, index=False, sheet_name='Monthly T-25')
+                ws = writer.sheets['Monthly T-25']
+                ws.freeze_panes = 'A2'
+
+                header_font = Font(bold=True)
+                for cell in ws[1]:
+                    cell.font = header_font
+                    cell.alignment = Alignment(horizontal='center', vertical='center')
+
+                # Basic auto-fit (capped) + keep the spacer column narrow
+                for col_cells in ws.columns:
+                    col_letter = col_cells[0].column_letter
+                    header_val = col_cells[0].value
+                    if header_val == '':
+                        ws.column_dimensions[col_letter].width = 3
+                        continue
+                    max_len = 0
+                    for c in col_cells[: min(len(col_cells), 200)]:
+                        v = c.value
+                        if v is None:
+                            continue
+                        max_len = max(max_len, len(str(v)))
+                    ws.column_dimensions[col_letter].width = min(max(8, max_len + 2), 44)
+
+            return bio.getvalue()
+
+        xlsx_bytes = _smps_month_xlsx_bytes(export_df)
+        if xlsx_bytes:
+            st.download_button(
+                'Download .xlsx',
+                data=xlsx_bytes,
+                file_name=f"SMPS_Monthly_T25_{pick}.xlsx",
+                mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+                key='smps_monthly_xlsx_dl',
+            )
+        else:
+            st.info('Excel export requires `openpyxl`. Install it in your venv with: `pip install openpyxl`')
+
+    except Exception as _e:
+        st.error(f"XLSX export failed: {_e}")
     c1, c2 = st.columns([1, 2])
     with c1:
         if st.button("Write this SMPS month to DB", key="smps_write_one"):
@@ -2327,38 +2377,37 @@ def tab_search():
         fts = st.text_input("Full-text search (FTS)", placeholder="e.g. Nickelodeon AND (school OR kids)")
         date_min = st.text_input("Start date (YYYY-MM-DD)", value="", key="gt_date_min")
         date_max = st.text_input("End date (YYYY-MM-DD)", value="", key="gt_date_max")
+        week_num = st.text_input("Week # (e.g. 2500 or 2400-2600)", value="", key="gt_week_num")
         rank_min, rank_max = st.slider("Rank range", 1, 50, (1, 10))
-        week_spec = st.text_input("Week # (single or range)", value="", placeholder="e.g. 2500 or 2400-2600", key="gt_week_num")
         limit = st.slider("Max results", 50, 10000, 1000, step=50)
-
-    # Week # filter parsing: accept a single number (exact match) or a range like 2400-2600.
-    week_number_min: int | None = None
-    week_number_max: int | None = None
-    _ws = (week_spec or "").strip()
-    if _ws:
-        try:
-            _ws = _ws.replace("–", "-").replace("—", "-")
-            if "-" in _ws:
-                a, b = [p.strip() for p in _ws.split("-", 1)]
-                if a:
-                    week_number_min = int(a)
-                if b:
-                    week_number_max = int(b)
-            else:
-                week_number_min = week_number_max = int(_ws)
-        except Exception:
-            week_number_min = None
-            week_number_max = None
 
     filters = FilterSpec(
         date_min=date_min.strip() or None,
         date_max=date_max.strip() or None,
         rank_min=int(rank_min),
         rank_max=int(rank_max),
-        week_number_min=week_number_min,
-        week_number_max=week_number_max,
     )
-    df = fetch_entries(filters, fts_query=fts, limit=int(limit))
+        # Parse Week # filter (optional)
+    wk_min: int | None = None
+    wk_max: int | None = None
+    wk_txt = (week_num or "").strip()
+    if wk_txt:
+        try:
+            if "-" in wk_txt:
+                a, b = [p.strip() for p in wk_txt.split("-", 1)]
+                wk_min = int(a)
+                wk_max = int(b)
+                if wk_min > wk_max:
+                    wk_min, wk_max = wk_max, wk_min
+            else:
+                wk_min = int(wk_txt)
+                wk_max = int(wk_txt)
+        except Exception:
+            st.warning("Week # must be an integer or a range like 2400-2600.")
+            wk_min = None
+            wk_max = None
+
+    df = fetch_entries(filters, fts_query=fts, limit=int(limit), week_min=wk_min, week_max=wk_max)
 
     st.write(f"Results: **{len(df)}**")
     st.dataframe(df, use_container_width=True)
@@ -2431,66 +2480,67 @@ def tab_show_detail():
             st.caption("No ledger rows found for this show.")
         else:
             st.dataframe(led, use_container_width=True, hide_index=True)
+
     with st.expander("All-Time Gross Races rank history (every chart week since debut/era start)"):
-        # We compute the show's all-time rank as-of *every* chart week in the grossing era,
-        # because other shows can keep grossing after this show disappears from the weekly chart.
-        hist_mode = st.radio(
-            "History view",
-            ["All weeks", "Rank changes only"],
-            index=0,
-            horizontal=True,
-            key=f"show_rankhist_mode_{show_id}",
-        )
-        db_mtime = DB_PATH.stat().st_mtime if DB_PATH.exists() else 0.0
-        base = _load_gross_races_base(str(DB_PATH), db_mtime)
-
-        if base.empty:
-            st.caption("No gross races base rows found (cannot compute all-time ranks).")
-        else:
-            weeks = pd.to_datetime(base["week_ending"], errors="coerce").dropna().dt.normalize()
-
-            # Start the history at the show's debut (first chart week) if it debuted after the grossing era began.
-            # If it debuted before the grossing era, start at the grossing era start (2001-03-17).
-            debut_df = sql_df(
-                "SELECT MIN(date(week_ending)) AS debut FROM t10_entry WHERE show_id = ?;",
-                (int(show_id),),
+            # We compute the show's all-time rank as-of *every* chart week in the grossing era,
+            # because other shows can keep grossing after this show disappears from the weekly chart.
+            hist_mode = st.radio(
+                "History view",
+                ["All weeks", "Rank changes only"],
+                index=0,
+                horizontal=True,
+                key=f"show_rankhist_mode_{show_id}",
             )
-            debut_str = None
-            if debut_df is not None and not debut_df.empty:
-                debut_str = debut_df.loc[0, "debut"]
-            debut_ts = pd.to_datetime(debut_str, errors="coerce")
-            start_ts = pd.Timestamp(GROSS_TRACKING_START)
-            if debut_ts is not None and not pd.isna(debut_ts):
-                start_ts = max(start_ts, debut_ts.normalize())
+            db_mtime = DB_PATH.stat().st_mtime if DB_PATH.exists() else 0.0
+            base = _load_gross_races_base(str(DB_PATH), db_mtime)
 
-            weeks = weeks[weeks >= start_ts]
-            weeks = sorted(pd.unique(weeks).tolist())
-
-            # Apply the same date window as the Show detail filters (if set)
-            tmin = pd.to_datetime(filters.date_min, errors="coerce") if filters.date_min else None
-            tmax = pd.to_datetime(filters.date_max, errors="coerce") if filters.date_max else None
-            if tmin is not None and not pd.isna(tmin):
-                weeks = [w for w in weeks if w >= tmin.normalize()]
-            if tmax is not None and not pd.isna(tmax):
-                weeks = [w for w in weeks if w <= tmax.normalize()]
-
-            rt = _alltime_rank_table_for_show_weeks(str(DB_PATH), db_mtime, show_id, weeks)
-
-            if rt.empty:
-                st.caption("No all-time rank rows could be computed for the selected weeks.")
+            if base.empty:
+                st.caption("No gross races base rows found (cannot compute all-time ranks).")
             else:
-                rt2 = rt.copy()
-                rt2["rank"] = pd.to_numeric(rt2["rank"], errors="coerce").astype("Int64")
-                rt2["rank_change"] = pd.to_numeric(rt2["rank_change"], errors="coerce").astype("Int64")
-                rt2["total_gross_millions"] = pd.to_numeric(rt2["total_gross_millions"], errors="coerce")
-                if hist_mode == "Rank changes only":
-                    # Keep the first row, then only weeks where the rank changed vs the prior week.
-                    ch = pd.to_numeric(rt2["rank_change"], errors="coerce").fillna(0)
-                    keep = (ch != 0)
-                    if len(rt2) > 0:
-                        keep.iloc[0] = True
-                    rt2 = rt2.loc[keep].copy()
-                st.dataframe(rt2, use_container_width=True, hide_index=True)
+                weeks = pd.to_datetime(base["week_ending"], errors="coerce").dropna().dt.normalize()
+
+                # Start the history at the show's debut (first chart week) if it debuted after the grossing era began.
+                # If it debuted before the grossing era, start at the grossing era start (2001-03-17).
+                debut_df = sql_df(
+                    "SELECT MIN(date(week_ending)) AS debut FROM t10_entry WHERE show_id = ?;",
+                    (int(show_id),),
+                )
+                debut_str = None
+                if debut_df is not None and not debut_df.empty:
+                    debut_str = debut_df.loc[0, "debut"]
+                debut_ts = pd.to_datetime(debut_str, errors="coerce")
+                start_ts = pd.Timestamp(GROSS_TRACKING_START)
+                if debut_ts is not None and not pd.isna(debut_ts):
+                    start_ts = max(start_ts, debut_ts.normalize())
+
+                weeks = weeks[weeks >= start_ts]
+                weeks = sorted(pd.unique(weeks).tolist())
+
+                # Apply the same date window as the Show detail filters (if set)
+                tmin = pd.to_datetime(filters.date_min, errors="coerce") if filters.date_min else None
+                tmax = pd.to_datetime(filters.date_max, errors="coerce") if filters.date_max else None
+                if tmin is not None and not pd.isna(tmin):
+                    weeks = [w for w in weeks if w >= tmin.normalize()]
+                if tmax is not None and not pd.isna(tmax):
+                    weeks = [w for w in weeks if w <= tmax.normalize()]
+
+                rt = _alltime_rank_table_for_show_weeks(str(DB_PATH), db_mtime, show_id, weeks)
+
+                if rt.empty:
+                    st.caption("No all-time rank rows could be computed for the selected weeks.")
+                else:
+                    rt2 = rt.copy()
+                    rt2["rank"] = pd.to_numeric(rt2["rank"], errors="coerce").astype("Int64")
+                    rt2["rank_change"] = pd.to_numeric(rt2["rank_change"], errors="coerce").astype("Int64")
+                    rt2["total_gross_millions"] = pd.to_numeric(rt2["total_gross_millions"], errors="coerce")
+                    if hist_mode == "Rank changes only":
+                        # Keep the first row, then only weeks where the rank changed vs the prior week.
+                        ch = pd.to_numeric(rt2["rank_change"], errors="coerce").fillna(0)
+                        keep = (ch != 0)
+                        if len(rt2) > 0:
+                            keep.iloc[0] = True
+                        rt2 = rt2.loc[keep].copy()
+                    st.dataframe(rt2, use_container_width=True, hide_index=True)
 
     df = fetch_show_entries(show_id, filters)
     st.dataframe(df, use_container_width=True)
@@ -2645,18 +2695,9 @@ def tab_compare_two_shows():
 
 
 def tab_companies():
-    company_mode = st.radio("Company field", ["Imprint 1", "Imprint 2"], horizontal=True, index=0)
-    imprint_col = "imprint_1" if company_mode == "Imprint 1" else "imprint_2"
-
-    st.subheader(f"Company view ({company_mode})")
-
-    if company_mode == "Imprint 1":
-        _, companies = load_lists()
-        company_list = companies["company"].tolist()
-    else:
-        company_list = fetch_company_list(imprint_col)
-
-    company = st.selectbox(f"Company ({company_mode})", company_list)
+    st.subheader("Company view (Imprint 1)")
+    _, companies = load_lists()
+    company = st.selectbox("Company (Imprint 1)", companies["company"].tolist())
 
     with st.sidebar:
         st.header("Company filters")
@@ -2666,17 +2707,16 @@ def tab_companies():
 
     filters = FilterSpec(date_min.strip() or None, date_max.strip() or None, int(rank_min), int(rank_max))
 
-    stat = fetch_company_stats(company, filters, imprint_col=imprint_col)
+    stat = sql_df("SELECT * FROM v_company_stats WHERE company = ?", (company,))
     if not stat.empty:
         s = stat.iloc[0].to_dict()
         c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Entries", int(s.get("entries", 0) or 0))
-        c2.metric("Unique shows", int(s.get("unique_shows", 0) or 0))
-        c3.metric("Total gross (M)", float(s.get("total_gross_millions", 0.0) or 0.0))
-        av = s.get("avg_gross_millions")
-        c4.metric("Avg gross (M)", None if pd.isna(av) else float(av))
+        c1.metric("Entries", int(s["entries"]))
+        c2.metric("Unique shows", int(s["unique_shows"]))
+        c3.metric("Total gross (M)", float(s["total_gross_millions"]))
+        c4.metric("Avg gross (M)", None if pd.isna(s["avg_gross_millions"]) else float(s["avg_gross_millions"]))
 
-    df = fetch_company_entries(company, filters, imprint_col=imprint_col)
+    df = fetch_company_entries(company, filters)
     st.dataframe(df, use_container_width=True)
 
 
@@ -2846,6 +2886,8 @@ def _load_gross_races_base(db_path: str, db_mtime: float) -> pd.DataFrame:
     return df
 
 
+
+
 @st.cache_data(show_spinner=False)
 def _alltime_rank_table_for_show_weeks(db_path: str, db_mtime: float, show_id: int, weeks: list[pd.Timestamp]) -> pd.DataFrame:
     """All-Time Gross Races rank for a show as-of selected weeks (grossing-era only, includes bonuses)."""
@@ -2893,9 +2935,6 @@ def _alltime_rank_table_for_show_weeks(db_path: str, db_mtime: float, show_id: i
     out["rank_change"] = (prev - out["rank"]).fillna(0).astype(int)
     out = out[["rank", "rank_change", "week_ending", "total_gross_millions"]]
     return out
-
-
-
 
 
 
@@ -3092,8 +3131,6 @@ def tab_gross_races():
     # -------------------------
     # 2) Annual Gross Races
     # -------------------------
-    
-
     st.markdown("### Annual Gross Races")
     st.caption("Cumulative grosses reset at the start of each year.")
 
@@ -3879,7 +3916,6 @@ def tab_admin():
     st.markdown('---')
     
     st.markdown('---')
-    st.markdown('---')
     st.markdown("### Export show list (show_id)")
     export_show_df = sql_df("SELECT show_id, canonical_title FROM show ORDER BY show_id")
     st.caption("Download a simple lookup of show_id ↔ canonical_title. (This is based on the `show` table.)")
@@ -3909,7 +3945,6 @@ def tab_admin():
         )
     except Exception:
         st.info("Excel export requires `openpyxl`. Install it in your venv with: `pip install openpyxl`")
-
     st.markdown("### View aliases for a show")
     show_for_aliases = st.selectbox("Show", titles, key="alias_list_show")
     show_id = int(shows.loc[shows["canonical_title"] == show_for_aliases, "show_id"].iloc[0])
@@ -4564,7 +4599,6 @@ def tab_records_achievements():
                     "Week Hit #1": _fmt_date(r["first_n1"]),
                 })
         disp = pd.DataFrame(rows)
-        disp["Order"] = disp["Order"].astype(str)
         st.dataframe(disp, use_container_width=True, hide_index=True)
 
     st.divider()
