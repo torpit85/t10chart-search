@@ -262,6 +262,7 @@ def fetch_entries(filters: FilterSpec, fts_query: str | None = None, limit: int 
     if fts_query and fts_query.strip():
         sql = f"""
         SELECT
+          e.show_id,
           e.week_ending,
           e.week_number,
           e.rank,
@@ -2736,6 +2737,7 @@ def tab_analytics():
     where, params = build_where(filters, "e")
     df = sql_df(f"""
         SELECT
+          e.show_id,
           e.week_ending,
           e.week_number,
           e.rank,
@@ -2807,6 +2809,28 @@ def tab_analytics():
     w2 = weekly.copy()
     w2["roll"] = w2["gross_millions"].rolling(win, min_periods=max(1, win // 3)).mean()
     plot_line_dates(w2["week_ending"], w2["roll"], "Week Ending", f"{win}-week avg gross (Millions)")
+
+    if st.checkbox("Show Top Weekly Averages"):
+        # Weekly average = total weekly gross / number of grossing shows that week (within the current filters).
+        counts = (
+            dg[dg[gross_col].fillna(0.0) > 0.0]
+            .groupby("week_ending", as_index=False)["show_id"]
+            .nunique()
+            .rename(columns={"show_id": "num_shows"})
+        )
+        wa = weekly.merge(counts, on="week_ending", how="left")
+        wa["num_shows"] = wa["num_shows"].fillna(0).astype(int)
+        wa["weekly_avg_millions"] = np.where(
+            wa["num_shows"] > 0,
+            wa["gross_millions"] / wa["num_shows"],
+            0.0,
+        )
+        wa = wa.sort_values("weekly_avg_millions", ascending=False)
+        st.dataframe(
+            wa[["week_ending", "gross_millions", "num_shows", "weekly_avg_millions"]].head(20),
+            use_container_width=True,
+        )
+
 
     st.markdown("### Rank vs Gross (scatter)")
     plot_scatter(dg["rank"].astype(float), dg[gross_col].astype(float), "Rank", gross_label)
