@@ -5,6 +5,7 @@ import os
 import sqlite3
 import math
 import io
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Optional, Callable
@@ -42,6 +43,27 @@ def _as_date_str(series: pd.Series) -> pd.Series:
     out = dt.dt.strftime("%Y-%m-%d")
     fallback = s.astype("string").fillna(pd.NA).str.strip()
     return out.fillna(fallback)
+
+
+# FTS5 sanitization: user input -> safe MATCH query (prevents errors on punctuation like '!').
+_FTS_TOKEN_RE = re.compile(r"[0-9A-Za-z]+(?:'[0-9A-Za-z]+)?")
+
+def fts5_safe_query(raw: str | None) -> str:
+    """Convert arbitrary user text into a safe SQLite FTS5 query.
+
+    - Extracts alphanumeric tokens (keeps apostrophes inside words)
+    - Quotes each token to avoid operator interpretation
+    - Joins tokens with AND so all terms are required
+    - Returns '' if no usable tokens
+    """
+    s = (raw or "").strip()
+    if not s:
+        return ""
+    tokens = _FTS_TOKEN_RE.findall(s)
+    if not tokens:
+        return ""
+    return " AND ".join([f'"{t}"' for t in tokens])
+
 
 def get_con() -> sqlite3.Connection:
     if not DB_PATH.exists():
@@ -258,8 +280,9 @@ def fetch_entries(filters: FilterSpec, fts_query: str | None = None, limit: int 
     elif week_min is not None:
         where = f"{where} AND e.week_number = ?"
         params2.append(int(week_min))
+    safe_fts = fts5_safe_query(fts_query)
 
-    if fts_query and fts_query.strip():
+    if safe_fts:
         sql = f"""
         SELECT
           e.show_id,
@@ -288,7 +311,7 @@ def fetch_entries(filters: FilterSpec, fts_query: str | None = None, limit: int 
         ORDER BY e.week_ending DESC, e.rank ASC, e.pos ASC
         LIMIT ?
         """
-        params2 = [fts_query.strip()] + params2 + [int(limit)]
+        params2 = [safe_fts] + params2 + [int(limit)]
     else:
         sql = f"""
         SELECT
@@ -436,7 +459,9 @@ def fetch_show_weekly_ledger(show_id: int) -> pd.DataFrame:
 
 
 
-def fetch_company_entries(company: str, filters: FilterSpec, limit: int = 2000) -> pd.DataFrame:
+def fetch_company_entries(company: str, filters: FilterSpec, imprint_col: str = "imprint_1", limit: int = 2000) -> pd.DataFrame:
+    if imprint_col not in ("imprint_1", "imprint_2"):
+        raise ValueError("imprint_col must be 'imprint_1' or 'imprint_2'")
     where, params = build_where(filters, "e")
     sql = f"""
     SELECT
@@ -458,7 +483,7 @@ def fetch_company_entries(company: str, filters: FilterSpec, limit: int = 2000) 
       GROUP BY show_id, week_ending
     ) gb ON gb.show_id = e.show_id AND gb.week_ending = e.week_ending
     JOIN show s ON s.show_id = e.show_id
-    WHERE COALESCE(e.imprint_1,'(Unknown)') = ?
+    WHERE COALESCE(e.{imprint_col},'(Unknown)') = ?
       AND {where}
     ORDER BY e.week_ending DESC, e.rank ASC, e.pos ASC
     LIMIT ?
@@ -468,6 +493,45 @@ def fetch_company_entries(company: str, filters: FilterSpec, limit: int = 2000) 
         df["week_ending"] = _as_date_str(df["week_ending"])
     return df
 
+@st.cache_data(show_spinner=False)
+def fetch_company_list(imprint_col: str) -> list[str]:
+    """Distinct company names from the chosen imprint column (with '(Unknown)' for blanks)."""
+    if imprint_col not in ("imprint_1", "imprint_2"):
+        raise ValueError("imprint_col must be 'imprint_1' or 'imprint_2'")
+    df = sql_df(
+        f"""
+        SELECT DISTINCT COALESCE(NULLIF(TRIM({imprint_col}), ''), '(Unknown)') AS company
+        FROM t10_entry
+        WHERE week_ending IS NOT NULL
+        ORDER BY company
+        """
+    )
+    return df["company"].tolist() if (df is not None and not df.empty and "company" in df.columns) else ["(Unknown)"]
+
+
+def fetch_company_stats(company: str, filters: FilterSpec, imprint_col: str = "imprint_1") -> pd.DataFrame:
+    """Company summary stats (entries/unique shows/total+avg gross), computed on the fly."""
+    if imprint_col not in ("imprint_1", "imprint_2"):
+        raise ValueError("imprint_col must be 'imprint_1' or 'imprint_2'")
+
+    where, params = build_where(filters, "e")
+    sql = f"""
+    WITH bonus_by_row AS (
+      SELECT show_id, week_ending, SUM(bonus_millions) AS bonus_millions
+      FROM gross_bonus
+      GROUP BY show_id, week_ending
+    )
+    SELECT
+      COUNT(*) AS entries,
+      COUNT(DISTINCT e.show_id) AS unique_shows,
+      SUM(e.gross_millions + COALESCE(b.bonus_millions, 0)) AS total_gross_millions,
+      AVG(e.gross_millions + COALESCE(b.bonus_millions, 0)) AS avg_gross_millions
+    FROM t10_entry e
+    LEFT JOIN bonus_by_row b ON b.show_id = e.show_id AND b.week_ending = e.week_ending
+    WHERE COALESCE(e.{imprint_col}, '(Unknown)') = ?
+      AND {where}
+    """
+    return sql_df(sql, tuple([company] + params))
 
 # ----------------------------
 # Plot helpers (matplotlib only)
@@ -655,45 +719,33 @@ def holiday_week_ending_for_date(all_week_endings: list[date], holiday_dt: date,
 
     Rules (week_ending dates are assumed to be Saturdays in your data):
     - Fixed-date holidays (New Year's, Valentine's, Independence Day, Halloween, Christmas):
-        * If the holiday is Sun/Mon/Tue/Wed -> use the previous weekend (Saturday before)
-        * If the holiday is Thu/Fri/Sat     -> use the following weekend (Saturday on/after)
-      Example: Independence Day (07-04) on Thursday -> use week_ending 07-06.
-    - Thanksgiving: use the following week_ending (Saturday after Thanksgiving).
-      Example: Thanksgiving 11-23 -> use 11-25.
-    - Weekend/Monday holidays (Easter, Memorial Day, Labor Day, MLK Day, Presidents Day):
+        * If the holiday is Sun/Mon/Tue -> use the previous weekend (Saturday before)
+        * If the holiday is Wed/Thu/Fri/Sat -> use the current holiday week (Saturday on/after)
+      Example: Christmas Day (12-25) on Monday -> use week_ending 12-23.
+      Example: Halloween (10-31) on Friday -> use week_ending 11-01.
+    - Thanksgiving: use the following week_ending (Saturday on/after Thanksgiving).
+    - Weekend/Monday-style holidays (Easter, Memorial Day, Labor Day, MLK Day, Presidents Day):
       use the weekend the holiday is part of (Saturday before).
-      Example: Easter 04-17 -> use 04-16.
-    - Fallback: if no prior/next exists (edge years), use the closest available week_ending.
+    - If the computed week_ending is not present in your database (missing charts / future weeks), return None.
     """
     if not all_week_endings:
         return None
 
-    weeks = sorted(all_week_endings)
+    weeks_set = set(all_week_endings)
 
-    def prev_week_ending(d: date) -> Optional[date]:
-        prev = None
-        for we in weeks:
-            if we < d:
-                prev = we
-            else:
-                break
-        return prev
+    def sat_on_or_before(d: date) -> date:
+        # Saturday=5 (Mon=0 ... Sun=6)
+        return d - timedelta(days=(d.weekday() - 5) % 7)
 
-    def next_week_ending(d: date) -> Optional[date]:
-        for we in weeks:
-            if we >= d:
-                return we
-        return None
-
-    def closest_week_ending(d: date) -> date:
-        return min(weeks, key=lambda we: abs((we - d).days))
+    def sat_on_or_after(d: date) -> date:
+        return d + timedelta(days=(5 - d.weekday()) % 7)
 
     name = (holiday_name or "").strip()
 
-    # Thanksgiving: always the following week ending
+    # Thanksgiving: always the following week ending (Saturday on/after)
     if name.startswith("Thanksgiving"):
-        we = next_week_ending(holiday_dt)
-        return we if we is not None else closest_week_ending(holiday_dt)
+        target = sat_on_or_after(holiday_dt)
+        return target if target in weeks_set else None
 
     # Weekend/Monday-style holidays: Saturday before
     if (
@@ -703,10 +755,10 @@ def holiday_week_ending_for_date(all_week_endings: list[date], holiday_dt: date,
         or name.startswith("Martin Luther King")
         or name.startswith("Presidents Day")
     ):
-        we = prev_week_ending(holiday_dt)
-        return we if we is not None else closest_week_ending(holiday_dt)
+        target = sat_on_or_before(holiday_dt)
+        return target if target in weeks_set else None
 
-    # Fixed-date holidays: previous vs following weekend depends on weekday
+    # Fixed-date holidays: previous vs current holiday week depends on weekday
     fixed = (
         name.startswith("New Year's Day")
         or name.startswith("Valentine's Day")
@@ -716,22 +768,15 @@ def holiday_week_ending_for_date(all_week_endings: list[date], holiday_dt: date,
     )
     if fixed:
         wd = holiday_dt.weekday()  # Mon=0 ... Sun=6
-        if wd in (6, 0, 1, 2):  # Sun/Mon/Tue/Wed
-            we = prev_week_ending(holiday_dt)
-            return we if we is not None else closest_week_ending(holiday_dt)
-        else:  # Thu/Fri/Sat
-            we = next_week_ending(holiday_dt)
-            return we if we is not None else closest_week_ending(holiday_dt)
+        if wd in (6, 0, 1):  # Sun/Mon/Tue
+            target = sat_on_or_before(holiday_dt)
+        else:  # Wed/Thu/Fri/Sat
+            target = sat_on_or_after(holiday_dt)
+        return target if target in weeks_set else None
 
-    # Default: previous chart as-of holiday date
-    we = prev_week_ending(holiday_dt)
-    return we if we is not None else closest_week_ending(holiday_dt)
-
-
-
-
-
-
+    # Default: treat as Saturday before (as-of holiday date)
+    target = sat_on_or_before(holiday_dt)
+    return target if target in weeks_set else None
 
 # ----------------------------
 # New tab: Monthly T-25 (SMPS)
@@ -2696,9 +2741,18 @@ def tab_compare_two_shows():
 
 
 def tab_companies():
-    st.subheader("Company view (Imprint 1)")
-    _, companies = load_lists()
-    company = st.selectbox("Company (Imprint 1)", companies["company"].tolist())
+    company_mode = st.radio("Company field", ["Imprint 1", "Imprint 2"], horizontal=True, index=0)
+    imprint_col = "imprint_1" if company_mode == "Imprint 1" else "imprint_2"
+
+    st.subheader(f"Company view ({company_mode})")
+
+    if company_mode == "Imprint 1":
+        _, companies = load_lists()
+        company_list = companies["company"].tolist()
+    else:
+        company_list = fetch_company_list(imprint_col)
+
+    company = st.selectbox(f"Company ({company_mode})", company_list)
 
     with st.sidebar:
         st.header("Company filters")
@@ -2708,16 +2762,17 @@ def tab_companies():
 
     filters = FilterSpec(date_min.strip() or None, date_max.strip() or None, int(rank_min), int(rank_max))
 
-    stat = sql_df("SELECT * FROM v_company_stats WHERE company = ?", (company,))
+    stat = fetch_company_stats(company, filters, imprint_col=imprint_col)
     if not stat.empty:
         s = stat.iloc[0].to_dict()
         c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Entries", int(s["entries"]))
-        c2.metric("Unique shows", int(s["unique_shows"]))
-        c3.metric("Total gross (M)", float(s["total_gross_millions"]))
-        c4.metric("Avg gross (M)", None if pd.isna(s["avg_gross_millions"]) else float(s["avg_gross_millions"]))
+        c1.metric("Entries", int(s.get("entries", 0) or 0))
+        c2.metric("Unique shows", int(s.get("unique_shows", 0) or 0))
+        c3.metric("Total gross (M)", float(s.get("total_gross_millions", 0.0) or 0.0))
+        av = s.get("avg_gross_millions")
+        c4.metric("Avg gross (M)", None if pd.isna(av) else float(av))
 
-    df = fetch_company_entries(company, filters)
+    df = fetch_company_entries(company, filters, imprint_col=imprint_col)
     st.dataframe(df, use_container_width=True)
 
 
@@ -3494,6 +3549,15 @@ def tab_holidays():
         hdt = maker(y)
         we = holiday_week_ending_for_date(week_endings, hdt, holiday_name)
         if we is None:
+            rows_out.append({
+                "year": y,
+                "holiday_date": hdt.isoformat(),
+                "week_ending": None,
+                "#1_show(s)": None,
+                "imprint_1": None,
+                "imprint_2": None,
+                "gross_millions_sum": None,
+            })
             continue
 
         we_str = we.isoformat()
@@ -3551,9 +3615,15 @@ def tab_holidays():
         })
 
     out = pd.DataFrame(rows_out).sort_values("year")
-    st.dataframe(out, use_container_width=True)
 
-    miss = out["#1_show(s)"].isna().sum() if not out.empty else 0
+    disp = out.copy()
+    for c in ["week_ending", "#1_show(s)", "imprint_1", "imprint_2", "gross_millions_sum"]:
+        if c in disp.columns:
+            disp[c] = disp[c].where(disp[c].notna(), "—")
+
+    st.dataframe(disp, use_container_width=True)
+
+    miss = out[(out["week_ending"].notna()) & (out["#1_show(s)"].isna())].shape[0] if not out.empty else 0
     if miss:
         st.warning(
             f"{miss} year(s) had no #1 record for the computed holiday-week. "
@@ -3563,9 +3633,9 @@ def tab_holidays():
     with st.expander("How the holiday week is chosen"):
         st.write(
             "- Fixed-date holidays (New Year's, Valentine's, Independence Day, Halloween, Christmas):\n"
-            "  - Sun/Mon/Tue/Wed → previous weekend (Saturday before)\n"
-            "  - Thu/Fri/Sat → following weekend (Saturday on/after)\n"
-            "- Thanksgiving → following week ending (Saturday after)\n"
+            "  - Sun/Mon/Tue → previous week (Saturday before)\n"
+            "  - Wed/Thu/Fri/Sat → current week (Saturday on/after)\n"
+            "- Thanksgiving → current week (Saturday on/after)\n"
             "- Easter/Memorial Day/Labor Day/MLK Day/Presidents Day → Saturday before\n"
         )
 
