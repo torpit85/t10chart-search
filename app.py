@@ -4898,28 +4898,50 @@ def _fetch_t10_rank_rows(rank: int, year: str | None = None) -> pd.DataFrame:
 
 
 def _streaks_for_rank(df: pd.DataFrame) -> pd.DataFrame:
+    """Compute consecutive-week streaks per show for a given rank table.
+
+    Ties do NOT break streaks: if a show appears at the position in consecutive
+    chart weeks (even as a co-#1 / co-#2), the streak continues.
+    """
     if df.empty:
         return pd.DataFrame(columns=["canonical_title", "weeks", "start_week_ending", "end_week_ending"])
 
     d = df.copy()
     d["week_ending_dt"] = pd.to_datetime(d["week_ending"], errors="coerce")
-    d = d.dropna(subset=["week_ending_dt"]).sort_values(["week_ending_dt", "canonical_title"], ascending=[True, True])
+    d = d.dropna(subset=["week_ending_dt"])
 
-    # A new streak starts if the show changes OR the week gap is not exactly 7 days.
-    show_change = d["canonical_title"].ne(d["canonical_title"].shift(1))
-    gap_break = d["week_ending_dt"].diff().dt.days.ne(7)
-    new_streak = (show_change | gap_break).fillna(True)
-    d["_streak_id"] = new_streak.cumsum()
+    # Prefer stable grouping by show_id when available (avoids title casing/dup issues).
+    group_cols = ["show_id"] if "show_id" in d.columns else ["canonical_title"]
 
-    streaks = (
-        d.groupby("_streak_id", as_index=False)
-        .agg(
-            canonical_title=("canonical_title", "first"),
-            weeks=("week_ending_dt", "size"),
-            start_week_ending=("week_ending_dt", "min"),
-            end_week_ending=("week_ending_dt", "max"),
+    # Remove any accidental duplicates (a show should only appear once per week at a given rank).
+    d = d.drop_duplicates(subset=group_cols + ["week_ending_dt"])
+
+    out_parts: list[pd.DataFrame] = []
+    for _, g in d.groupby(group_cols, dropna=False):
+        g = g.sort_values("week_ending_dt").copy()
+
+        gap_days = g["week_ending_dt"].diff().dt.days
+        gap_ok = gap_days.between(*CONSECUTIVE_DAY_TOLERANCE)
+        new_streak = (~gap_ok).fillna(True)
+        g["_streak_id"] = new_streak.cumsum()
+
+        agg = (
+            g.groupby("_streak_id", as_index=False)
+            .agg(
+                canonical_title=("canonical_title", "first"),
+                weeks=("week_ending_dt", "size"),
+                start_week_ending=("week_ending_dt", "min"),
+                end_week_ending=("week_ending_dt", "max"),
+            )
         )
-        .sort_values(["weeks", "start_week_ending"], ascending=[False, True])
+        out_parts.append(agg)
+
+    if not out_parts:
+        return pd.DataFrame(columns=["canonical_title", "weeks", "start_week_ending", "end_week_ending"])
+
+    streaks = pd.concat(out_parts, ignore_index=True)
+    streaks = (
+        streaks.sort_values(["weeks", "start_week_ending", "canonical_title"], ascending=[False, True, True])
         .reset_index(drop=True)
     )
 
@@ -5003,10 +5025,66 @@ def _render_t10_rank_view(rank: int, title: str) -> None:
         st.markdown(f"#### Total weeks at #{rank} (Imprint 2)")
         t2 = _totals_table(df, "imprint_2", "imprint_2")
         st.dataframe(t2, use_container_width=True, hide_index=True)
+    
     with c1[2]:
         st.markdown(f"#### Total weeks at #{rank} (Show)")
-        ts = _totals_table(df, "canonical_title", "canonical_title")
-        st.dataframe(ts, use_container_width=True, hide_index=True)
+
+        # For #1 Shows (year-specific), also show "career #1s through that year".
+        if rank == 1 and year != "All":
+            if df.empty:
+                ts_disp = pd.DataFrame(
+                    columns=["canonical_title", "weeks", f"career_weeks_at_#{rank} (through {year})"]
+                )
+            else:
+                yd = df.copy()
+                if "show_id" in yd.columns:
+                    year_tot = (
+                        yd.dropna(subset=["show_id"])
+                        .groupby(["show_id", "canonical_title"], as_index=False)
+                        .size()
+                        .rename(columns={"size": "weeks"})
+                    )
+                else:
+                    year_tot = _totals_table(yd, "canonical_title", "canonical_title").rename(columns={"weeks": "weeks"})
+
+                # Career totals up through the end of the selected year.
+                try:
+                    y_int = int(str(year))
+                except Exception:
+                    y_int = None
+
+                career_tot = pd.DataFrame(columns=["show_id", "career_weeks"])
+                if y_int is not None and "show_id" in year_tot.columns:
+                    cutoff = f"{y_int + 1:04d}-01-01"
+                    career_tot = sql_df(
+                        """
+                        SELECT e.show_id, COUNT(*) AS career_weeks
+                        FROM t10_entry e
+                        WHERE e.rank = ?
+                          AND date(e.week_ending) < date(?)
+                        GROUP BY e.show_id
+                        """,
+                        (int(rank), cutoff),
+                    )
+
+                if "show_id" in year_tot.columns and not career_tot.empty:
+                    out = year_tot.merge(career_tot, on="show_id", how="left")
+                else:
+                    out = year_tot.copy()
+                    out["career_weeks"] = pd.NA
+
+                # If career_tot missing (or show_id unavailable), fall back to that year's weeks.
+                out["career_weeks"] = out["career_weeks"].fillna(out["weeks"]).astype("Int64")
+                out = out.sort_values(["weeks", "canonical_title"], ascending=[False, True]).reset_index(drop=True)
+
+                ts_disp = out[["canonical_title", "weeks", "career_weeks"]].rename(
+                    columns={"career_weeks": f"career_weeks_at_#{rank} (through {year})"}
+                )
+
+            st.dataframe(ts_disp, use_container_width=True, hide_index=True)
+        else:
+            ts = _totals_table(df, "canonical_title", "canonical_title")
+            st.dataframe(ts, use_container_width=True, hide_index=True)
 
 
 def tab_t10_chart_number_shows() -> None:
