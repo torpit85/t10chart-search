@@ -16,6 +16,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 import matplotlib.pyplot as plt
+import altair as alt
 
 from charts import chart_top_gross_weeks
 
@@ -719,33 +720,45 @@ def holiday_week_ending_for_date(all_week_endings: list[date], holiday_dt: date,
 
     Rules (week_ending dates are assumed to be Saturdays in your data):
     - Fixed-date holidays (New Year's, Valentine's, Independence Day, Halloween, Christmas):
-        * If the holiday is Sun/Mon/Tue -> use the previous weekend (Saturday before)
-        * If the holiday is Wed/Thu/Fri/Sat -> use the current holiday week (Saturday on/after)
-      Example: Christmas Day (12-25) on Monday -> use week_ending 12-23.
-      Example: Halloween (10-31) on Friday -> use week_ending 11-01.
-    - Thanksgiving: use the following week_ending (Saturday on/after Thanksgiving).
-    - Weekend/Monday-style holidays (Easter, Memorial Day, Labor Day, MLK Day, Presidents Day):
+        * If the holiday is Sun/Mon/Tue/Wed -> use the previous weekend (Saturday before)
+        * If the holiday is Thu/Fri/Sat     -> use the following weekend (Saturday on/after)
+      Example: Independence Day (07-04) on Thursday -> use week_ending 07-06.
+    - Thanksgiving: use the following week_ending (Saturday after Thanksgiving).
+      Example: Thanksgiving 11-23 -> use 11-25.
+    - Weekend/Monday holidays (Easter, Memorial Day, Labor Day, MLK Day, Presidents Day):
       use the weekend the holiday is part of (Saturday before).
-    - If the computed week_ending is not present in your database (missing charts / future weeks), return None.
+      Example: Easter 04-17 -> use 04-16.
+    - Fallback: if no prior/next exists (edge years), use the closest available week_ending.
     """
     if not all_week_endings:
         return None
 
-    weeks_set = set(all_week_endings)
+    weeks = sorted(all_week_endings)
 
-    def sat_on_or_before(d: date) -> date:
-        # Saturday=5 (Mon=0 ... Sun=6)
-        return d - timedelta(days=(d.weekday() - 5) % 7)
+    def prev_week_ending(d: date) -> Optional[date]:
+        prev = None
+        for we in weeks:
+            if we < d:
+                prev = we
+            else:
+                break
+        return prev
 
-    def sat_on_or_after(d: date) -> date:
-        return d + timedelta(days=(5 - d.weekday()) % 7)
+    def next_week_ending(d: date) -> Optional[date]:
+        for we in weeks:
+            if we >= d:
+                return we
+        return None
+
+    def closest_week_ending(d: date) -> date:
+        return min(weeks, key=lambda we: abs((we - d).days))
 
     name = (holiday_name or "").strip()
 
-    # Thanksgiving: always the following week ending (Saturday on/after)
+    # Thanksgiving: always the following week ending
     if name.startswith("Thanksgiving"):
-        target = sat_on_or_after(holiday_dt)
-        return target if target in weeks_set else None
+        we = next_week_ending(holiday_dt)
+        return we if we is not None else closest_week_ending(holiday_dt)
 
     # Weekend/Monday-style holidays: Saturday before
     if (
@@ -755,10 +768,10 @@ def holiday_week_ending_for_date(all_week_endings: list[date], holiday_dt: date,
         or name.startswith("Martin Luther King")
         or name.startswith("Presidents Day")
     ):
-        target = sat_on_or_before(holiday_dt)
-        return target if target in weeks_set else None
+        we = prev_week_ending(holiday_dt)
+        return we if we is not None else closest_week_ending(holiday_dt)
 
-    # Fixed-date holidays: previous vs current holiday week depends on weekday
+    # Fixed-date holidays: previous vs following weekend depends on weekday
     fixed = (
         name.startswith("New Year's Day")
         or name.startswith("Valentine's Day")
@@ -768,15 +781,22 @@ def holiday_week_ending_for_date(all_week_endings: list[date], holiday_dt: date,
     )
     if fixed:
         wd = holiday_dt.weekday()  # Mon=0 ... Sun=6
-        if wd in (6, 0, 1):  # Sun/Mon/Tue
-            target = sat_on_or_before(holiday_dt)
-        else:  # Wed/Thu/Fri/Sat
-            target = sat_on_or_after(holiday_dt)
-        return target if target in weeks_set else None
+        if wd in (6, 0, 1, 2):  # Sun/Mon/Tue/Wed
+            we = prev_week_ending(holiday_dt)
+            return we if we is not None else closest_week_ending(holiday_dt)
+        else:  # Thu/Fri/Sat
+            we = next_week_ending(holiday_dt)
+            return we if we is not None else closest_week_ending(holiday_dt)
 
-    # Default: treat as Saturday before (as-of holiday date)
-    target = sat_on_or_before(holiday_dt)
-    return target if target in weeks_set else None
+    # Default: previous chart as-of holiday date
+    we = prev_week_ending(holiday_dt)
+    return we if we is not None else closest_week_ending(holiday_dt)
+
+
+
+
+
+
 
 # ----------------------------
 # New tab: Monthly T-25 (SMPS)
@@ -2416,6 +2436,469 @@ def tab_grossing_trends():
             else:
                 st.dataframe(eras_df, use_container_width=True)
 
+
+def _show_years(show_id: int) -> list[str]:
+    df = sql_df(
+        "SELECT DISTINCT strftime('%Y', week_ending) AS y FROM t10_entry WHERE show_id=? ORDER BY y",
+        (int(show_id),),
+    )
+    if df is None or df.empty:
+        return []
+    ys = [str(y) for y in df["y"].dropna().astype(str).tolist()]
+    return ys
+
+
+@st.cache_data(show_spinner=False)
+def _fetch_show_trends_rows(show_id: int, year: str | None) -> pd.DataFrame:
+    """Base rows for a single show (chart weeks only)."""
+    params: list[Any] = [int(show_id)]
+    year_clause = ""
+    if year:
+        year_clause = " AND strftime('%Y', e.week_ending) = ?"
+        params.append(str(year))
+
+    df = sql_df(
+        f"""
+        SELECT
+          e.week_number,
+          date(e.week_ending) AS week_ending,
+          e.rank,
+          e.pos,
+          e.last_week,
+          s.canonical_title,
+          e.imprint_1,
+          e.imprint_2,
+          COALESCE(e.gross_millions, 0) AS base_gross_millions,
+          COALESCE(gb.bonus_millions, 0) AS bonus_millions,
+          (COALESCE(e.gross_millions, 0) + COALESCE(gb.bonus_millions, 0)) AS gross_millions
+        FROM t10_entry e
+        JOIN show s ON s.show_id = e.show_id
+        LEFT JOIN (
+          SELECT show_id, week_ending, SUM(bonus_millions) AS bonus_millions
+          FROM gross_bonus
+          GROUP BY show_id, week_ending
+        ) gb ON gb.show_id = e.show_id AND gb.week_ending = e.week_ending
+        WHERE e.show_id = ?
+        {year_clause}
+        ORDER BY e.week_number ASC, date(e.week_ending) ASC, e.rank ASC, e.pos ASC
+        """,
+        tuple(params),
+    )
+    if df is None or df.empty:
+        return pd.DataFrame(
+            columns=[
+                "week_number",
+                "week_ending",
+                "rank",
+                "pos",
+                "last_week",
+                "canonical_title",
+                "imprint_1",
+                "imprint_2",
+                "base_gross_millions",
+                "bonus_millions",
+                "gross_millions",
+            ]
+        )
+    df["week_ending"] = _as_date_str(df["week_ending"])
+    df["week_ending_dt"] = pd.to_datetime(df["week_ending"], errors="coerce")
+    df["week_number"] = pd.to_numeric(df["week_number"], errors="coerce")
+    df["rank"] = pd.to_numeric(df["rank"], errors="coerce")
+    df["pos"] = pd.to_numeric(df["pos"], errors="coerce")
+    df["base_gross_millions"] = pd.to_numeric(df["base_gross_millions"], errors="coerce").fillna(0.0)
+    df["bonus_millions"] = pd.to_numeric(df["bonus_millions"], errors="coerce").fillna(0.0)
+    df["gross_millions"] = pd.to_numeric(df["gross_millions"], errors="coerce").fillna(0.0)
+    return df
+
+
+@st.cache_data(show_spinner=False)
+def _fetch_top10_totals_by_week(year: str | None) -> pd.DataFrame:
+    """Top-10 total gross by week (includes bonuses)."""
+    params: list[Any] = []
+    year_clause = ""
+    if year:
+        year_clause = "WHERE strftime('%Y', e.week_ending) = ?"
+        params.append(str(year))
+
+    df = sql_df(
+        f"""
+        WITH bonus_by_row AS (
+          SELECT show_id, week_ending, SUM(bonus_millions) AS bonus_millions
+          FROM gross_bonus
+          GROUP BY show_id, week_ending
+        )
+        SELECT
+          date(e.week_ending) AS week_ending,
+          SUM(COALESCE(e.gross_millions,0) + COALESCE(b.bonus_millions,0)) AS top10_gross_millions
+        FROM t10_entry e
+        LEFT JOIN bonus_by_row b ON b.show_id = e.show_id AND b.week_ending = e.week_ending
+        {year_clause}
+        AND e.rank BETWEEN 1 AND 10
+        GROUP BY date(e.week_ending)
+        ORDER BY date(e.week_ending) ASC
+        """,
+        tuple(params),
+    )
+    if df is None or df.empty:
+        return pd.DataFrame(columns=["week_ending", "top10_gross_millions"])
+    df["week_ending"] = _as_date_str(df["week_ending"])
+    df["top10_gross_millions"] = pd.to_numeric(df["top10_gross_millions"], errors="coerce").fillna(0.0)
+    return df
+
+
+def _longest_run_masked(df: pd.DataFrame, mask: pd.Series) -> dict[str, Any] | None:
+    """Return longest consecutive run where mask==True; tie-friendly if mask defines membership."""
+    if df.empty or mask is None or len(df) == 0:
+        return None
+
+    g = df.sort_values(["week_number", "week_ending_dt"]).reset_index(drop=True).copy()
+    mask = mask.reset_index(drop=True).fillna(False)
+
+    # consecutive logic
+    if g["week_number"].notna().all():
+        cont = _consecutive_by_week_number(g["week_number"])
+    else:
+        cont = _consecutive_by_date(g["week_ending"])
+
+    best = {"len": 0, "start": None, "end": None}
+    cur_len = 0
+    cur_start = None
+
+    for i in range(len(g)):
+        if bool(mask.iloc[i]):
+            if cur_len == 0:
+                cur_len = 1
+                cur_start = g.loc[i, "week_ending"]
+            else:
+                if bool(cont.iloc[i]):
+                    cur_len += 1
+                else:
+                    # break run; start new
+                    cur_len = 1
+                    cur_start = g.loc[i, "week_ending"]
+            cur_end = g.loc[i, "week_ending"]
+            if cur_len > best["len"]:
+                best = {"len": int(cur_len), "start": cur_start, "end": cur_end}
+        else:
+            cur_len = 0
+            cur_start = None
+
+    return best if best["len"] > 0 else None
+
+
+def tab_show_trends():
+    st.header("Show Trends")
+    st.caption("Grossing + rank trends for a single show over time. (Altair charts; ties supported.)")
+
+    shows_df, _ = load_lists()
+    if shows_df is None or shows_df.empty:
+        st.info("No shows found.")
+        return
+
+    # Global controls
+    c1, c2, c3, c4 = st.columns([3, 1, 1, 1])
+
+    with c1:
+        title = st.selectbox(
+            "Show",
+            options=shows_df["canonical_title"].astype(str).tolist(),
+            index=0,
+            key="show_trends_title",
+        )
+        show_id = int(shows_df.loc[shows_df["canonical_title"] == title, "show_id"].iloc[0])
+
+    years = _show_years(show_id)
+    with c2:
+        year = st.selectbox("Year", ["All"] + years, index=0, key="show_trends_year")
+        year_val = None if year == "All" else year
+
+    with c3:
+        include_bonuses = st.checkbox("Include bonuses", value=True, key="show_trends_bonus")
+
+    with c4:
+        smoothing = st.selectbox("Smoothing", ["None", "4-week MA", "8-week MA"], index=0, key="show_trends_smooth")
+
+    df = _fetch_show_trends_rows(show_id, year_val)
+    if df.empty:
+        st.info("No chart rows for this selection.")
+        return
+
+    df["gross_use"] = df["gross_millions"] if include_bonuses else df["base_gross_millions"]
+
+    # Smoothing
+    win = 0
+    if smoothing.startswith("4"):
+        win = 4
+    elif smoothing.startswith("8"):
+        win = 8
+    if win > 0:
+        df["gross_ma"] = df["gross_use"].rolling(win, min_periods=1).mean()
+    else:
+        df["gross_ma"] = np.nan
+
+    subtabs = st.tabs(["Trend", "Momentum", "Runs & peaks", "Context"])
+
+    # ----------------------------
+    # Trend
+    # ----------------------------
+    with subtabs[0]:
+        # KPIs
+        peak_idx = int(df["gross_use"].idxmax())
+        peak_week = df.loc[peak_idx, "week_ending"]
+        peak_value = float(df.loc[peak_idx, "gross_use"])
+        total_gross = float(df["gross_use"].sum())
+        avg_gross = float(df["gross_use"].mean()) if len(df) else 0.0
+        weeks_charted = int(df["week_ending"].nunique())
+        n1_weeks = int((df["rank"] == 1).sum())
+        top3_weeks = int((df["rank"] <= 3).sum())
+
+        k1, k2, k3, k4, k5, k6 = st.columns(6)
+        k1.metric("Peak week", f"{peak_week}")
+        k2.metric("Peak gross", f"{peak_value:,.1f}")
+        k3.metric("Total gross", f"{total_gross:,.1f}")
+        k4.metric("Avg gross", f"{avg_gross:,.1f}")
+        k5.metric("Weeks charted", f"{weeks_charted}")
+        k6.metric("#1 / Top-3 weeks", f"{n1_weeks} / {top3_weeks}")
+
+        # Line chart (gross over time + optional MA)
+        plot_df = df.dropna(subset=["week_ending_dt"]).copy()
+        base_line = (
+            alt.Chart(plot_df)
+            .mark_line()
+            .encode(
+                x=alt.X("week_ending_dt:T", title="Week ending"),
+                y=alt.Y("gross_use:Q", title="Gross (millions)"),
+                tooltip=[
+                    alt.Tooltip("week_ending:N", title="Week"),
+                    alt.Tooltip("week_number:Q", title="Week #"),
+                    alt.Tooltip("rank:Q", title="Rank"),
+                    alt.Tooltip("pos:Q", title="Pos"),
+                    alt.Tooltip("gross_use:Q", title="Gross", format=",.1f"),
+                ],
+            )
+        )
+        layers = [base_line]
+        if win > 0:
+            ma_line = (
+                alt.Chart(plot_df)
+                .mark_line(strokeDash=[4, 4])
+                .encode(
+                    x="week_ending_dt:T",
+                    y=alt.Y("gross_ma:Q", title="Gross (millions)"),
+                    tooltip=[
+                        alt.Tooltip("week_ending:N", title="Week"),
+                        alt.Tooltip("gross_ma:Q", title=f"{win}-wk MA", format=",.1f"),
+                    ],
+                )
+            )
+            layers.append(ma_line)
+
+        st.altair_chart(alt.layer(*layers).interactive(), use_container_width=True)
+
+        # Weekly detail table
+        cols = [
+            "week_number",
+            "week_ending",
+            "rank",
+            "pos",
+            "last_week",
+            "canonical_title",
+            "imprint_1",
+            "imprint_2",
+            "base_gross_millions",
+            "bonus_millions",
+            "gross_use",
+        ]
+        out = df[cols].copy()
+        out = out.rename(columns={"gross_use": "gross_millions (selected)"})
+        st.dataframe(out, use_container_width=True, hide_index=True)
+
+    # ----------------------------
+    # Momentum
+    # ----------------------------
+    with subtabs[1]:
+        g = df.sort_values(["week_number", "week_ending_dt"]).reset_index(drop=True).copy()
+        g["prev_gross"] = g["gross_use"].shift(1)
+        g["delta"] = g["gross_use"] - g["prev_gross"]
+        g["delta_pct"] = np.where(g["prev_gross"] > 0, g["delta"] / g["prev_gross"], np.nan)
+
+        def _top(df_in: pd.DataFrame, col: str, n: int = 10, asc: bool = False) -> pd.DataFrame:
+            d2 = df_in.dropna(subset=[col]).copy()
+            if d2.empty:
+                return d2
+            return d2.sort_values(col, ascending=asc).head(n)
+
+        st.markdown("### Biggest week-over-week % gains")
+        st.dataframe(
+            _top(g[g["delta_pct"] > 0], "delta_pct", 10, asc=False)[
+                ["week_number", "week_ending", "rank", "pos", "gross_use", "prev_gross", "delta_pct", "delta"]
+            ],
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        st.markdown("### Biggest week-over-week % drops")
+        st.dataframe(
+            _top(g[g["delta_pct"] < 0], "delta_pct", 10, asc=True)[
+                ["week_number", "week_ending", "rank", "pos", "gross_use", "prev_gross", "delta_pct", "delta"]
+            ],
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        st.markdown("### Biggest absolute gains")
+        st.dataframe(
+            _top(g[g["delta"] > 0], "delta", 10, asc=False)[
+                ["week_number", "week_ending", "rank", "pos", "gross_use", "prev_gross", "delta", "delta_pct"]
+            ],
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        st.markdown("### Biggest absolute drops")
+        st.dataframe(
+            _top(g[g["delta"] < 0], "delta", 10, asc=True)[
+                ["week_number", "week_ending", "rank", "pos", "gross_use", "prev_gross", "delta", "delta_pct"]
+            ],
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        # Streaks: longest up/down streak (by delta sign)
+        up_run = _longest_run_masked(g, g["delta"] > 0)
+        down_run = _longest_run_masked(g, g["delta"] < 0)
+
+        s1, s2 = st.columns(2)
+        with s1:
+            st.markdown("### Longest up-streak")
+            if up_run:
+                st.write(f"{up_run['len']} weeks ({up_run['start']} → {up_run['end']})")
+            else:
+                st.write("—")
+        with s2:
+            st.markdown("### Longest down-streak")
+            if down_run:
+                st.write(f"{down_run['len']} weeks ({down_run['start']} → {down_run['end']})")
+            else:
+                st.write("—")
+
+    # ----------------------------
+    # Runs & peaks
+    # ----------------------------
+    with subtabs[2]:
+        # Longest consecutive charted run (all rows)
+        run_all = _longest_run_masked(df, pd.Series([True] * len(df)))
+        if run_all:
+            st.markdown("### Longest consecutive charted run")
+            st.write(f"{run_all['len']} weeks ({run_all['start']} → {run_all['end']})")
+
+        # Longest consecutive #1 run (tie-friendly: rank==1, pos irrelevant)
+        run_n1 = _longest_run_masked(df, df["rank"] == 1)
+        st.markdown("### Longest consecutive #1 run (tie-friendly)")
+        if run_n1:
+            st.write(f"{run_n1['len']} weeks ({run_n1['start']} → {run_n1['end']})")
+        else:
+            st.write("—")
+
+        st.markdown("### Top 10 peak weeks (by gross)")
+        top10 = df.sort_values("gross_use", ascending=False).head(10)[
+            ["week_number", "week_ending", "rank", "pos", "base_gross_millions", "bonus_millions", "gross_use"]
+        ].copy()
+        st.dataframe(top10.rename(columns={"gross_use": "gross_millions (selected)"}), use_container_width=True, hide_index=True)
+
+        # Aggregates
+        g = df.dropna(subset=["week_ending_dt"]).copy()
+        g["year"] = g["week_ending_dt"].dt.year
+        g["month"] = g["week_ending_dt"].dt.to_period("M").astype(str)
+
+        st.markdown("### Top months")
+        top_months = (
+            g.groupby("month", as_index=False)["gross_use"].sum()
+            .sort_values("gross_use", ascending=False)
+            .head(12)
+            .rename(columns={"gross_use": "gross_millions (selected)"})
+        )
+        st.dataframe(top_months, use_container_width=True, hide_index=True)
+
+        st.markdown("### Top years")
+        top_years = (
+            g.groupby("year", as_index=False)["gross_use"].sum()
+            .sort_values("gross_use", ascending=False)
+            .rename(columns={"gross_use": "gross_millions (selected)"})
+        )
+        st.dataframe(top_years, use_container_width=True, hide_index=True)
+
+    # ----------------------------
+    # Context
+    # ----------------------------
+    with subtabs[3]:
+        # Share of Top 10 each week
+        top10_tot = _fetch_top10_totals_by_week(year_val)
+        ctx = df.merge(top10_tot, on="week_ending", how="left")
+        ctx["top10_gross_millions"] = pd.to_numeric(ctx["top10_gross_millions"], errors="coerce").fillna(0.0)
+
+        if include_bonuses:
+            ctx["share_top10"] = np.where(ctx["top10_gross_millions"] > 0, ctx["gross_millions"] / ctx["top10_gross_millions"], np.nan)
+        else:
+            # If bonuses are excluded for the show, compare to Top-10 base only
+            base_top10 = sql_df(
+                f"""
+                SELECT date(week_ending) AS week_ending, SUM(COALESCE(gross_millions,0)) AS top10_base_gross
+                FROM t10_entry
+                WHERE rank BETWEEN 1 AND 10
+                {("AND strftime('%Y', week_ending) = ?" if year_val else "")}
+                GROUP BY date(week_ending)
+                ORDER BY date(week_ending) ASC
+                """,
+                tuple([year_val] if year_val else []),
+            )
+            if base_top10 is None or base_top10.empty:
+                base_top10 = pd.DataFrame(columns=["week_ending", "top10_base_gross"])
+            base_top10["week_ending"] = _as_date_str(base_top10["week_ending"])
+            base_top10["top10_base_gross"] = pd.to_numeric(base_top10["top10_base_gross"], errors="coerce").fillna(0.0)
+            ctx = ctx.drop(columns=["top10_gross_millions"]).merge(base_top10, on="week_ending", how="left")
+            ctx["top10_base_gross"] = pd.to_numeric(ctx["top10_base_gross"], errors="coerce").fillna(0.0)
+            ctx["share_top10"] = np.where(ctx["top10_base_gross"] > 0, ctx["base_gross_millions"] / ctx["top10_base_gross"], np.nan)
+
+        st.markdown("### Share of Top 10 each week")
+        share_plot = ctx.dropna(subset=["week_ending_dt"]).copy()
+        share_plot["share_top10"] = pd.to_numeric(share_plot["share_top10"], errors="coerce")
+        st.altair_chart(
+            alt.Chart(share_plot)
+            .mark_line()
+            .encode(
+                x=alt.X("week_ending_dt:T", title="Week ending"),
+                y=alt.Y("share_top10:Q", title="Share of Top 10"),
+                tooltip=[
+                    alt.Tooltip("week_ending:N", title="Week"),
+                    alt.Tooltip("share_top10:Q", title="Share", format=".3f"),
+                ],
+            )
+            .interactive(),
+            use_container_width=True,
+        )
+
+        st.markdown("### Rank vs gross")
+        scatter = df.dropna(subset=["rank"]).copy()
+        scatter["rank"] = pd.to_numeric(scatter["rank"], errors="coerce")
+        scatter["gross_use"] = pd.to_numeric(scatter["gross_use"], errors="coerce")
+        st.altair_chart(
+            alt.Chart(scatter)
+            .mark_circle()
+            .encode(
+                x=alt.X("gross_use:Q", title="Gross (millions)"),
+                y=alt.Y("rank:Q", title="Rank", scale=alt.Scale(reverse=True)),
+                tooltip=[
+                    alt.Tooltip("week_ending:N", title="Week"),
+                    alt.Tooltip("rank:Q", title="Rank"),
+                    alt.Tooltip("gross_use:Q", title="Gross", format=",.1f"),
+                ],
+            )
+            .interactive(),
+            use_container_width=True,
+        )
+
+
 def tab_search():
     st.subheader("Search")
     with st.sidebar:
@@ -3549,15 +4032,6 @@ def tab_holidays():
         hdt = maker(y)
         we = holiday_week_ending_for_date(week_endings, hdt, holiday_name)
         if we is None:
-            rows_out.append({
-                "year": y,
-                "holiday_date": hdt.isoformat(),
-                "week_ending": None,
-                "#1_show(s)": None,
-                "imprint_1": None,
-                "imprint_2": None,
-                "gross_millions_sum": None,
-            })
             continue
 
         we_str = we.isoformat()
@@ -3615,15 +4089,9 @@ def tab_holidays():
         })
 
     out = pd.DataFrame(rows_out).sort_values("year")
+    st.dataframe(out, use_container_width=True)
 
-    disp = out.copy()
-    for c in ["week_ending", "#1_show(s)", "imprint_1", "imprint_2", "gross_millions_sum"]:
-        if c in disp.columns:
-            disp[c] = disp[c].where(disp[c].notna(), "—")
-
-    st.dataframe(disp, use_container_width=True)
-
-    miss = out[(out["week_ending"].notna()) & (out["#1_show(s)"].isna())].shape[0] if not out.empty else 0
+    miss = out["#1_show(s)"].isna().sum() if not out.empty else 0
     if miss:
         st.warning(
             f"{miss} year(s) had no #1 record for the computed holiday-week. "
@@ -3633,9 +4101,9 @@ def tab_holidays():
     with st.expander("How the holiday week is chosen"):
         st.write(
             "- Fixed-date holidays (New Year's, Valentine's, Independence Day, Halloween, Christmas):\n"
-            "  - Sun/Mon/Tue → previous week (Saturday before)\n"
-            "  - Wed/Thu/Fri/Sat → current week (Saturday on/after)\n"
-            "- Thanksgiving → current week (Saturday on/after)\n"
+            "  - Sun/Mon/Tue/Wed → previous weekend (Saturday before)\n"
+            "  - Thu/Fri/Sat → following weekend (Saturday on/after)\n"
+            "- Thanksgiving → following week ending (Saturday after)\n"
             "- Easter/Memorial Day/Labor Day/MLK Day/Presidents Day → Saturday before\n"
         )
 
@@ -4848,7 +5316,7 @@ def tab_records_achievements():
 # ----------------------------
 
 # ----------------------------
-# T-10 Chart #1/#2 Shows
+# T-10 Chart #1 Shows
 # ----------------------------
 def _t10_rank_years(rank: int) -> list[str]:
     dfy = sql_df(
@@ -5143,10 +5611,11 @@ def main():
         "Monthly T-25 (SMPS)",
         "Grossing Milestones",
         "Grossing Trends",
+        "Show Trends",
+        "T-10 Chart #1 Shows",
         "Streak Analytics",
         "Holidays",
         "Records and Achievements",
-        "T-10 Chart #1 Shows",
         "Admin",
     ])
 
@@ -5169,14 +5638,16 @@ def main():
     with tabs[8]:
         tab_grossing_trends()
     with tabs[9]:
-        tab_streak_analytics()
+        tab_show_trends()
     with tabs[10]:
-        tab_holidays()
-    with tabs[11]:
-        tab_records_achievements()
-    with tabs[12]:
         tab_t10_chart_number_shows()
+    with tabs[11]:
+        tab_streak_analytics()
+    with tabs[12]:
+        tab_holidays()
     with tabs[13]:
+        tab_records_achievements()
+    with tabs[14]:
         tab_admin()
 
 
