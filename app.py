@@ -922,11 +922,14 @@ def _compute_show_month_metrics(db_path: str, db_mtime: float, include_bonuses: 
             }
         )
 
-    agg = (
-        base.groupby(["month", "month_ord", "show_id", "canonical_title", "imprint_1", "imprint_2"], as_index=False)
-        .apply(_agg_one)
-        .reset_index(drop=True)
-    )
+    grp = base.groupby(["month", "month_ord", "show_id", "canonical_title", "imprint_1", "imprint_2"], as_index=False)
+    try:
+        # pandas >=2.2 warns that grouping columns will be excluded; this opts into the future behavior.
+        agg = grp.apply(_agg_one, include_groups=False)
+    except TypeError:
+        # pandas <2.2 doesn't support include_groups
+        agg = grp.apply(_agg_one)
+    agg = agg.reset_index(drop=True)
 
     # Prev-month gross per show
     agg = agg.sort_values(["show_id", "month_ord"]).reset_index(drop=True)
@@ -1339,6 +1342,7 @@ def tab_monthly_smps_t25():
         cnt_before.update(cdf["show_id"].astype(int).tolist())
 
     disp["Last Mo Pos"] = disp["show_id"].astype(int).apply(lambda sid: prev_pos_map.get(int(sid)))
+    disp["Last Mo Pos"] = disp["Last Mo Pos"].astype("object")  # allow NEW/RE strings
     disp["Months on Chart"] = disp["show_id"].astype(int).map(cnt_before).fillna(0).astype(int) + 1
 
     # NEW/RE flags folded into Last Mo Pos: if not on last month, NEW if first-ever appearance; else RE
@@ -1397,7 +1401,7 @@ def tab_monthly_smps_t25():
                 "heat_raw": "HeatRaw",
             }
         ),
-        use_container_width=True,
+        width='stretch',
         hide_index=True,
     )
 
@@ -1676,7 +1680,7 @@ def tab_grossing_milestones():
 
     st.dataframe(
         one[["milestone", "week_ending", "cumulative_gross_millions", "week_gross_millions"]],
-        use_container_width=True,
+        width='stretch',
         hide_index=True,
     )
 
@@ -1718,7 +1722,7 @@ def tab_grossing_milestones():
     st.caption(f"Shows that first reached {fmt_int(pick_big)} gross_millions (earliest first).")
     st.dataframe(
         hit[["canonical_title", "week_ending", "cumulative_gross_millions", "week_gross_millions"]],
-        use_container_width=True,
+        width='stretch',
         hide_index=True,
     )
     st.write(f"Count: **{len(hit):,}**")
@@ -1911,7 +1915,7 @@ def tab_grossing_trends():
 
             with st.expander("Seasonality table"):
                 show_tbl = month_stats[["month_name", "avg", "median", "n"]].rename(columns={"month_name": "Month", "avg": "Avg", "median": "Median", "n": "Weeks"})
-                st.dataframe(show_tbl, use_container_width=True)
+                st.dataframe(show_tbl, width='stretch')
 
         st.markdown("### Position decay curves (gross by rank)")
         if df_top10.empty:
@@ -1932,7 +1936,7 @@ def tab_grossing_trends():
             st.pyplot(fig, clear_figure=True)
 
             with st.expander("Position decay table"):
-                st.dataframe(pos_stats, use_container_width=True)
+                st.dataframe(pos_stats, width='stretch')
 
         st.markdown("### Volatility index")
         if not weekly_total.empty:
@@ -2023,14 +2027,14 @@ def tab_grossing_trends():
                     ["canonical_title", "week_ending_dt", "prev_gross", "gross_use", "pct_change"]
                 ].copy()
                 tbl["week_ending_dt"] = tbl["week_ending_dt"].dt.date
-                st.dataframe(tbl, use_container_width=True)
+                st.dataframe(tbl, width='stretch')
 
                 st.markdown("#### Biggest week-over-week $ gains")
                 tbl = show_week.sort_values("abs_change", ascending=False).head(topn)[
                     ["canonical_title", "week_ending_dt", "prev_gross", "gross_use", "abs_change"]
                 ].copy()
                 tbl["week_ending_dt"] = tbl["week_ending_dt"].dt.date
-                st.dataframe(tbl, use_container_width=True)
+                st.dataframe(tbl, width='stretch')
 
             with c2:
                 st.markdown("#### Biggest week-over-week drops")
@@ -2038,7 +2042,7 @@ def tab_grossing_trends():
                     ["canonical_title", "week_ending_dt", "prev_gross", "gross_use", "abs_change"]
                 ].copy()
                 tbl["week_ending_dt"] = tbl["week_ending_dt"].dt.date
-                st.dataframe(tbl, use_container_width=True)
+                st.dataframe(tbl, width='stretch')
 
                 st.markdown("#### Biggest 4-appearance moves (net change)")
                 show_week["gross_4_ago"] = show_week.groupby("show_id")["gross_use"].shift(4)
@@ -2047,7 +2051,7 @@ def tab_grossing_trends():
                     ["canonical_title", "week_ending_dt", "gross_4_ago", "gross_use", "net_4"]
                 ].copy()
                 tbl["week_ending_dt"] = tbl["week_ending_dt"].dt.date
-                st.dataframe(tbl, use_container_width=True)
+                st.dataframe(tbl, width='stretch')
 
             st.markdown("#### Hot shows right now (slope over last N appearances)")
             window_n = st.slider("N appearances", min_value=3, max_value=20, value=6, step=1, key="trends_hot_n")
@@ -2065,7 +2069,7 @@ def tab_grossing_trends():
                     continue
                 slopes.append({"show_id": sid, "canonical_title": title, "slope": slope, "last_week": gg["week_ending_dt"].iloc[-1].date()})
             slope_df = pd.DataFrame(slopes).sort_values("slope", ascending=False).head(topn)
-            st.dataframe(slope_df, use_container_width=True)
+            st.dataframe(slope_df, width='stretch')
 
             st.markdown("#### Rebounders (big drop then recovery next appearance)")
             drop_thr = st.number_input("Drop threshold (absolute)", min_value=0.0, value=5.0, step=0.5, key="trends_drop_thr")
@@ -2089,7 +2093,7 @@ def tab_grossing_trends():
                                 "rebound_change": g.loc[i + 1, "abs_change"],
                             })
             reb_df = pd.DataFrame(rebounds).sort_values(["drop_week", "canonical_title"], ascending=[False, True]).head(topn)
-            st.dataframe(reb_df, use_container_width=True)
+            st.dataframe(reb_df, width='stretch')
 
     # ----------------------------
     # Longevity
@@ -2147,7 +2151,7 @@ def tab_grossing_trends():
                 st.pyplot(fig, clear_figure=True)
 
                 with st.expander("Peak table (top 200 by peak gross)"):
-                    st.dataframe(peaks.sort_values("peak_gross", ascending=False).head(200), use_container_width=True)
+                    st.dataframe(peaks.sort_values("peak_gross", ascending=False).head(200), width='stretch')
 
                 # Half-life
                 half_rows = []
@@ -2175,7 +2179,7 @@ def tab_grossing_trends():
                     st.pyplot(fig, clear_figure=True)
 
                     with st.expander("Half-life table (top 200 slowest to decay)"):
-                        st.dataframe(half_df.sort_values("weeks_to_half", ascending=False).head(200), use_container_width=True)
+                        st.dataframe(half_df.sort_values("weeks_to_half", ascending=False).head(200), width='stretch')
 
     # ----------------------------
     # Market Structure
@@ -2234,7 +2238,7 @@ def tab_grossing_trends():
         with st.expander("Newest shows (top 200)"):
             newest = df_first.sort_values("first_week", ascending=False).head(200)
             newest["first_week"] = newest["first_week"].dt.date
-            st.dataframe(newest[["canonical_title", "first_week"]], use_container_width=True)
+            st.dataframe(newest[["canonical_title", "first_week"]], width='stretch')
 
     # ----------------------------
     # Imprints / Companies
@@ -2288,7 +2292,7 @@ def tab_grossing_trends():
             share_tbl = (totals / totals.sum()).reset_index()
             share_tbl.columns = ["Imprint", "Share"]
             share_tbl["TotalGross"] = totals.reset_index(drop=True)
-            st.dataframe(share_tbl.head(50), use_container_width=True)
+            st.dataframe(share_tbl.head(50), width='stretch')
 
             st.markdown("#### Imprint momentum (last 13 weeks vs prior 13)")
             w = 13
@@ -2303,7 +2307,7 @@ def tab_grossing_trends():
                 mom = pd.DataFrame({"last13": last, "prev13": prev}).fillna(0.0)
                 mom["change"] = mom["last13"] - mom["prev13"]
                 mom = mom.sort_values("change", ascending=False).reset_index()
-                st.dataframe(mom.head(50), use_container_width=True)
+                st.dataframe(mom.head(50), width='stretch')
             else:
                 st.info("Not enough weeks for 13+13 momentum window.")
 
@@ -2341,7 +2345,7 @@ def tab_grossing_trends():
             hits["top3_rate"] = hits["top3_entries"] / hits["entries"].replace(0, np.nan)
             hits["n1_rate"] = hits["n1_entries"] / hits["entries"].replace(0, np.nan)
             hits = hits.fillna(0.0).sort_values("entries", ascending=False).reset_index()
-            st.dataframe(hits.head(50), use_container_width=True)
+            st.dataframe(hits.head(50), width='stretch')
 
     # ----------------------------
     # Anomalies & Eras
@@ -2379,7 +2383,7 @@ def tab_grossing_trends():
                 out_disp = out.head(50).copy()
                 out_disp["week"] = out_disp["week"].dt.date
                 out_disp["top_contributors"] = contrib + [""] * max(0, len(out_disp) - len(contrib))
-                st.dataframe(out_disp, use_container_width=True)
+                st.dataframe(out_disp, width='stretch')
 
         st.markdown("### Era detection (heuristic change points)")
         st.caption("Detects large sustained shifts in average total gross using a lookback/lookahead window. This is a heuristic, not a statistical guarantee.")
@@ -2434,161 +2438,167 @@ def tab_grossing_trends():
             if eras_df.empty:
                 st.info("No eras detected at current settings.")
             else:
-                st.dataframe(eras_df, use_container_width=True)
+                st.dataframe(eras_df, width='stretch')
+
 
 
 def _show_years(show_id: int) -> list[str]:
+    """Return sorted list of years where the show appears on the chart."""
     df = sql_df(
-        "SELECT DISTINCT strftime('%Y', week_ending) AS y FROM t10_entry WHERE show_id=? ORDER BY y",
+        """
+        SELECT DISTINCT strftime('%Y', week_ending) AS y
+        FROM t10_entry
+        WHERE show_id = ?
+        ORDER BY y
+        """,
         (int(show_id),),
     )
-    if df is None or df.empty:
-        return []
-    ys = [str(y) for y in df["y"].dropna().astype(str).tolist()]
-    return ys
+    years = (
+        df["y"]
+        .astype("string")
+        .dropna()
+        .str.strip()
+        .loc[lambda s: s != ""]
+        .tolist()
+    )
+    return years
 
 
-@st.cache_data(show_spinner=False)
 def _fetch_show_trends_rows(show_id: int, year: str | None) -> pd.DataFrame:
-    """Base rows for a single show (chart weeks only)."""
-    params: list[Any] = [int(show_id)]
-    year_clause = ""
-    if year:
-        year_clause = " AND strftime('%Y', e.week_ending) = ?"
-        params.append(str(year))
+    """Fetch show chart rows for Show trends tab.
 
-    df = sql_df(
-        f"""
+    Returns:
+      week_number, week_ending, rank, pos, last_week,
+      canonical_title, imprint_1, imprint_2,
+      base_gross_millions, bonus_millions, gross_millions
+    """
+    sql = """
         SELECT
+          e.show_id,
+          e.week_ending,
           e.week_number,
-          date(e.week_ending) AS week_ending,
           e.rank,
           e.pos,
           e.last_week,
           s.canonical_title,
           e.imprint_1,
           e.imprint_2,
-          COALESCE(e.gross_millions, 0) AS base_gross_millions,
+          e.gross_millions AS base_gross_millions,
           COALESCE(gb.bonus_millions, 0) AS bonus_millions,
-          (COALESCE(e.gross_millions, 0) + COALESCE(gb.bonus_millions, 0)) AS gross_millions
+          (e.gross_millions + COALESCE(gb.bonus_millions, 0)) AS gross_millions
         FROM t10_entry e
         JOIN show s ON s.show_id = e.show_id
         LEFT JOIN (
           SELECT show_id, week_ending, SUM(bonus_millions) AS bonus_millions
           FROM gross_bonus
           GROUP BY show_id, week_ending
-        ) gb ON gb.show_id = e.show_id AND gb.week_ending = e.week_ending
+        ) gb ON gb.show_id = e.show_id AND date(gb.week_ending) = date(e.week_ending)
         WHERE e.show_id = ?
-        {year_clause}
-        ORDER BY e.week_number ASC, date(e.week_ending) ASC, e.rank ASC, e.pos ASC
-        """,
-        tuple(params),
-    )
-    if df is None or df.empty:
-        return pd.DataFrame(
-            columns=[
-                "week_number",
-                "week_ending",
-                "rank",
-                "pos",
-                "last_week",
-                "canonical_title",
-                "imprint_1",
-                "imprint_2",
-                "base_gross_millions",
-                "bonus_millions",
-                "gross_millions",
-            ]
-        )
+    """
+    params: list[Any] = [int(show_id)]
+    if year is not None:
+        sql += " AND strftime('%Y', e.week_ending) = ? "
+        params.append(str(year))
+    sql += " ORDER BY date(e.week_ending) ASC, e.pos ASC "
+    df = sql_df(sql, tuple(params))
+    if df.empty:
+        return df
+
+    # Normalize types
     df["week_ending"] = _as_date_str(df["week_ending"])
+    df["week_number"] = pd.to_numeric(df["week_number"], errors="coerce").astype("Int64")
+    df["rank"] = pd.to_numeric(df["rank"], errors="coerce").astype("Int64")
+    df["pos"] = pd.to_numeric(df["pos"], errors="coerce").astype("Int64")
+    for c in ["base_gross_millions", "bonus_millions", "gross_millions"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
+
+    # Datetime for charts
     df["week_ending_dt"] = pd.to_datetime(df["week_ending"], errors="coerce")
-    df["week_number"] = pd.to_numeric(df["week_number"], errors="coerce")
-    df["rank"] = pd.to_numeric(df["rank"], errors="coerce")
-    df["pos"] = pd.to_numeric(df["pos"], errors="coerce")
-    df["base_gross_millions"] = pd.to_numeric(df["base_gross_millions"], errors="coerce").fillna(0.0)
-    df["bonus_millions"] = pd.to_numeric(df["bonus_millions"], errors="coerce").fillna(0.0)
-    df["gross_millions"] = pd.to_numeric(df["gross_millions"], errors="coerce").fillna(0.0)
     return df
 
 
-@st.cache_data(show_spinner=False)
-def _fetch_top10_totals_by_week(year: str | None) -> pd.DataFrame:
-    """Top-10 total gross by week (includes bonuses)."""
-    params: list[Any] = []
-    year_clause = ""
-    if year:
-        year_clause = "WHERE strftime('%Y', e.week_ending) = ?"
-        params.append(str(year))
-
-    df = sql_df(
-        f"""
-        WITH bonus_by_row AS (
+def _fetch_top10_totals_by_week(year: int | None) -> pd.DataFrame:
+    """Return Top-10 total gross (weekly) including bonuses, for Show Trends Context tab."""
+    sql = """
+        SELECT
+          date(e.week_ending) AS week_ending,
+          SUM(e.gross_millions + COALESCE(gb.bonus_millions, 0)) AS top10_gross_millions
+        FROM t10_entry e
+        LEFT JOIN (
           SELECT show_id, week_ending, SUM(bonus_millions) AS bonus_millions
           FROM gross_bonus
           GROUP BY show_id, week_ending
-        )
-        SELECT
-          date(e.week_ending) AS week_ending,
-          SUM(COALESCE(e.gross_millions,0) + COALESCE(b.bonus_millions,0)) AS top10_gross_millions
-        FROM t10_entry e
-        LEFT JOIN bonus_by_row b ON b.show_id = e.show_id AND b.week_ending = e.week_ending
-        {year_clause}
-        AND e.rank BETWEEN 1 AND 10
+        ) gb ON gb.show_id = e.show_id AND date(gb.week_ending) = date(e.week_ending)
+        WHERE e.rank BETWEEN 1 AND 10
+    """
+    params: list[Any] = []
+    if year is not None:
+        sql += " AND strftime('%Y', e.week_ending) = ? "
+        params.append(str(year))
+    sql += """
         GROUP BY date(e.week_ending)
         ORDER BY date(e.week_ending) ASC
-        """,
-        tuple(params),
-    )
+    """
+    df = sql_df(sql, tuple(params) if params else None)
     if df is None or df.empty:
         return pd.DataFrame(columns=["week_ending", "top10_gross_millions"])
     df["week_ending"] = _as_date_str(df["week_ending"])
     df["top10_gross_millions"] = pd.to_numeric(df["top10_gross_millions"], errors="coerce").fillna(0.0)
     return df
 
+def _longest_run_masked(df: pd.DataFrame, mask: pd.Series) -> dict[str, object] | None:
+    """Return the longest consecutive-week run where mask is True.
 
-def _longest_run_masked(df: pd.DataFrame, mask: pd.Series) -> dict[str, Any] | None:
-    """Return longest consecutive run where mask==True; tie-friendly if mask defines membership."""
-    if df.empty or mask is None or len(df) == 0:
+    Consecutive weeks are defined as week_ending dates exactly 7 days apart.
+    Returns a dict with keys: len, start, end.
+    """
+    if df is None or df.empty:
         return None
 
-    g = df.sort_values(["week_number", "week_ending_dt"]).reset_index(drop=True).copy()
-    mask = mask.reset_index(drop=True).fillna(False)
+    d = df.copy()
+    # Ensure datetime column exists
+    if "week_ending_dt" not in d.columns:
+        d["week_ending_dt"] = pd.to_datetime(d["week_ending"], errors="coerce")
 
-    # consecutive logic
-    if g["week_number"].notna().all():
-        cont = _consecutive_by_week_number(g["week_number"])
-    else:
-        cont = _consecutive_by_date(g["week_ending"])
+    m = mask.reindex(d.index) if hasattr(mask, "reindex") else pd.Series(mask, index=d.index)
+    d = d[m.fillna(False)].copy()
+    d = d.dropna(subset=["week_ending_dt"]).sort_values("week_ending_dt").reset_index(drop=True)
+    if d.empty:
+        return None
 
-    best = {"len": 0, "start": None, "end": None}
-    cur_len = 0
-    cur_start = None
+    gap = d["week_ending_dt"].diff().dt.days
+    new_run = (gap != 7).fillna(True)
+    run_id = new_run.cumsum()
 
-    for i in range(len(g)):
-        if bool(mask.iloc[i]):
-            if cur_len == 0:
-                cur_len = 1
-                cur_start = g.loc[i, "week_ending"]
-            else:
-                if bool(cont.iloc[i]):
-                    cur_len += 1
-                else:
-                    # break run; start new
-                    cur_len = 1
-                    cur_start = g.loc[i, "week_ending"]
-            cur_end = g.loc[i, "week_ending"]
-            if cur_len > best["len"]:
-                best = {"len": int(cur_len), "start": cur_start, "end": cur_end}
-        else:
-            cur_len = 0
-            cur_start = None
-
-    return best if best["len"] > 0 else None
-
+    # Put the grouping key on the DataFrame to avoid future pandas behavior changes/warnings.
+    d["_run_id"] = run_id.to_numpy()
+    runs = (
+        d.groupby("_run_id", as_index=False)
+         .agg(start=("week_ending_dt", "min"), end=("week_ending_dt", "max"), n=("week_ending_dt", "count"))
+         .sort_values(["n", "start"], ascending=[False, True])
+    )
+    best = runs.iloc[0]
+    return {
+        "len": int(best["n"]),
+        "start": best["start"].date().isoformat(),
+        "end": best["end"].date().isoformat(),
+    }
 
 def tab_show_trends():
     st.header("Show Trends")
     st.caption("Grossing + rank trends for a single show over time. (Altair charts; ties supported.)")
+
+    st.markdown(
+        """
+        <style>
+        /* Show Trends KPI: smaller metric text */
+        .showtrends-metrics div[data-testid="stMetricValue"] { font-size: 1rem; }
+        .showtrends-metrics div[data-testid="stMetricLabel"] { font-size: 0.8rem; }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
 
     shows_df, _ = load_lists()
     if shows_df is None or shows_df.empty:
@@ -2643,6 +2653,8 @@ def tab_show_trends():
     # ----------------------------
     with subtabs[0]:
         # KPIs
+        st.markdown('<div class="showtrends-metrics">', unsafe_allow_html=True)
+
         peak_idx = int(df["gross_use"].idxmax())
         peak_week = df.loc[peak_idx, "week_ending"]
         peak_value = float(df.loc[peak_idx, "gross_use"])
@@ -2659,6 +2671,9 @@ def tab_show_trends():
         k4.metric("Avg gross", f"{avg_gross:,.1f}")
         k5.metric("Weeks charted", f"{weeks_charted}")
         k6.metric("#1 / Top-3 weeks", f"{n1_weeks} / {top3_weeks}")
+
+        st.markdown('</div>', unsafe_allow_html=True)
+
 
         # Line chart (gross over time + optional MA)
         plot_df = df.dropna(subset=["week_ending_dt"]).copy()
@@ -2693,7 +2708,7 @@ def tab_show_trends():
             )
             layers.append(ma_line)
 
-        st.altair_chart(alt.layer(*layers).interactive(), use_container_width=True)
+        st.altair_chart(alt.layer(*layers).interactive(), width='stretch')
 
         # Weekly detail table
         cols = [
@@ -2711,7 +2726,7 @@ def tab_show_trends():
         ]
         out = df[cols].copy()
         out = out.rename(columns={"gross_use": "gross_millions (selected)"})
-        st.dataframe(out, use_container_width=True, hide_index=True)
+        st.dataframe(out, width='stretch', hide_index=True)
 
     # ----------------------------
     # Momentum
@@ -2733,7 +2748,7 @@ def tab_show_trends():
             _top(g[g["delta_pct"] > 0], "delta_pct", 10, asc=False)[
                 ["week_number", "week_ending", "rank", "pos", "gross_use", "prev_gross", "delta_pct", "delta"]
             ],
-            use_container_width=True,
+            width='stretch',
             hide_index=True,
         )
 
@@ -2742,7 +2757,7 @@ def tab_show_trends():
             _top(g[g["delta_pct"] < 0], "delta_pct", 10, asc=True)[
                 ["week_number", "week_ending", "rank", "pos", "gross_use", "prev_gross", "delta_pct", "delta"]
             ],
-            use_container_width=True,
+            width='stretch',
             hide_index=True,
         )
 
@@ -2751,7 +2766,7 @@ def tab_show_trends():
             _top(g[g["delta"] > 0], "delta", 10, asc=False)[
                 ["week_number", "week_ending", "rank", "pos", "gross_use", "prev_gross", "delta", "delta_pct"]
             ],
-            use_container_width=True,
+            width='stretch',
             hide_index=True,
         )
 
@@ -2760,7 +2775,7 @@ def tab_show_trends():
             _top(g[g["delta"] < 0], "delta", 10, asc=True)[
                 ["week_number", "week_ending", "rank", "pos", "gross_use", "prev_gross", "delta", "delta_pct"]
             ],
-            use_container_width=True,
+            width='stretch',
             hide_index=True,
         )
 
@@ -2804,7 +2819,7 @@ def tab_show_trends():
         top10 = df.sort_values("gross_use", ascending=False).head(10)[
             ["week_number", "week_ending", "rank", "pos", "base_gross_millions", "bonus_millions", "gross_use"]
         ].copy()
-        st.dataframe(top10.rename(columns={"gross_use": "gross_millions (selected)"}), use_container_width=True, hide_index=True)
+        st.dataframe(top10.rename(columns={"gross_use": "gross_millions (selected)"}), width='stretch', hide_index=True)
 
         # Aggregates
         g = df.dropna(subset=["week_ending_dt"]).copy()
@@ -2818,7 +2833,7 @@ def tab_show_trends():
             .head(12)
             .rename(columns={"gross_use": "gross_millions (selected)"})
         )
-        st.dataframe(top_months, use_container_width=True, hide_index=True)
+        st.dataframe(top_months, width='stretch', hide_index=True)
 
         st.markdown("### Top years")
         top_years = (
@@ -2826,7 +2841,7 @@ def tab_show_trends():
             .sort_values("gross_use", ascending=False)
             .rename(columns={"gross_use": "gross_millions (selected)"})
         )
-        st.dataframe(top_years, use_container_width=True, hide_index=True)
+        st.dataframe(top_years, width='stretch', hide_index=True)
 
     # ----------------------------
     # Context
@@ -2875,7 +2890,7 @@ def tab_show_trends():
                 ],
             )
             .interactive(),
-            use_container_width=True,
+            width='stretch',
         )
 
         st.markdown("### Rank vs gross")
@@ -2895,7 +2910,7 @@ def tab_show_trends():
                 ],
             )
             .interactive(),
-            use_container_width=True,
+            width='stretch',
         )
 
 
@@ -2939,7 +2954,7 @@ def tab_search():
     df = fetch_entries(filters, fts_query=fts, limit=int(limit), week_min=wk_min, week_max=wk_max)
 
     st.write(f"Results: **{len(df)}**")
-    st.dataframe(df, use_container_width=True)
+    st.dataframe(df, width='stretch')
 
     if not df.empty:
         gross = df["gross_millions"].dropna()
@@ -3008,7 +3023,7 @@ def tab_show_detail():
         if led.empty:
             st.caption("No ledger rows found for this show.")
         else:
-            st.dataframe(led, use_container_width=True, hide_index=True)
+            st.dataframe(led, width='stretch', hide_index=True)
 
     with st.expander("All-Time Gross Races rank history (every chart week since debut/era start)"):
             # We compute the show's all-time rank as-of *every* chart week in the grossing era,
@@ -3069,10 +3084,10 @@ def tab_show_detail():
                         if len(rt2) > 0:
                             keep.iloc[0] = True
                         rt2 = rt2.loc[keep].copy()
-                    st.dataframe(rt2, use_container_width=True, hide_index=True)
+                    st.dataframe(rt2, width='stretch', hide_index=True)
 
     df = fetch_show_entries(show_id, filters)
-    st.dataframe(df, use_container_width=True)
+    st.dataframe(df, width='stretch')
 
     if df.empty:
         st.info("No rows match your filters for this show.")
@@ -3161,7 +3176,7 @@ def tab_compare_two_shows():
     )
     st.write(f"Overlap weeks (same Week Ending): **{overlap['week_ending'].nunique()}**")
     if not overlap.empty:
-        st.dataframe(overlap, use_container_width=True)
+        st.dataframe(overlap, width='stretch')
 
     st.markdown("### Rank comparison")
     if align_mode.startswith("Calendar"):
@@ -3256,7 +3271,7 @@ def tab_companies():
         c4.metric("Avg gross (M)", None if pd.isna(av) else float(av))
 
     df = fetch_company_entries(company, filters, imprint_col=imprint_col)
-    st.dataframe(df, use_container_width=True)
+    st.dataframe(df, width='stretch')
 
 
 def tab_analytics():
@@ -3366,7 +3381,7 @@ def tab_analytics():
         wa = wa.sort_values("weekly_avg_millions", ascending=False)
         st.dataframe(
             wa[["week_ending", "gross_millions", "num_shows", "weekly_avg_millions"]].head(20),
-            use_container_width=True,
+            width='stretch',
         )
 
 
@@ -3376,7 +3391,7 @@ def tab_analytics():
     st.markdown("### Top companies by total gross")
     top_comp = dg.groupby("company", as_index=False)["gross_millions"].sum()
     top_comp = top_comp.sort_values("gross_millions", ascending=False).head(int(top_n))
-    st.dataframe(top_comp, use_container_width=True)
+    st.dataframe(top_comp, width='stretch')
     plot_barh(top_comp["company"][::-1], top_comp["gross_millions"][::-1], "Total Gross (Millions)", "Company")
 
     st.markdown("### Gross distribution")
@@ -3384,7 +3399,7 @@ def tab_analytics():
 
     st.markdown("### Yearly gross totals")
     yearly = dg.groupby("year", as_index=False)["gross_millions"].sum().sort_values("year")
-    st.dataframe(yearly, use_container_width=True)
+    st.dataframe(yearly, width='stretch')
     fig = plt.figure()
     plt.plot(yearly["year"], yearly["gross_millions"])
     plt.xlabel("Year")
@@ -3681,7 +3696,7 @@ def tab_gross_races():
 
         st.caption(f"Unlimited rank: every show with any gross is included. (Through **{pick_all_dt.isoformat()}**)")
         all_time_disp = all_time[["rank", "canonical_title", "imprint_1", "imprint_2", "debut_date", "gross_millions"]].copy()
-        st.dataframe(all_time_disp, use_container_width=True, hide_index=True)
+        st.dataframe(all_time_disp, width='stretch', hide_index=True)
 
         with st.expander("Optional: visualize the leaders (bar chart)"):
             top_plot = st.slider("How many shows to display in the bar chart", 5, min(200, int(len(all_time))), min(50, int(len(all_time))))
@@ -3728,7 +3743,7 @@ def tab_gross_races():
         leaders = leaders[["rank", "canonical_title", "imprint_1", "imprint_2", "cum_gross_millions"]].copy()
 
         st.caption(f"Leaderboard for **{pick_dt.year}** (through **{pick_dt.isoformat()}**)")
-        st.dataframe(leaders, use_container_width=True, hide_index=True)
+        st.dataframe(leaders, width='stretch', hide_index=True)
 
         # Line chart for top K at the selected date
         top_k = st.slider("Shows to plot (annual)", 2, min(50, int(len(leaders))), min(10, int(len(leaders))))
@@ -3823,7 +3838,7 @@ def tab_gross_races():
     leaders_q = leaders_q[["rank", "canonical_title", "imprint_1", "imprint_2", "cum_gross_millions"]].copy()
 
     st.caption(f"Leaderboard for **Q{int(quarter)} {int(year_pick)}** (through **{wk_dt.date().isoformat()}**)")
-    st.dataframe(leaders_q, use_container_width=True, hide_index=True)
+    st.dataframe(leaders_q, width='stretch', hide_index=True)
 
     top_kq = st.slider("Shows to plot (quarter)", 2, min(50, int(len(leaders_q))), min(10, int(len(leaders_q))), key="q_race_topk")
     top_titles_q = leaders_q.head(int(top_kq))["canonical_title"].tolist()
@@ -3891,7 +3906,7 @@ def tab_gross_races():
             f"Leaderboard for cycle **{cycle_start.date().isoformat()} → {cycle_end_incl.isoformat()}** "
             f"(through **{through_m_dt.date().isoformat()}**)"
         )
-        st.dataframe(leaders_m, use_container_width=True, hide_index=True)
+        st.dataframe(leaders_m, width='stretch', hide_index=True)
 
         top_km = st.slider(
             "Shows to plot (monthly)",
@@ -3962,7 +3977,7 @@ def tab_streak_analytics():
     rank_pick = st.selectbox("Rank", ranks, index=0)
 
     block = streaks[streaks["rank"] == rank_pick].head(int(top_n)).copy()
-    st.dataframe(block, use_container_width=True)
+    st.dataframe(block, width='stretch')
 
     st.divider()
     st.markdown("### Per-show streak breakdown")
@@ -3974,13 +3989,13 @@ def tab_streak_analytics():
         st.info("No streak data for this show in the selected filters.")
         return
 
-    st.dataframe(show_block, use_container_width=True)
+    st.dataframe(show_block, width='stretch')
 
     st.markdown("### Quick peek: raw weeks for this show (filtered)")
     # Useful for validating consecutive week_number behavior
     show_rows = rows[rows["show_id"] == show_id].copy()
     show_rows["week_ending"] = _as_date_str(show_rows["week_ending"])
-    st.dataframe(show_rows.sort_values(["week_number", "rank", "pos"]), use_container_width=True)
+    st.dataframe(show_rows.sort_values(["week_number", "rank", "pos"]), width='stretch')
 
 
 # ----------------------------
@@ -4089,7 +4104,7 @@ def tab_holidays():
         })
 
     out = pd.DataFrame(rows_out).sort_values("year")
-    st.dataframe(out, use_container_width=True)
+    st.dataframe(out, width='stretch')
 
     miss = out["#1_show(s)"].isna().sum() if not out.empty else 0
     if miss:
@@ -4326,7 +4341,7 @@ def tab_admin():
                 """,
                 (sel_id,),
             )
-            st.dataframe(cur_pairs, use_container_width=True, hide_index=True)
+            st.dataframe(cur_pairs, width='stretch', hide_index=True)
 
             c1, c2 = st.columns(2)
             with c1:
@@ -4511,7 +4526,7 @@ def tab_admin():
     show_for_aliases = st.selectbox("Show", titles, key="alias_list_show")
     show_id = int(shows.loc[shows["canonical_title"] == show_for_aliases, "show_id"].iloc[0])
     alias_df = sql_df("SELECT alias_title FROM show_alias WHERE show_id = ? ORDER BY alias_title", (show_id,))
-    st.dataframe(alias_df, use_container_width=True)
+    st.dataframe(alias_df, width='stretch')
 
 
 # ----------------------------
@@ -4820,7 +4835,7 @@ def tab_records_achievements():
             f"First Career #{rank_pick}": agg["first_week"].apply(_fmt_date),
             f"Last #{rank_pick}": agg["last_week"].apply(_fmt_date),
         })
-        st.dataframe(disp, use_container_width=True, hide_index=True)
+        st.dataframe(disp, width='stretch', hide_index=True)
 
     # -------------------------
     # 2) #1 week grossing record (progression)
@@ -4845,7 +4860,7 @@ def tab_records_achievements():
                 "Week Record Broken": prog["broken_week"].apply(_fmt_date),
                 "Grosses (in millions)": prog["gross_millions"].apply(fmt_millions),
             })
-            st.dataframe(disp, use_container_width=True, hide_index=True)
+            st.dataframe(disp, width='stretch', hide_index=True)
 
     
 
@@ -4904,7 +4919,7 @@ def tab_records_achievements():
                 "Month Record Broken": prog_m["broken_month"],
                 "Grosses (in millions)": prog_m["gross_millions"].apply(fmt_millions),
             })
-            st.dataframe(disp_m, use_container_width=True, hide_index=True)
+            st.dataframe(disp_m, width='stretch', hide_index=True)
 
     st.divider()
 
@@ -4931,7 +4946,7 @@ def tab_records_achievements():
                 "Week Record Broken": prog["broken_week"].apply(_fmt_date),
                 "Grosses (in millions)": prog["gross_millions"].apply(fmt_millions),
             })
-            st.dataframe(disp, use_container_width=True, hide_index=True)
+            st.dataframe(disp, width='stretch', hide_index=True)
 
     st.divider()
 
@@ -5085,7 +5100,7 @@ def tab_records_achievements():
             hat = hat.sort_values(["_completed_dt", "#1 Show/#2 Show"]).reset_index(drop=True)
             hat.insert(0, "#", np.arange(1, len(hat) + 1))
             disp = hat[["#", "#1 Show/#2 Show", "Imprint 1", "Imprint 2", "Hat Trick Status", "Hat Trick Week", "Total Grosses (in millions)"]].copy()
-            st.dataframe(disp, use_container_width=True, hide_index=True)
+            st.dataframe(disp, width='stretch', hide_index=True)
 
     st.divider()
 
@@ -5112,7 +5127,7 @@ def tab_records_achievements():
     if pos_df.empty:
         st.info("No unique max-by-rank rows found (ties may be blocking one or more ranks).")
     else:
-        st.dataframe(pos_df, use_container_width=True, hide_index=True)
+        st.dataframe(pos_df, width='stretch', hide_index=True)
 
     st.divider()
 
@@ -5138,184 +5153,8 @@ def tab_records_achievements():
             .reset_index(drop=True)
         )
 
-        # Order of distinct #1 shows within each calendar year
-        first_in_year["Order"] = first_in_year.groupby("year").cumcount() + 1
-        first_in_year["doy"] = first_in_year["first_n1"].dt.dayofyear
-
-        # For each order (1st #1 show of a year, 2nd, 3rd, ...), pick the earliest day-of-year across all years.
-        min_doy_by_order = first_in_year.groupby("Order")["doy"].min()
-        winners = first_in_year[first_in_year["doy"].eq(first_in_year["Order"].map(min_doy_by_order))].copy()
-
-        # Note "Earliest possible" when the date aligns with the theoretical minimum for weekly charts:
-        # Jan 1 for Order 1, Jan 8 for Order 2, Jan 15 for Order 3, etc.
-        winners["Note"] = np.where(winners["doy"].eq(1 + 7 * (winners["Order"] - 1)), "Earliest possible", "")
-        winners = winners.sort_values(["Order", "first_n1", "canonical_title"]).reset_index(drop=True)
-
-        rows = []
-        for order, g in winners.groupby("Order", sort=True):
-            for j, (_, r) in enumerate(g.iterrows()):
-                rows.append({
-                    "Note": r["Note"] if j == 0 else "",
-                    "Order": int(order) if j == 0 else "",
-                    "Show": r["canonical_title"],
-                    "Week Hit #1": _fmt_date(r["first_n1"]),
-                })
-        disp = pd.DataFrame(rows)
-        st.dataframe(disp, use_container_width=True, hide_index=True)
-
-    st.divider()
-
-    # -------------------------
-    # 7) Most weeks at #1 by imprint (Imprint 1)
-    # -------------------------
-
-    # -------------------------
-    # 7) Most weeks at #1 by imprint (Imprint 1 + Imprint 2 combined)
-    # -------------------------
-    st.markdown("### Most #1's by imprint")
-    if n1.empty:
-        st.info("No #1 rows found.")
-    else:
-        def _norm_imp(v: Any) -> str | None:
-            if v is None:
-                return None
-            s = str(v).strip()
-            if not s:
-                return None
-            low = s.lower()
-            if low in {"(none)", "<none>", "none", "(unknown)", "unknown"}:
-                return None
-            return s
-
-        imp_pairs = n1[["week_ending", "week_ending_dt", "imprint_1", "imprint_2"]].copy()
-        imp_pairs["imp1"] = imp_pairs["imprint_1"].map(_norm_imp)
-        imp_pairs["imp2"] = imp_pairs["imprint_2"].map(_norm_imp)
-
-        # De-duplicate within a row (same imprint in both columns shouldn't double-count)
-        imp_pairs["imprints"] = imp_pairs.apply(
-            lambda r: sorted({x for x in [r["imp1"], r["imp2"]] if x is not None}),
-            axis=1,
-        )
-
-        imp_long = (
-            imp_pairs[["week_ending", "week_ending_dt", "imprints"]]
-            .explode("imprints")
-            .dropna(subset=["imprints"])
-            .rename(columns={"imprints": "imprint"})
-        )
-
-        if imp_long.empty:
-            st.info("No imprint data found for #1 rows.")
-        else:
-            imp = (
-                imp_long.groupby("imprint", as_index=False)
-                .agg(
-                    total_weeks_at_1=("week_ending", "nunique"),
-                    first_1=("week_ending_dt", "min"),
-                    last_1=("week_ending_dt", "max"),
-                )
-                .sort_values(["total_weeks_at_1", "first_1", "imprint"], ascending=[False, True, True])
-                .reset_index(drop=True)
-            )
-            imp.insert(0, "Rank", np.arange(1, len(imp) + 1))
-            disp = pd.DataFrame({
-                "Rank": imp["Rank"],
-                "Imprint": imp["imprint"],
-                "#1 Weeks": imp["total_weeks_at_1"],
-                "Earliest #1": imp["first_1"].apply(_fmt_date),
-                "Latest #1": imp["last_1"].apply(_fmt_date),
-            })
-            st.dataframe(disp, use_container_width=True, hide_index=True)
-
-    st.divider()
 
 
-    # -------------------------
-    # 8) All #1 debuts
-    # -------------------------
-    st.markdown("### #1 debuts")
-    if debut_n1.empty:
-        st.info("No #1 debuts found.")
-    else:
-        deb = debut_n1.sort_values(["week_ending_dt"]).reset_index(drop=True).copy()
-        deb.insert(0, "#", np.arange(1, len(deb) + 1))
-        disp = pd.DataFrame({
-            "#": deb["#"],
-            "Show": deb["canonical_title"],
-            "Imprint 1": deb["imprint_1"],
-            "Imprint 2": deb["imprint_2"],
-            "Week #": deb["week_number"].astype("Int64"),
-            "Debut": deb["week_ending"].apply(_fmt_date),
-            "Grosses (in millions)": deb["gross_millions"].apply(fmt_millions),
-        })
-        st.dataframe(disp, use_container_width=True, hide_index=True)
-
-    st.divider()
-
-    # -------------------------
-    # 9) Biggest grossing #1 weeks by month (ties allowed)
-    # -------------------------
-    st.markdown("### Biggest grossing #1 weeks by month (ties allowed)")
-    if n1_gross.empty:
-        st.info("No grossing-era #1 rows found.")
-    else:
-        tmp = n1_gross.copy()
-        tmp["month_num"] = tmp["week_ending_dt"].dt.month
-
-        month_max = tmp.groupby("month_num")["gross_millions"].max()
-        winners = tmp[tmp["gross_millions"].eq(tmp["month_num"].map(month_max))].copy()
-        winners = winners.sort_values(["month_num", "gross_millions", "canonical_title"], ascending=[True, False, True]).reset_index(drop=True)
-
-        rows = []
-        for mnum, g in winners.groupby("month_num", sort=True):
-            mlabel = pd.Timestamp(2016, int(mnum), 1).strftime("%B")
-            for j, (_, r) in enumerate(g.iterrows()):
-                rows.append({
-                    "Month": mlabel if j == 0 else "",
-                    "Show": r["canonical_title"],
-                    "Imprint 1": r.get("imprint_1", ""),
-                    "Imprint 2": r.get("imprint_2", ""),
-                    "Week Record Set": _fmt_date(r["week_ending"]),
-                    "Grosses (in millions)": fmt_millions(r["gross_millions"]),
-                })
-        disp = pd.DataFrame(rows)
-        st.dataframe(disp, use_container_width=True, hide_index=True)
-
-    st.divider()
-
-    # -------------------------
-    # 10) Biggest grossing #1 debuts by month (ties allowed)
-    # -------------------------
-    st.markdown("### Biggest grossing #1 debuts by month (ties allowed)")
-    if debut_n1_gross.empty:
-        st.info("No grossing-era #1 debuts found.")
-    else:
-        tmp = debut_n1_gross.copy()
-        tmp["month_num"] = tmp["week_ending_dt"].dt.month
-
-        month_max = tmp.groupby("month_num")["gross_millions"].max()
-        winners = tmp[tmp["gross_millions"].eq(tmp["month_num"].map(month_max))].copy()
-        winners = winners.sort_values(["month_num", "gross_millions", "canonical_title"], ascending=[True, False, True]).reset_index(drop=True)
-
-        rows = []
-        for mnum, g in winners.groupby("month_num", sort=True):
-            mlabel = pd.Timestamp(2016, int(mnum), 1).strftime("%B")
-            for j, (_, r) in enumerate(g.iterrows()):
-                rows.append({
-                    "Month": mlabel if j == 0 else "",
-                    "Show": r["canonical_title"],
-                    "Imprint 1": r.get("imprint_1", ""),
-                    "Imprint 2": r.get("imprint_2", ""),
-                    "Week Record Set": _fmt_date(r["week_ending"]),
-                    "Grosses (in millions)": fmt_millions(r["gross_millions"]),
-                })
-        disp = pd.DataFrame(rows)
-        st.dataframe(disp, use_container_width=True, hide_index=True)
-
-
-# ----------------------------
-
-# ----------------------------
 # T-10 Chart #1 Shows
 # ----------------------------
 def _t10_rank_years(rank: int) -> list[str]:
@@ -5458,7 +5297,7 @@ def _render_t10_rank_view(rank: int, title: str) -> None:
                 dy = df[df["_year"] == y].copy()
                 st.dataframe(
                     dy[["week_number", "week_ending", "canonical_title", "imprint_1", "imprint_2", "base_gross_millions"]],
-                    use_container_width=True,
+                    width='stretch',
                     hide_index=True,
                 )
     else:
@@ -5468,7 +5307,7 @@ def _render_t10_rank_view(rank: int, title: str) -> None:
         else:
             st.dataframe(
                 df[["week_number", "week_ending", "canonical_title", "imprint_1", "imprint_2", "base_gross_millions"]],
-                use_container_width=True,
+                width='stretch',
                 hide_index=True,
             )
 
@@ -5482,17 +5321,17 @@ def _render_t10_rank_view(rank: int, title: str) -> None:
     if streaks_show.empty:
         st.write("No multi-week streaks found.")
     else:
-        st.dataframe(streaks_show, use_container_width=True, hide_index=True)
+        st.dataframe(streaks_show, width='stretch', hide_index=True)
 
     c1 = st.columns(3)
     with c1[0]:
         st.markdown(f"#### Total weeks at #{rank} (Imprint 1)")
         t1 = _totals_table(df, "imprint_1", "imprint_1")
-        st.dataframe(t1, use_container_width=True, hide_index=True)
+        st.dataframe(t1, width='stretch', hide_index=True)
     with c1[1]:
         st.markdown(f"#### Total weeks at #{rank} (Imprint 2)")
         t2 = _totals_table(df, "imprint_2", "imprint_2")
-        st.dataframe(t2, use_container_width=True, hide_index=True)
+        st.dataframe(t2, width='stretch', hide_index=True)
     
     with c1[2]:
         st.markdown(f"#### Total weeks at #{rank} (Show)")
@@ -5549,10 +5388,10 @@ def _render_t10_rank_view(rank: int, title: str) -> None:
                     columns={"career_weeks": f"career_weeks_at_#{rank} (through {year})"}
                 )
 
-            st.dataframe(ts_disp, use_container_width=True, hide_index=True)
+            st.dataframe(ts_disp, width='stretch', hide_index=True)
         else:
             ts = _totals_table(df, "canonical_title", "canonical_title")
-            st.dataframe(ts, use_container_width=True, hide_index=True)
+            st.dataframe(ts, width='stretch', hide_index=True)
 
 
 def tab_t10_chart_number_shows() -> None:
@@ -5560,12 +5399,10 @@ def tab_t10_chart_number_shows() -> None:
     st.caption("All #1 and #2 shows, grouped by year, with streak and total summaries.")
 
     subtabs = st.tabs(["#1 Shows", "#2 Shows"])
-
     with subtabs[0]:
         _render_t10_rank_view(1, "#1 Shows")
     with subtabs[1]:
         _render_t10_rank_view(2, "#2 Shows")
-
 
 def main():
     st.set_page_config(page_title=APP_TITLE, layout="wide")
