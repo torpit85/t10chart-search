@@ -5323,6 +5323,259 @@ def tab_records_achievements():
 
 
 # ----------------------------
+def _t10_rank_years(rank: int) -> list[str]:
+    dfy = sql_df(
+        """
+        SELECT DISTINCT strftime('%Y', week_ending) AS y
+        FROM t10_entry
+        WHERE rank = ?
+        ORDER BY y DESC
+        """,
+        (int(rank),),
+    )
+    years = [str(y) for y in dfy["y"].dropna().tolist()] if not dfy.empty else []
+    # Defensive: ensure unique + sorted desc
+    years = sorted(list(dict.fromkeys(years)), reverse=True)
+    return years
+
+
+
+def _fetch_t10_rank_rows(rank: int, year: str | None = None) -> pd.DataFrame:
+    params: list[Any] = [int(rank)]
+    year_clause = ""
+    if year and year != "All":
+        year_clause = "AND strftime('%Y', e.week_ending) = ?"
+        params.append(str(year))
+
+    df = sql_df(
+        f"""
+        SELECT
+          e.show_id,
+          e.week_number,
+          date(e.week_ending) AS week_ending,
+          s.canonical_title,
+          e.imprint_1,
+          e.imprint_2,
+          e.gross_millions AS base_gross_millions
+        FROM t10_entry e
+        JOIN show s ON s.show_id = e.show_id
+        WHERE e.rank = ?
+          {year_clause}
+        ORDER BY date(e.week_ending) ASC, e.week_number ASC
+        """,
+        tuple(params),
+    )
+
+    if not df.empty:
+        df["week_ending"] = _as_date_str(df["week_ending"])
+    return df
+
+
+
+def _streaks_for_rank(df: pd.DataFrame) -> pd.DataFrame:
+    """Compute consecutive-week streaks per show for a given rank table.
+
+    Ties do NOT break streaks: if a show appears at the position in consecutive
+    chart weeks (even as a co-#1 / co-#2), the streak continues.
+    """
+    if df.empty:
+        return pd.DataFrame(columns=["canonical_title", "weeks", "start_week_ending", "end_week_ending"])
+
+    d = df.copy()
+    d["week_ending_dt"] = pd.to_datetime(d["week_ending"], errors="coerce")
+    d = d.dropna(subset=["week_ending_dt"])
+
+    # Prefer stable grouping by show_id when available (avoids title casing/dup issues).
+    group_cols = ["show_id"] if "show_id" in d.columns else ["canonical_title"]
+
+    # Remove any accidental duplicates (a show should only appear once per week at a given rank).
+    d = d.drop_duplicates(subset=group_cols + ["week_ending_dt"])
+
+    out_parts: list[pd.DataFrame] = []
+    for _, g in d.groupby(group_cols, dropna=False):
+        g = g.sort_values("week_ending_dt").copy()
+
+        gap_days = g["week_ending_dt"].diff().dt.days
+        gap_ok = gap_days.between(*CONSECUTIVE_DAY_TOLERANCE)
+        new_streak = (~gap_ok).fillna(True)
+        g["_streak_id"] = new_streak.cumsum()
+
+        agg = (
+            g.groupby("_streak_id", as_index=False)
+            .agg(
+                canonical_title=("canonical_title", "first"),
+                weeks=("week_ending_dt", "size"),
+                start_week_ending=("week_ending_dt", "min"),
+                end_week_ending=("week_ending_dt", "max"),
+            )
+        )
+        out_parts.append(agg)
+
+    if not out_parts:
+        return pd.DataFrame(columns=["canonical_title", "weeks", "start_week_ending", "end_week_ending"])
+
+    streaks = pd.concat(out_parts, ignore_index=True)
+    streaks = (
+        streaks.sort_values(["weeks", "start_week_ending", "canonical_title"], ascending=[False, True, True])
+        .reset_index(drop=True)
+    )
+
+    streaks["start_week_ending"] = _as_date_str(streaks["start_week_ending"])
+    streaks["end_week_ending"] = _as_date_str(streaks["end_week_ending"])
+    return streaks
+
+
+
+def _totals_table(df: pd.DataFrame, col: str, label: str) -> pd.DataFrame:
+    if df.empty or col not in df.columns:
+        return pd.DataFrame(columns=[label, "weeks"])
+    d = df.copy()
+    if col in ("imprint_2",):
+        d[col] = d[col].fillna("").astype(str).str.strip()
+        d = d[d[col] != ""]
+    out = (
+        d.groupby(col, dropna=False)
+        .size()
+        .reset_index(name="weeks")
+        .rename(columns={col: label})
+        .sort_values(["weeks", label], ascending=[False, True])
+        .reset_index(drop=True)
+    )
+    return out
+
+
+
+def _render_t10_rank_view(rank: int, title: str) -> None:
+    years = _t10_rank_years(rank)
+    if not years:
+        st.info("No data found.")
+        return
+
+    year = st.selectbox("Year", ["All"] + years, index=1 if years else 0, key=f"t10_rank_{rank}_year")
+
+    df = _fetch_t10_rank_rows(rank, None if year == "All" else year)
+
+    # Main listing
+    if year == "All":
+        st.caption(f"Listing all shows that reached #{rank}, grouped by year.")
+        if df.empty:
+            st.info("No results.")
+        else:
+            df["_year"] = df["week_ending"].astype(str).str.slice(0, 4)
+            for y in sorted(df["_year"].unique().tolist(), reverse=True):
+                st.markdown(f"#### {y}")
+                dy = df[df["_year"] == y].copy()
+                st.dataframe(
+                    dy[["week_number", "week_ending", "canonical_title", "imprint_1", "imprint_2", "base_gross_millions"]],
+                    use_container_width=True,
+                    hide_index=True,
+                )
+    else:
+        st.caption(f"Listing all shows that reached #{rank} in **{year}**.")
+        if df.empty:
+            st.info("No results for that year.")
+        else:
+            st.dataframe(
+                df[["week_number", "week_ending", "canonical_title", "imprint_1", "imprint_2", "base_gross_millions"]],
+                use_container_width=True,
+                hide_index=True,
+            )
+
+    # Weeks-at sections
+    st.markdown("---")
+    st.markdown(f"### Weeks at #{rank} sections")
+
+    streaks = _streaks_for_rank(df)
+    st.markdown(f"#### Consecutive weeks at #{rank} (Show)")
+    streaks_show = streaks[streaks["weeks"] >= 2].copy()
+    if streaks_show.empty:
+        st.write("No multi-week streaks found.")
+    else:
+        st.dataframe(streaks_show, use_container_width=True, hide_index=True)
+
+    c1 = st.columns(3)
+    with c1[0]:
+        st.markdown(f"#### Total weeks at #{rank} (Imprint 1)")
+        t1 = _totals_table(df, "imprint_1", "imprint_1")
+        st.dataframe(t1, use_container_width=True, hide_index=True)
+    with c1[1]:
+        st.markdown(f"#### Total weeks at #{rank} (Imprint 2)")
+        t2 = _totals_table(df, "imprint_2", "imprint_2")
+        st.dataframe(t2, use_container_width=True, hide_index=True)
+    
+    with c1[2]:
+        st.markdown(f"#### Total weeks at #{rank} (Show)")
+
+        # For #1 Shows (year-specific), also show "career #1s through that year".
+        if rank == 1 and year != "All":
+            if df.empty:
+                ts_disp = pd.DataFrame(
+                    columns=["canonical_title", "weeks", f"career_weeks_at_#{rank} (through {year})"]
+                )
+            else:
+                yd = df.copy()
+                if "show_id" in yd.columns:
+                    year_tot = (
+                        yd.dropna(subset=["show_id"])
+                        .groupby(["show_id", "canonical_title"], as_index=False)
+                        .size()
+                        .rename(columns={"size": "weeks"})
+                    )
+                else:
+                    year_tot = _totals_table(yd, "canonical_title", "canonical_title").rename(columns={"weeks": "weeks"})
+
+                # Career totals up through the end of the selected year.
+                try:
+                    y_int = int(str(year))
+                except Exception:
+                    y_int = None
+
+                career_tot = pd.DataFrame(columns=["show_id", "career_weeks"])
+                if y_int is not None and "show_id" in year_tot.columns:
+                    cutoff = f"{y_int + 1:04d}-01-01"
+                    career_tot = sql_df(
+                        """
+                        SELECT e.show_id, COUNT(*) AS career_weeks
+                        FROM t10_entry e
+                        WHERE e.rank = ?
+                          AND date(e.week_ending) < date(?)
+                        GROUP BY e.show_id
+                        """,
+                        (int(rank), cutoff),
+                    )
+
+                if "show_id" in year_tot.columns and not career_tot.empty:
+                    out = year_tot.merge(career_tot, on="show_id", how="left")
+                else:
+                    out = year_tot.copy()
+                    out["career_weeks"] = pd.NA
+
+                # If career_tot missing (or show_id unavailable), fall back to that year's weeks.
+                out["career_weeks"] = out["career_weeks"].fillna(out["weeks"]).astype("Int64")
+                out = out.sort_values(["weeks", "canonical_title"], ascending=[False, True]).reset_index(drop=True)
+
+                ts_disp = out[["canonical_title", "weeks", "career_weeks"]].rename(
+                    columns={"career_weeks": f"career_weeks_at_#{rank} (through {year})"}
+                )
+
+            st.dataframe(ts_disp, use_container_width=True, hide_index=True)
+        else:
+            ts = _totals_table(df, "canonical_title", "canonical_title")
+            st.dataframe(ts, use_container_width=True, hide_index=True)
+
+
+
+def tab_t10_chart_number_shows() -> None:
+    st.header("T-10 Chart #1 Shows")
+    st.caption("All #1 and #2 shows, grouped by year, with streak and total summaries.")
+
+    subtabs = st.tabs(["#1 Shows", "#2 Shows"])
+
+    with subtabs[0]:
+        _render_t10_rank_view(1, "#1 Shows")
+    with subtabs[1]:
+        _render_t10_rank_view(2, "#2 Shows")
+
 def main():
     st.set_page_config(page_title=APP_TITLE, layout="wide")
     st.title(APP_TITLE)
@@ -5368,6 +5621,7 @@ def main():
         "Grossing Milestones",
         "Grossing Trends",
         "Show Trends",
+        "T-10 Chart #1 Shows",
         "Streak Analytics",
         "Holidays",
         "Records and Achievements",
@@ -5395,12 +5649,14 @@ def main():
     with tabs[9]:
         tab_show_trends()
     with tabs[10]:
-        tab_streak_analytics()
+        tab_t10_chart_number_shows()
     with tabs[11]:
-        tab_holidays()
+        tab_streak_analytics()
     with tabs[12]:
-        tab_records_achievements()
+        tab_holidays()
     with tabs[13]:
+        tab_records_achievements()
+    with tabs[14]:
         tab_admin()
 
 
