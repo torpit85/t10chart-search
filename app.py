@@ -3437,6 +3437,8 @@ def tab_analytics():
           e.gross_millions AS base_gross_millions,
           COALESCE(gb.bonus_millions, 0) AS bonus_millions,
           (e.gross_millions + COALESCE(gb.bonus_millions, 0)) AS gross_millions,
+          COALESCE(e.imprint_1,'(Unknown)') AS imprint_1,
+          COALESCE(e.imprint_2,'') AS imprint_2,
           COALESCE(e.imprint_1,'(Unknown)') AS company,
           s.canonical_title
         FROM t10_entry e
@@ -3527,7 +3529,30 @@ def tab_analytics():
     plot_scatter(dg["rank"].astype(float), dg[gross_col].astype(float), "Rank", gross_label)
 
     st.markdown("### Top companies by total gross")
-    top_comp = dg.groupby("company", as_index=False)["gross_millions"].sum()
+    # Combine imprint_1 + imprint_2 (dedupe per row) so companies appearing in either column are counted.
+    if ("imprint_1" in dg.columns) or ("imprint_2" in dg.columns):
+        c1 = dg["imprint_1"] if "imprint_1" in dg.columns else dg.get("company")
+        c1 = c1.fillna("(Unknown)").astype(str)
+
+        if "imprint_2" in dg.columns:
+            c2 = dg["imprint_2"].fillna("").astype(str)
+        else:
+            c2 = pd.Series([""] * len(dg), index=dg.index)
+
+        comp_rows_1 = pd.DataFrame({"company": c1, "gross_millions": dg["gross_millions"]})
+
+        comp_rows_2 = pd.DataFrame({"company": c2, "gross_millions": dg["gross_millions"], "_c1": c1})
+        comp_rows_2 = comp_rows_2[
+            (comp_rows_2["company"].str.strip() != "") & (comp_rows_2["company"] != comp_rows_2["_c1"])
+        ][["company", "gross_millions"]]
+
+        comp_rows = pd.concat([comp_rows_1, comp_rows_2], ignore_index=True)
+        comp_rows["company"] = comp_rows["company"].fillna("(Unknown)").replace({"": "(Unknown)"})
+
+        top_comp = comp_rows.groupby("company", as_index=False)["gross_millions"].sum()
+    else:
+        top_comp = dg.groupby("company", as_index=False)["gross_millions"].sum()
+
     top_comp = top_comp.sort_values("gross_millions", ascending=False).head(int(top_n))
     st.dataframe(top_comp, use_container_width=True)
     plot_barh(top_comp["company"][::-1], top_comp["gross_millions"][::-1], "Total Gross (Millions)", "Company")
