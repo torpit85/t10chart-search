@@ -3495,14 +3495,16 @@ def tab_analytics():
 
     # Keep this INSIDE the tab so 'weekly' is defined
     if st.checkbox("Show Top Gross Weeks"):
-        chart_top_gross_weeks(weekly, n=20)
+        chart_top_gross_weeks(weekly, n=int(top_n))
 
     st.markdown("### Rolling average total gross")
     win = st.slider("Rolling window (weeks)", 2, 52, 13)
     w2 = weekly.copy()
     w2["roll"] = w2["gross_millions"].rolling(win, min_periods=max(1, win // 3)).mean()
     plot_line_dates(w2["week_ending"], w2["roll"], "Week Ending", f"{win}-week avg gross (Millions)")
+
     st.markdown("### Weekly average gross")
+    # Weekly average = total weekly gross / number of grossing shows that week (within the current filters).
     counts = (
         dg[dg[gross_col].fillna(0.0) > 0.0]
         .groupby("week_ending", as_index=False)["show_id"]
@@ -3517,19 +3519,34 @@ def tab_analytics():
         0.0,
     )
     wa_ts = wa_ts.sort_values("week_ending")
-    plot_line_dates(
-        wa_ts["week_ending"],
-        wa_ts["weekly_avg_millions"],
-        "Week Ending",
-        "Weekly avg gross (Millions)",
-    )
+
+    use_ma = st.checkbox("Use moving average", value=False, key="wa_use_ma")
+    if use_ma:
+        ma_win = st.slider("Moving average window (weeks)", 2, 52, 13, key="wa_ma_win")
+        wa_plot = wa_ts["weekly_avg_millions"].rolling(
+            ma_win, min_periods=max(1, ma_win // 3)
+        ).mean()
+        plot_line_dates(
+            wa_ts["week_ending"],
+            wa_plot,
+            "Week Ending",
+            f"{ma_win}-week moving avg (Millions)",
+        )
+    else:
+        plot_line_dates(
+            wa_ts["week_ending"],
+            wa_ts["weekly_avg_millions"],
+            "Week Ending",
+            "Weekly avg gross (Millions)",
+        )
 
     if st.checkbox("Show Top Weekly Averages"):
         wa = wa_ts.sort_values("weekly_avg_millions", ascending=False)
         st.dataframe(
-            wa[["week_ending", "gross_millions", "num_shows", "weekly_avg_millions"]].head(20),
+            wa[["week_ending", "gross_millions", "num_shows", "weekly_avg_millions"]].head(int(top_n)),
             use_container_width=True,
         )
+
 
 
     st.markdown("### Rank vs Gross (scatter)")
