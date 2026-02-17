@@ -794,6 +794,62 @@ def holiday_week_ending_for_date(all_week_endings: list[date], holiday_dt: date,
 # ----------------------------
 # New tab: Monthly T-25 (SMPS)
 # ----------------------------
+
+
+# ----------------------------
+# New tab: Gross Races
+# ----------------------------
+@st.cache_data(show_spinner=False)
+def _load_gross_races_base(db_path: str, db_mtime: float) -> pd.DataFrame:
+    """Weekly gross (including annual+quarter bonuses) per show. db_mtime busts cache on DB updates."""
+    con = sqlite3.connect(db_path)
+    try:
+        df = pd.read_sql_query(
+            """
+            WITH combined AS (
+              -- Base weekly gross rows
+              SELECT
+                date(e.week_ending) AS week_ending,
+                e.show_id AS show_id,
+                COALESCE(e.gross_millions, 0.0) AS base_gross_millions,
+                0.0 AS bonus_millions
+              FROM t10_entry e
+              WHERE e.gross_millions IS NOT NULL
+
+              UNION ALL
+
+              -- Bonus rows (include even if show wasn't on chart that week)
+              SELECT
+                date(gb.week_ending) AS week_ending,
+                gb.show_id AS show_id,
+                0.0 AS base_gross_millions,
+                COALESCE(gb.bonus_millions, 0.0) AS bonus_millions
+              FROM gross_bonus gb
+              WHERE gb.bonus_type IN ('annual', 'quarter')
+            )
+            SELECT
+              c.week_ending,
+              c.show_id,
+              s.canonical_title AS canonical_title,
+              SUM(c.base_gross_millions) AS base_gross_millions,
+              SUM(c.bonus_millions) AS bonus_millions,
+              SUM(c.base_gross_millions + c.bonus_millions) AS gross_millions
+            FROM combined c
+            JOIN show s ON s.show_id = c.show_id
+            GROUP BY c.week_ending, c.show_id, s.canonical_title
+            ORDER BY c.show_id, c.week_ending
+            """,
+            con,
+        )
+    finally:
+        con.close()
+
+    if df.empty:
+        return df
+
+    return df
+
+
 @st.cache_data(show_spinner=False)
 def _load_smps_weekly_base(db_path: str, db_mtime: float, include_bonuses: bool) -> pd.DataFrame:
     """Weekly gross base for SMPS.
@@ -2789,7 +2845,7 @@ def tab_show_trends():
     else:
         df["gross_ma"] = np.nan
 
-    subtabs = st.tabs(["Trend", "Momentum", "Runs & peaks", "Context"])
+    subtabs = st.tabs(["Trend", "Momentum", "Runs & peaks", "Context", "Anomalies"])
 
     # ----------------------------
     # Trend
@@ -3052,6 +3108,71 @@ def tab_show_trends():
         )
 
 
+    # ----------------------------
+    # Anomalies (show-level z-scores)
+    # ----------------------------
+    with subtabs[4]:
+        st.markdown("### Anomalies (z-scores)")
+        st.caption("Detect weeks where this show over- or under-performed versus its own recent history (rolling window).")
+
+        method = st.selectbox(
+            "Method",
+            options=["Rolling z-score (mean/std)", "Rolling robust z-score (median/MAD)"],
+            index=1,
+            key="show_trends_anom_method",
+        )
+        window = st.slider("Rolling window (weeks)", 4, 52, 26, key="show_trends_anom_window")
+        threshold = st.slider("Outlier threshold (|z|)", 1.0, 5.0, 2.5, 0.1, key="show_trends_anom_threshold")
+
+        s = df[["week_ending", "rank", "gross_use"]].copy()
+        s["week_dt"] = pd.to_datetime(s["week_ending"], errors="coerce")
+        s["gross_use"] = pd.to_numeric(s["gross_use"], errors="coerce")
+
+        minp = max(6, int(window // 2))
+
+        if method.startswith("Rolling z-score"):
+            mu = s["gross_use"].rolling(window, min_periods=minp).mean()
+            sig = s["gross_use"].rolling(window, min_periods=minp).std(ddof=0)
+            s["z"] = (s["gross_use"] - mu) / sig.replace(0, np.nan)
+        else:
+            med = s["gross_use"].rolling(window, min_periods=minp).median()
+
+            def _mad(arr):
+                arr = np.asarray(arr, dtype=float)
+                arr = arr[~np.isnan(arr)]
+                if arr.size == 0:
+                    return np.nan
+                m = np.median(arr)
+                return np.median(np.abs(arr - m))
+
+            mad = s["gross_use"].rolling(window, min_periods=minp).apply(_mad, raw=True)
+            s["z"] = 0.6745 * (s["gross_use"] - med) / mad.replace(0, np.nan)
+
+        s["is_outlier"] = s["z"].abs() >= float(threshold)
+
+        base = alt.Chart(s.dropna(subset=["week_dt", "gross_use"])).encode(
+            x=alt.X("week_dt:T", title="Week ending"),
+            tooltip=[
+                alt.Tooltip("week_ending:N", title="Week"),
+                alt.Tooltip("rank:Q", title="Rank"),
+                alt.Tooltip("gross_use:Q", title="Gross", format=",.1f"),
+                alt.Tooltip("z:Q", title="z", format=".2f"),
+            ],
+        )
+
+        line = base.mark_line().encode(y=alt.Y("gross_use:Q", title="Gross (millions)"))
+        pts = (
+            alt.Chart(s[s["is_outlier"]].dropna(subset=["week_dt", "gross_use"]))
+            .mark_point(size=60)
+            .encode(x=alt.X("week_dt:T"), y=alt.Y("gross_use:Q"))
+        )
+
+        st.altair_chart((line + pts).interactive(), use_container_width=True)
+
+        out = s[s["is_outlier"]].copy()
+        out["abs_z"] = out["z"].abs()
+        out = out.sort_values("abs_z", ascending=False).drop(columns=["abs_z", "week_dt"])
+        st.dataframe(out, use_container_width=True, hide_index=True)
 def tab_search():
     st.subheader("Search")
     with st.sidebar:
@@ -3426,7 +3547,8 @@ def tab_analytics():
     filters = FilterSpec(date_min.strip() or None, date_max.strip() or None, int(rank_min), int(rank_max))
 
     where, params = build_where(filters, "e")
-    df = sql_df(f"""
+    df = sql_df(
+        f"""
         SELECT
           e.show_id,
           e.week_ending,
@@ -3450,7 +3572,9 @@ def tab_analytics():
         JOIN show s ON s.show_id = e.show_id
         WHERE {where}
         ORDER BY e.week_ending ASC, e.rank ASC, e.pos ASC
-    """, tuple(params))
+        """,
+        tuple(params),
+    )
 
     if df.empty:
         st.info("No rows match your filters.")
@@ -3459,6 +3583,9 @@ def tab_analytics():
     df["week_ending"] = _as_date_str(df["week_ending"])
     df["week_ending_dt"] = pd.to_datetime(df["week_ending"], errors="coerce")
     df["year"] = df["week_ending_dt"].dt.year
+    df["month"] = df["week_ending_dt"].dt.month
+    # ISO week-of-year (1–53)
+    df["week_of_year"] = df["week_ending_dt"].dt.isocalendar().week.astype("Int64")
 
     dg = df.dropna(subset=["gross_millions"]).copy()
     for col in ["gross_millions", "base_gross_millions", "bonus_millions"]:
@@ -3468,6 +3595,7 @@ def tab_analytics():
     ignore_bonus = st.checkbox(
         "Ignore gross bonuses in most analytics (Top shows/companies + yearly totals still include bonuses)",
         value=False,
+        key="analytics_ignore_bonus",
     )
     gross_col = "base_gross_millions" if ignore_bonus else "gross_millions"
     gross_label = "Base gross (millions)" if gross_col == "base_gross_millions" else "Gross + bonuses (millions)"
@@ -3475,42 +3603,28 @@ def tab_analytics():
         st.caption(
             "Bonuses are excluded from most charts/totals below, except Top shows, Top companies, and Yearly gross totals (those always include bonuses)."
         )
-    st.markdown("### Total gross over time (weekly sum)")
+
     if dg.empty:
         st.warning("No gross values in the selected range.")
         return
 
+    # -------------------------
+    # Reusable weekly series
+    # -------------------------
     weekly = (
-
         dg.groupby("week_ending", as_index=False)[gross_col]
-
         .sum()
-
         .rename(columns={gross_col: "gross_millions"})
-
         .sort_values("week_ending")
-
     )
-    plot_line_dates(weekly["week_ending"], weekly["gross_millions"], "Week Ending", "Total Gross (Millions)")
 
-    # Keep this INSIDE the tab so 'weekly' is defined
-    if st.checkbox("Show Top Gross Weeks"):
-        chart_top_gross_weeks(weekly, n=int(top_n))
-
-    st.markdown("### Rolling average total gross")
-    win = st.slider("Rolling window (weeks)", 2, 52, 13)
-    w2 = weekly.copy()
-    w2["roll"] = w2["gross_millions"].rolling(win, min_periods=max(1, win // 3)).mean()
-    plot_line_dates(w2["week_ending"], w2["roll"], "Week Ending", f"{win}-week avg gross (Millions)")
-
-    st.markdown("### Weekly average gross")
-    # Weekly average = total weekly gross / number of grossing shows that week (within the current filters).
     counts = (
         dg[dg[gross_col].fillna(0.0) > 0.0]
         .groupby("week_ending", as_index=False)["show_id"]
         .nunique()
         .rename(columns={"show_id": "num_shows"})
     )
+
     wa_ts = weekly.merge(counts, on="week_ending", how="left")
     wa_ts["num_shows"] = wa_ts["num_shows"].fillna(0).astype(int)
     wa_ts["weekly_avg_millions"] = np.where(
@@ -3518,139 +3632,376 @@ def tab_analytics():
         wa_ts["gross_millions"] / wa_ts["num_shows"],
         0.0,
     )
+    wa_ts["week_ending_dt"] = pd.to_datetime(wa_ts["week_ending"], errors="coerce")
+    wa_ts["year"] = wa_ts["week_ending_dt"].dt.year
+    wa_ts["month"] = wa_ts["week_ending_dt"].dt.month
+    wa_ts["week_of_year"] = wa_ts["week_ending_dt"].dt.isocalendar().week.astype("Int64")
     wa_ts = wa_ts.sort_values("week_ending")
 
-    use_ma = st.checkbox("Use moving average", value=False, key="wa_use_ma")
-    if use_ma:
-        ma_win = st.slider("Moving average window (weeks)", 2, 52, 13, key="wa_ma_win")
-        wa_plot = wa_ts["weekly_avg_millions"].rolling(
-            ma_win, min_periods=max(1, ma_win // 3)
-        ).mean()
-        plot_line_dates(
-            wa_ts["week_ending"],
-            wa_plot,
-            "Week Ending",
-            f"{ma_win}-week moving avg (Millions)",
-        )
-    else:
-        plot_line_dates(
-            wa_ts["week_ending"],
-            wa_ts["weekly_avg_millions"],
-            "Week Ending",
-            "Weekly avg gross (Millions)",
-        )
+    # -------------------------
+    # Analytics sub-tabs
+    # -------------------------
+    t_overview, t_heat, t_dist, t_outliers = st.tabs(
+        [
+            "Overview",
+            "Heatmaps",
+            "Distribution",
+            "Outliers",
+        ]
+    )
 
-    if st.checkbox("Show Top Weekly Averages"):
-        wa = wa_ts.sort_values("weekly_avg_millions", ascending=False)
-        st.dataframe(
-            wa[["week_ending", "gross_millions", "num_shows", "weekly_avg_millions"]].head(int(top_n)),
-            use_container_width=True,
-        )
+    # -------------------------
+    # Overview
+    # -------------------------
+    with t_overview:
+        st.markdown("### Total gross over time (weekly sum)")
+        plot_line_dates(weekly["week_ending"], weekly["gross_millions"], "Week Ending", "Total Gross (Millions)")
 
+        if st.checkbox("Show Top Gross Weeks", key="analytics_show_top_gross_weeks"):
+            chart_top_gross_weeks(weekly, n=int(top_n))
 
+        st.markdown("### Rolling average total gross")
+        win = st.slider("Rolling window (weeks)", 2, 52, 13, key="analytics_roll_total_window")
+        w2 = weekly.copy()
+        w2["roll"] = w2["gross_millions"].rolling(win, min_periods=max(1, win // 3)).mean()
+        plot_line_dates(w2["week_ending"], w2["roll"], "Week Ending", f"{win}-week avg gross (Millions)")
 
-    st.markdown("### Rank vs Gross (scatter)")
-    plot_scatter(dg["rank"].astype(float), dg[gross_col].astype(float), "Rank", gross_label)
+        st.markdown("### Weekly average gross")
+        use_ma = st.checkbox("Show moving average instead of raw weekly average", value=False, key="analytics_wa_use_ma")
+        ma_win = st.slider("Moving average window (weeks)", 2, 52, 13, key="analytics_wa_ma_window")
+        wa_plot = wa_ts.copy()
+        wa_plot["ma"] = wa_plot["weekly_avg_millions"].rolling(ma_win, min_periods=max(1, ma_win // 3)).mean()
+        ycol = "ma" if use_ma else "weekly_avg_millions"
+        ylabel = f"{ma_win}-week moving avg (Millions)" if use_ma else "Weekly avg gross (Millions)"
+        plot_line_dates(wa_plot["week_ending"], wa_plot[ycol], "Week Ending", ylabel)
 
-    st.markdown("### Top companies by total gross")
-    # Combine imprint_1 + imprint_2 (dedupe per row) so companies appearing in either column are counted.
-    if ("imprint_1" in dg.columns) or ("imprint_2" in dg.columns):
-        c1 = dg["imprint_1"] if "imprint_1" in dg.columns else dg.get("company")
-        c1 = c1.fillna("(Unknown)").astype(str)
-
-        if "imprint_2" in dg.columns:
-            c2 = dg["imprint_2"].fillna("").astype(str)
-        else:
-            c2 = pd.Series([""] * len(dg), index=dg.index)
-
-        comp_rows_1 = pd.DataFrame({"company": c1, "gross_millions": dg["gross_millions"]})
-
-        comp_rows_2 = pd.DataFrame({"company": c2, "gross_millions": dg["gross_millions"], "_c1": c1})
-        comp_rows_2 = comp_rows_2[
-            (comp_rows_2["company"].str.strip() != "") & (comp_rows_2["company"] != comp_rows_2["_c1"])
-        ][["company", "gross_millions"]]
-
-        comp_rows = pd.concat([comp_rows_1, comp_rows_2], ignore_index=True)
-        comp_rows["company"] = comp_rows["company"].fillna("(Unknown)").replace({"": "(Unknown)"})
-
-        top_comp = comp_rows.groupby("company", as_index=False)["gross_millions"].sum()
-    else:
-        top_comp = dg.groupby("company", as_index=False)["gross_millions"].sum()
-
-    top_comp = top_comp.sort_values("gross_millions", ascending=False).head(int(top_n))
-    st.dataframe(top_comp, use_container_width=True)
-    plot_barh(top_comp["company"][::-1], top_comp["gross_millions"][::-1], "Total Gross (Millions)", "Company")
-
-    st.markdown("### Gross distribution")
-    plot_hist(dg[gross_col].astype(float), bins=30, xlabel=gross_label, ylabel="Count")
-
-    st.markdown("### Yearly gross totals")
-    yearly = dg.groupby("year", as_index=False)["gross_millions"].sum().sort_values("year")
-    st.dataframe(yearly, use_container_width=True)
-    fig = plt.figure()
-    plt.plot(yearly["year"], yearly["gross_millions"])
-    plt.xlabel("Year")
-    plt.ylabel("Total Gross (Millions)")
-    plt.tight_layout()
-    st.pyplot(fig)
-    plt.close(fig)
-
-
-
-# ----------------------------
-# New tab: Gross Races
-# ----------------------------
-@st.cache_data(show_spinner=False)
-def _load_gross_races_base(db_path: str, db_mtime: float) -> pd.DataFrame:
-    """Weekly gross (including annual+quarter bonuses) per show. db_mtime busts cache on DB updates."""
-    con = sqlite3.connect(db_path)
-    try:
-        df = pd.read_sql_query(
-            """
-            WITH combined AS (
-              -- Base weekly gross rows
-              SELECT
-                date(e.week_ending) AS week_ending,
-                e.show_id AS show_id,
-                COALESCE(e.gross_millions, 0.0) AS base_gross_millions,
-                0.0 AS bonus_millions
-              FROM t10_entry e
-              WHERE e.gross_millions IS NOT NULL
-
-              UNION ALL
-
-              -- Bonus rows (include even if show wasn't on chart that week)
-              SELECT
-                date(gb.week_ending) AS week_ending,
-                gb.show_id AS show_id,
-                0.0 AS base_gross_millions,
-                COALESCE(gb.bonus_millions, 0.0) AS bonus_millions
-              FROM gross_bonus gb
-              WHERE gb.bonus_type IN ('annual', 'quarter')
+        if st.checkbox("Show Top Weekly Averages", key="analytics_show_top_weekly_avgs"):
+            wa = wa_ts.sort_values("weekly_avg_millions", ascending=False)
+            st.dataframe(
+                wa[["week_ending", "gross_millions", "num_shows", "weekly_avg_millions"]].head(int(top_n)),
+                use_container_width=True,
             )
-            SELECT
-              c.week_ending,
-              c.show_id,
-              s.canonical_title AS canonical_title,
-              SUM(c.base_gross_millions) AS base_gross_millions,
-              SUM(c.bonus_millions) AS bonus_millions,
-              SUM(c.base_gross_millions + c.bonus_millions) AS gross_millions
-            FROM combined c
-            JOIN show s ON s.show_id = c.show_id
-            GROUP BY c.week_ending, c.show_id, s.canonical_title
-            ORDER BY c.show_id, c.week_ending
-            """,
-            con,
+
+        st.markdown("### Rank vs Gross (scatter)")
+        plot_scatter(dg["rank"].astype(float), dg[gross_col].astype(float), "Rank", gross_label)
+
+        st.markdown("### Top companies by total gross")
+        # Combine imprint_1 + imprint_2 (dedupe per row) so companies appearing in either column are counted.
+        if ("imprint_1" in dg.columns) or ("imprint_2" in dg.columns):
+            c1 = dg["imprint_1"] if "imprint_1" in dg.columns else dg.get("company")
+            c1 = c1.fillna("(Unknown)").astype(str)
+
+            if "imprint_2" in dg.columns:
+                c2 = dg["imprint_2"].fillna("").astype(str)
+            else:
+                c2 = pd.Series([""] * len(dg), index=dg.index)
+
+            comp_rows_1 = pd.DataFrame({"company": c1, "gross_millions": dg["gross_millions"]})
+
+            comp_rows_2 = pd.DataFrame({"company": c2, "gross_millions": dg["gross_millions"], "_c1": c1})
+            comp_rows_2 = comp_rows_2[
+                (comp_rows_2["company"].str.strip() != "") & (comp_rows_2["company"] != comp_rows_2["_c1"])
+            ][["company", "gross_millions"]]
+
+            comp_rows = pd.concat([comp_rows_1, comp_rows_2], ignore_index=True)
+            comp_rows["company"] = comp_rows["company"].fillna("(Unknown)").replace({"": "(Unknown)"})
+
+            top_comp = comp_rows.groupby("company", as_index=False)["gross_millions"].sum()
+        else:
+            top_comp = dg.groupby("company", as_index=False)["gross_millions"].sum()
+
+        top_comp = top_comp.sort_values("gross_millions", ascending=False).head(int(top_n))
+        st.dataframe(top_comp, use_container_width=True)
+        plot_barh(top_comp["company"][::-1], top_comp["gross_millions"][::-1], "Total Gross (Millions)", "Company")
+
+        st.markdown("### Gross distribution")
+        plot_hist(dg[gross_col].astype(float), bins=30, xlabel=gross_label, ylabel="Count")
+
+        st.markdown("### Yearly gross totals")
+        yearly = dg.groupby("year", as_index=False)["gross_millions"].sum().sort_values("year")
+        st.dataframe(yearly, use_container_width=True)
+        fig = plt.figure()
+        plt.plot(yearly["year"], yearly["gross_millions"])
+        plt.xlabel("Year")
+        plt.ylabel("Total Gross (Millions)")
+        plt.tight_layout()
+        st.pyplot(fig)
+        plt.close(fig)
+
+    # -------------------------
+    # Heatmaps
+    # -------------------------
+    with t_heat:
+        metric = st.selectbox(
+            "Heatmap metric",
+            options=["Weekly average gross", "Total gross"],
+            index=0,
+            key="analytics_heat_metric",
         )
-    finally:
-        con.close()
+        metric_col = "weekly_avg_millions" if metric == "Weekly average gross" else "gross_millions"
 
-    if df.empty:
-        return df
-    return df
+        st.markdown("### Calendar heatmap (year × week-of-year)")
+        hm = wa_ts.dropna(subset=["week_ending_dt"]).copy()
+        hm["metric"] = hm[metric_col].astype(float)
 
+        # If week_of_year is NA (shouldn't be, but just in case), drop
+        hm = hm.dropna(subset=["year", "week_of_year"]).copy()
+        hm["year"] = hm["year"].astype(int)
+        hm["week_of_year"] = hm["week_of_year"].astype(int)
 
+        if hm.empty:
+            st.info("Not enough weekly data for a heatmap in the selected range.")
+        else:
+            chart = (
+                alt.Chart(hm)
+                .mark_rect()
+                .encode(
+                    x=alt.X("week_of_year:O", title="ISO week of year"),
+                    y=alt.Y("year:O", title="Year"),
+                    color=alt.Color("metric:Q", title=metric),
+                    tooltip=[
+                        alt.Tooltip("week_ending:N", title="Week ending"),
+                        alt.Tooltip("metric:Q", title=metric, format=",.2f"),
+                        alt.Tooltip("num_shows:Q", title="# shows"),
+                        alt.Tooltip("gross_millions:Q", title="Total gross", format=",.2f"),
+                    ],
+                )
+                .properties(height=260)
+            )
+            st.altair_chart(chart, use_container_width=True)
 
+        st.markdown("### Rank-by-week heatmap (gross by rank over time)")
+        rb = dg.dropna(subset=["week_ending_dt", "rank", gross_col]).copy()
+        if rb.empty:
+            st.info("No ranked gross rows available for the selected range.")
+        else:
+            rb["gross_use"] = rb[gross_col].astype(float)
+            # Aggregate in case of duplicate rank rows (shouldn't happen, but safe)
+            rb2 = (
+                rb.groupby(["week_ending_dt", "week_ending", "rank"], as_index=False)["gross_use"]
+                .sum()
+                .sort_values(["week_ending_dt", "rank"])
+            )
+
+            chart2 = (
+                alt.Chart(rb2)
+                .mark_rect()
+                .encode(
+                    x=alt.X("week_ending_dt:T", title="Week ending"),
+                    y=alt.Y("rank:O", title="Rank", sort="ascending"),
+                    color=alt.Color("gross_use:Q", title=gross_label),
+                    tooltip=[
+                        alt.Tooltip("week_ending:N", title="Week ending"),
+                        alt.Tooltip("rank:Q", title="Rank"),
+                        alt.Tooltip("gross_use:Q", title=gross_label, format=",.2f"),
+                    ],
+                )
+                .properties(height=360)
+            )
+            st.altair_chart(chart2, use_container_width=True)
+
+    # -------------------------
+    # Distribution (boxplots)
+    # -------------------------
+    with t_dist:
+        metric = st.selectbox(
+            "Distribution metric",
+            options=["Weekly average gross", "Total gross"],
+            index=0,
+            key="analytics_dist_metric",
+        )
+        metric_col = "weekly_avg_millions" if metric == "Weekly average gross" else "gross_millions"
+
+        dd = wa_ts.dropna(subset=["week_ending_dt"]).copy()
+        dd["metric"] = dd[metric_col].astype(float)
+        dd["month_name"] = dd["week_ending_dt"].dt.strftime("%b")
+        dd["week_of_year"] = dd["week_of_year"].astype("Int64")
+
+        if dd.empty:
+            st.info("No weekly data available for distribution charts.")
+        else:
+            st.markdown("### Summary distribution")
+            chart = (
+                alt.Chart(dd)
+                .mark_boxplot(extent="min-max")
+                .encode(
+                    y=alt.Y("metric:Q", title=metric),
+                    tooltip=[
+                        alt.Tooltip("metric:Q", title=metric, format=",.2f"),
+                    ],
+                )
+                .properties(height=260)
+            )
+            st.altair_chart(chart, use_container_width=True)
+
+            st.markdown("### Seasonality: month-of-year")
+            month_order = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
+            chart_m = (
+                alt.Chart(dd)
+                .mark_boxplot()
+                .encode(
+                    x=alt.X("month_name:O", sort=month_order, title="Month"),
+                    y=alt.Y("metric:Q", title=metric),
+                    tooltip=[
+                        alt.Tooltip("month_name:N", title="Month"),
+                        alt.Tooltip("metric:Q", title=metric, format=",.2f"),
+                    ],
+                )
+                .properties(height=320)
+            )
+            st.altair_chart(chart_m, use_container_width=True)
+
+            st.markdown("### Seasonality: week-of-year")
+            # 52 (sometimes 53) boxes can be a lot; allow a min-week filter
+            show_woy = st.checkbox("Show week-of-year boxplots", value=False, key="analytics_dist_woy_show")
+            if show_woy:
+                chart_w = (
+                    alt.Chart(dd.dropna(subset=["week_of_year"]))
+                    .mark_boxplot(size=6)
+                    .encode(
+                        x=alt.X("week_of_year:O", title="ISO week of year"),
+                        y=alt.Y("metric:Q", title=metric),
+                        tooltip=[
+                            alt.Tooltip("week_of_year:Q", title="ISO week"),
+                            alt.Tooltip("metric:Q", title=metric, format=",.2f"),
+                        ],
+                    )
+                    .properties(height=320)
+                )
+                st.altair_chart(chart_w, use_container_width=True)
+            else:
+                st.caption("Toggle the checkbox above if you want the full week-of-year view (it can be very wide).")
+
+            with st.expander("Summary stats table"):
+                stats = (
+                    dd["metric"]
+                    .agg(["count", "mean", "median", "min", "max", "std"])
+                    .to_frame()
+                    .reset_index()
+                    .rename(columns={"index": "stat", "metric": "value"})
+                )
+                st.dataframe(stats, use_container_width=True, hide_index=True)
+
+    # -------------------------
+    # Outlier weeks detector
+    # -------------------------
+    with t_outliers:
+
+        # -------------------------
+        # Week-level outliers
+        # -------------------------
+        metric = st.selectbox(
+            "Outlier metric",
+            options=["Weekly average gross", "Total gross"],
+            index=0,
+            key="analytics_out_metric",
+        )
+        metric_col = "weekly_avg_millions" if metric == "Weekly average gross" else "gross_millions"
+
+        method = st.selectbox(
+            "Scoring method",
+            options=["Rolling z-score (mean/std)", "Rolling robust z-score (median/MAD)"],
+            index=0,
+            key="analytics_out_method",
+        )
+
+        roll_w = st.slider(
+            "Rolling window (weeks)",
+            min_value=4,
+            max_value=52,
+            value=13,
+            step=1,
+            key="analytics_out_window",
+        )
+        thr = st.slider(
+            "Outlier threshold (absolute z)",
+            min_value=1.0,
+            max_value=6.0,
+            value=2.5,
+            step=0.1,
+            key="analytics_out_thr",
+        )
+
+        o = wa_ts.dropna(subset=["week_ending_dt"]).copy()
+        o["x"] = o[metric_col].astype(float)
+
+        if o.empty:
+            st.info("No weekly data available for outlier detection.")
+        else:
+            o = o.sort_values("week_ending_dt").reset_index(drop=True)
+
+            if method.startswith("Rolling z-score"):
+                mu = o["x"].rolling(roll_w, min_periods=max(2, roll_w // 2)).mean()
+                sd = o["x"].rolling(roll_w, min_periods=max(2, roll_w // 2)).std().replace(0.0, np.nan)
+                o["z"] = ((o["x"] - mu) / sd).fillna(0.0)
+            else:
+                med = o["x"].rolling(roll_w, min_periods=max(2, roll_w // 2)).median()
+                mad = (o["x"] - med).abs().rolling(roll_w, min_periods=max(2, roll_w // 2)).median()
+                mad = mad.replace(0.0, np.nan)
+                # 0.6745 scales MAD to std for normal dist
+                o["z"] = (0.6745 * (o["x"] - med) / mad).fillna(0.0)
+
+            o["is_outlier"] = o["z"].abs() >= float(thr)
+
+            # Chart: line + highlighted points
+            base = alt.Chart(o).encode(
+                x=alt.X("week_ending_dt:T", title="Week ending"),
+            )
+
+            line = base.mark_line().encode(
+                y=alt.Y("x:Q", title=metric),
+                tooltip=[
+                    alt.Tooltip("week_ending:N", title="Week ending"),
+                    alt.Tooltip("x:Q", title=metric, format=",.2f"),
+                    alt.Tooltip("z:Q", title="z", format=",.2f"),
+                    alt.Tooltip("num_shows:Q", title="# shows"),
+                ],
+            )
+
+            pts = (
+                base.transform_filter(alt.datum.is_outlier == True)
+                .mark_point(size=80)
+                .encode(
+                    y="x:Q",
+                    tooltip=[
+                        alt.Tooltip("week_ending:N", title="Week ending"),
+                        alt.Tooltip("x:Q", title=metric, format=",.2f"),
+                        alt.Tooltip("z:Q", title="z", format=",.2f"),
+                        alt.Tooltip("gross_millions:Q", title="Total gross", format=",.2f"),
+                        alt.Tooltip("num_shows:Q", title="# shows"),
+                    ],
+                )
+            )
+
+            st.altair_chart((line + pts).properties(height=320), use_container_width=True)
+
+            outs = o[o["is_outlier"]].copy()
+            if outs.empty:
+                st.info("No outliers at this threshold.")
+            else:
+                outs = outs.assign(abs_z=outs["z"].abs()).sort_values("abs_z", ascending=False)
+                show_cols = ["week_ending", "x", "z", "gross_millions", "num_shows"]
+                tbl = outs[show_cols].rename(columns={"x": metric, "z": "z_score"})
+                st.dataframe(tbl.head(int(top_n)), use_container_width=True)
+
+                pick = st.selectbox(
+                    "Drilldown week",
+                    options=outs["week_ending"].head(min(50, len(outs))).tolist(),
+                    index=0,
+                    key="analytics_out_pick_week",
+                )
+                with st.expander("Top contributors (by show) for selected week"):
+                    wk = dg[dg["week_ending"] == pick].copy()
+                    if wk.empty:
+                        st.info("No show-level rows found for that week under current filters.")
+                    else:
+                        wk["gross_use"] = wk[gross_col].astype(float)
+                        wk = wk.sort_values("gross_use", ascending=False)
+                        st.dataframe(
+                            wk[["rank", "canonical_title", "imprint_1", "imprint_2", "gross_use"]].head(10),
+                            use_container_width=True,
+                            hide_index=True,
+                        )
 
 @st.cache_data(show_spinner=False)
 def _alltime_rank_table_for_show_weeks(db_path: str, db_mtime: float, show_id: int, weeks: list[pd.Timestamp]) -> pd.DataFrame:
