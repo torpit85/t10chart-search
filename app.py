@@ -974,7 +974,7 @@ def _compute_show_month_metrics(db_path: str, db_mtime: float, include_bonuses: 
     agg = (
         base.groupby(["month", "month_ord", "show_id", "canonical_title", "imprint_1", "imprint_2"], as_index=False)
         .apply(_agg_one)
-        .reset_index(drop=True)
+        .reset_index()
     )
 
     # Prev-month gross per show
@@ -6137,6 +6137,1032 @@ def tab_t10_chart_number_shows() -> None:
     with subtabs[1]:
         _render_t10_rank_view(2, "#2 Shows")
 
+# ----------------------------
+# New tab: Hall of Fame
+# ----------------------------
+
+# Tunables (badges / inductees)
+HOF_G1_SHOW_GROSS = 10000.0  # "millions" units
+HOF_P1_SHOW_POINTS = 2000.0
+HOF_CG1_COMPANY_GROSS = 50000.0
+HOF_CP1_COMPANY_POINTS = 20000.0
+HOF_DEEP_BENCH_YEAR_POINTS_X = 150.0
+HOF_DEEP_BENCH_MIN_SHOWS = 8
+
+HOF_INDUCT_MIN_WEEKS = 10  # minimum chart weeks to show up in inductees (to avoid noise)
+HOF_TABLE_MAX_BADGES = 4
+
+_HOF_BADGE_ORDER_SHOW = [
+    "Crown Collector",
+    "#1 Legend",
+    "Chart Emperor",
+    "Top 10 Ironman",
+    "Points Machine",
+    "Box Office Beast",
+    "Peak Monster",
+    "Consistency King",
+    "Steady Climber",
+    "Comeback Kid",
+    "Gatekeeper",
+    "One-Hit Titan",
+]
+
+_HOF_BADGE_ORDER_COMPANY = [
+    "Points Empire",
+    "Box Office Titan",
+    "#1 Machine",
+    "Dynasty Year",
+    "Hit Factory",
+    "Deep Bench",
+    "Era Staple",
+    "Seasonal Specialists",
+]
+
+
+def _hof_inverse_rank_points(rank: float | int | None) -> float:
+    """Pre-grossing era (or missing gross): #1=100, #2=90, ..."""
+    if rank is None or pd.isna(rank):
+        return np.nan
+    r = int(rank)
+    return float(max(0, 100 - 10 * (r - 1)))
+
+
+def _hof_compute_week_points(df: pd.DataFrame) -> pd.DataFrame:
+    """Add ye_points column: gross-era uses % of #1 gross; pre-gross-era uses inverse rank points."""
+    if df.empty:
+        df = df.copy()
+        df["ye_points"] = pd.Series(dtype=float)
+        return df
+
+    out = df.copy()
+    out["week_ending_dt"] = pd.to_datetime(out["week_ending"], errors="coerce")
+    out["gross_millions"] = pd.to_numeric(out.get("gross_millions"), errors="coerce")
+
+    # top1 gross per week (only meaningful in gross-era)
+    wk = out.groupby("week_ending_dt", dropna=False)
+    top1 = (
+        out[out["rank"] == 1]
+        .groupby("week_ending_dt", dropna=False)["gross_millions"]
+        .max()
+        .rename("top1_gross")
+    )
+    out = out.join(top1, on="week_ending_dt")
+
+    gross_era = out["week_ending_dt"].dt.date >= GROSS_TRACKING_START
+    has_gross = out["gross_millions"].notna() & out["top1_gross"].notna() & (out["top1_gross"] > 0)
+
+    out["ye_points"] = np.nan
+
+    # Gross era points
+    mask = gross_era & has_gross
+    out.loc[mask, "ye_points"] = (out.loc[mask, "gross_millions"] / out.loc[mask, "top1_gross"]) * 100.0
+
+    # Pre-gross era OR missing gross -> inverse rank points
+    mask2 = ~mask
+    out.loc[mask2, "ye_points"] = out.loc[mask2, "rank"].apply(_hof_inverse_rank_points)
+
+    out = out.drop(columns=["top1_gross"])
+    return out
+
+
+@st.cache_data(show_spinner=False)
+def _load_hof_weekly_base(db_path: str, db_mtime: float) -> pd.DataFrame:
+    """All weekly rows needed for Hall of Fame (includes bonus gross + ye_points)."""
+    con = sqlite3.connect(db_path)
+    try:
+        df = pd.read_sql_query(
+            """
+            SELECT
+              e.week_ending,
+              e.week_number,
+              e.rank,
+              e.pos,
+              e.show_id,
+              s.canonical_title,
+              COALESCE(NULLIF(TRIM(e.imprint_1), ''), '(Unknown)') AS imprint_1,
+              COALESCE(NULLIF(TRIM(e.imprint_2), ''), '(Unknown)') AS imprint_2,
+              (e.gross_millions + COALESCE(gb.bonus_millions, 0)) AS gross_millions
+            FROM t10_entry e
+            JOIN show s ON s.show_id = e.show_id
+            LEFT JOIN (
+              SELECT show_id, week_ending, SUM(bonus_millions) AS bonus_millions
+              FROM gross_bonus
+              GROUP BY show_id, week_ending
+            ) gb ON gb.show_id = e.show_id AND gb.week_ending = e.week_ending
+            WHERE e.week_ending IS NOT NULL
+            """,
+            con,
+        )
+    finally:
+        con.close()
+
+    if df.empty:
+        return df
+
+    df["week_ending"] = _as_date_str(df["week_ending"])
+    df["week_ending_dt"] = pd.to_datetime(df["week_ending"], errors="coerce")
+    df["year"] = df["week_ending_dt"].dt.year.astype("Int64")
+    df["month"] = df["week_ending_dt"].dt.month.astype("Int64")
+    df["quarter"] = df["week_ending_dt"].dt.quarter.astype("Int64")
+
+    # Points
+    df = _hof_compute_week_points(df)
+
+    return df
+
+
+def _hof_apply_filters(df: pd.DataFrame, date_min: str | None, date_max: str | None, rank_min: int, rank_max: int) -> pd.DataFrame:
+    out = df
+    if date_min:
+        dmin = pd.to_datetime(date_min, errors="coerce")
+        if pd.notna(dmin):
+            out = out[out["week_ending_dt"] >= dmin]
+    if date_max:
+        dmax = pd.to_datetime(date_max, errors="coerce")
+        if pd.notna(dmax):
+            out = out[out["week_ending_dt"] <= dmax]
+    out = out[(out["rank"] >= int(rank_min)) & (out["rank"] <= int(rank_max))]
+    return out.copy()
+
+
+def _hof_company_universe(df: pd.DataFrame) -> pd.DataFrame:
+    """Explode imprint_1 + imprint_2 into a single company universe.
+
+    - Counts imprint_1 rows
+    - Counts imprint_2 rows
+    - Avoids double-counting when imprint_2 == imprint_1 for the same chart row
+    - Hall of Fame: suppress '(Unknown)' / blank companies so they don't dominate leaderboards
+    """
+    if df is None or df.empty:
+        return df.copy() if df is not None else pd.DataFrame()
+
+    base = df.copy()
+
+    # Defensive: if upstream merges accidentally created duplicate column names,
+    # keep the first instance so column selection yields a Series (not a DataFrame).
+    if base.columns.duplicated().any():
+        base = base.loc[:, ~base.columns.duplicated()].copy()
+
+    # If this frame already has a 'company' column (i.e., it has already been exploded),
+    # drop it before renaming to avoid duplicate 'company' columns.
+    if "company" in base.columns:
+        base = base.drop(columns=["company"])
+
+    # Ensure expected columns exist
+    if "imprint_1" not in base.columns:
+        base["imprint_1"] = "(Unknown)"
+    if "imprint_2" not in base.columns:
+        base["imprint_2"] = "(Unknown)"
+
+    base["imprint_1"] = base["imprint_1"].fillna("(Unknown)").astype("string")
+    base["imprint_2"] = base["imprint_2"].fillna("(Unknown)").astype("string")
+
+    a = base.rename(columns={"imprint_1": "company"}).copy()
+    b = base.rename(columns={"imprint_2": "company"}).copy()
+
+    # Remove rows where imprint_2 equals imprint_1 (row-wise) to avoid double count
+    b = b[b["company"].astype("string").str.strip() != b["imprint_1"].astype("string").str.strip()]
+
+    out = pd.concat([a, b], ignore_index=True)
+    out["company"] = out["company"].fillna("(Unknown)").astype("string")
+
+    # Hall of Fame: suppress unknown/blank companies so they don't dominate leaderboards.
+    _c = out["company"].astype("string").str.strip()
+    out = out[(_c != "(Unknown)") & (_c != "")].copy()
+    return out
+
+
+def _hof_agg_shows(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return pd.DataFrame()
+
+    g = df.groupby(["show_id", "canonical_title"], dropna=False)
+
+    out = g.agg(
+        weeks_charting=("week_ending", "nunique"),
+        top10_weeks=("rank", lambda s: int((pd.to_numeric(s, errors="coerce") <= 10).sum())),
+        top5_weeks=("rank", lambda s: int((pd.to_numeric(s, errors="coerce") <= 5).sum())),
+        weeks_at_1=("rank", lambda s: int((pd.to_numeric(s, errors="coerce") == 1).sum())),
+        peak_rank=("rank", lambda s: int(pd.to_numeric(s, errors="coerce").min())),
+        avg_rank=("rank", lambda s: float(pd.to_numeric(s, errors="coerce").mean())),
+        median_rank=("rank", lambda s: float(pd.to_numeric(s, errors="coerce").median())),
+        total_gross_millions=("gross_millions", lambda s: float(pd.to_numeric(s, errors="coerce").fillna(0).sum())),
+        total_ye_points=("ye_points", lambda s: float(pd.to_numeric(s, errors="coerce").fillna(0).sum())),
+        first_week=("week_ending", "min"),
+        last_week=("week_ending", "max"),
+    ).reset_index()
+
+    return out
+
+
+def _hof_agg_companies(df_company: pd.DataFrame) -> pd.DataFrame:
+    if df_company.empty:
+        return pd.DataFrame()
+
+    g = df_company.groupby(["company"], dropna=False)
+
+    out = g.agg(
+        entries=("week_ending", "count"),
+        unique_shows_charted=("show_id", "nunique"),
+        weeks_charting=("week_ending", "nunique"),
+        weeks_at_1_sum=("rank", lambda s: int((pd.to_numeric(s, errors="coerce") == 1).sum())),
+        total_gross_millions=("gross_millions", lambda s: float(pd.to_numeric(s, errors="coerce").fillna(0).sum())),
+        total_ye_points=("ye_points", lambda s: float(pd.to_numeric(s, errors="coerce").fillna(0).sum())),
+        first_week=("week_ending", "min"),
+        last_week=("week_ending", "max"),
+    ).reset_index()
+
+    return out
+
+
+def _hof_badge_pack_show(row: dict[str, Any], flags: dict[str, bool]) -> list[tuple[str, str, str]]:
+    """Return list of (emoji, label, earned_how)."""
+    badges: list[tuple[str, str, str]] = []
+
+    weeks_at_1 = float(row.get("weeks_at_1", 0) or 0)
+    weeks_charting = float(row.get("weeks_charting", 0) or 0)
+    top10_weeks = float(row.get("top10_weeks", 0) or 0)
+    top5_weeks = float(row.get("top5_weeks", 0) or 0)
+    peak_rank = int(row.get("peak_rank", 999) or 999)
+    med_rank = float(row.get("median_rank", 999) or 999)
+    total_gross = float(row.get("total_gross_millions", 0) or 0)
+    total_points = float(row.get("total_ye_points", 0) or 0)
+
+    # Dominance
+    if weeks_at_1 >= 10:
+        badges.append(("🏆", "#1 Legend", f"Weeks at #1: {int(weeks_at_1)}"))
+    if weeks_at_1 >= 25:
+        badges.append(("🥇", "Crown Collector", f"Weeks at #1: {int(weeks_at_1)}"))
+    if peak_rank == 1 and weeks_charting >= 20:
+        badges.append(("⚡", "Peak Monster", f"Peak #1, weeks charting: {int(weeks_charting)}"))
+
+    # Longevity
+    if weeks_charting >= 52:
+        badges.append(("👑", "Chart Emperor", f"Weeks charting: {int(weeks_charting)}"))
+    if top10_weeks >= 104:
+        badges.append(("🧱", "Top 10 Ironman", f"Top 10 weeks: {int(top10_weeks)}"))
+
+    # Consistency
+    if weeks_charting >= 20 and (top5_weeks / max(1.0, weeks_charting)) >= 0.70:
+        badges.append(("🎯", "Consistency King", f"Top 5 rate: {top5_weeks/max(1.0,weeks_charting):.0%} over {int(weeks_charting)} weeks"))
+    if weeks_charting >= 20 and med_rank <= 5:
+        badges.append(("🧊", "Steady Climber", f"Median rank: {med_rank:.1f} over {int(weeks_charting)} weeks"))
+
+    # Money / points
+    if total_gross >= HOF_G1_SHOW_GROSS:
+        badges.append(("💰", "Box Office Beast", f"Total gross: {total_gross:,.0f}M"))
+    if total_points >= HOF_P1_SHOW_POINTS:
+        badges.append(("📈", "Points Machine", f"Total points: {total_points:,.0f}"))
+
+    # Narrative / wings
+    if flags.get("comeback", False):
+        badges.append(("🪃", "Comeback Kid", "Returned after a long absence and charted in multiple distinct runs."))
+    if flags.get("gatekeeper", False):
+        badges.append(("🚪", "Gatekeeper", "Huge Top 10 presence without ever hitting #1."))
+    if flags.get("onehit", False):
+        badges.append(("🧨", "One-Hit Titan", "Exactly one week at #1 with a short overall run."))
+
+    return badges
+
+
+def _hof_badge_pack_company(row: dict[str, Any], flags: dict[str, bool]) -> list[tuple[str, str, str]]:
+    badges: list[tuple[str, str, str]] = []
+
+    uniq = float(row.get("unique_shows_charted", 0) or 0)
+    weeks1 = float(row.get("weeks_at_1_sum", 0) or 0)
+    gross = float(row.get("total_gross_millions", 0) or 0)
+    points = float(row.get("total_ye_points", 0) or 0)
+    years_distinct = float(row.get("years_distinct", 0) or 0)
+
+    if uniq >= 25:
+        badges.append(("🏢", "Hit Factory", f"Unique shows charted: {int(uniq)}"))
+    if flags.get("deep_bench", False):
+        badges.append(("🧠", "Deep Bench", "Had at least one year with a big cluster of strong point-getters."))
+    if weeks1 >= 52:
+        badges.append(("🥇", "#1 Machine", f"Weeks at #1 (sum): {int(weeks1)}"))
+    if gross >= HOF_CG1_COMPANY_GROSS:
+        badges.append(("💼", "Box Office Titan", f"Total gross: {gross:,.0f}M"))
+    if points >= HOF_CP1_COMPANY_POINTS:
+        badges.append(("📊", "Points Empire", f"Total points: {points:,.0f}"))
+    if flags.get("dynasty_year", False):
+        badges.append(("🏰", "Dynasty Year", "Won at least one year-long championship."))
+    if years_distinct >= 10:
+        badges.append(("🗓️", "Era Staple", f"Distinct years with meaningful presence: {int(years_distinct)}"))
+    if flags.get("seasonal", False):
+        badges.append(("🌡️", "Seasonal Specialists", "Won at least one seasonal bucket title."))
+
+    return badges
+
+
+def _hof_pick_badges_for_table(badges: list[tuple[str, str, str]], order: list[str]) -> tuple[str, int]:
+    """Return (rendered_badge_str, extra_count)."""
+    if not badges:
+        return ("", 0)
+
+    by_label = {lbl: (emo, lbl, how) for (emo, lbl, how) in badges}
+    picked: list[str] = []
+    for lbl in order:
+        if lbl in by_label:
+            emo = by_label[lbl][0]
+            picked.append(f"{emo} {lbl}")
+        if len(picked) >= HOF_TABLE_MAX_BADGES:
+            break
+
+    extra = max(0, len(badges) - len(picked))
+    return (" · ".join(picked) + (f"  +{extra}" if extra else ""), extra)
+
+
+def _hof_wing_gatekeepers(agg: pd.DataFrame) -> pd.DataFrame:
+    if agg.empty:
+        return agg
+    out = agg[
+        (agg["top10_weeks"] >= 40) &
+        (agg["weeks_at_1"] == 0) &
+        (agg["peak_rank"].isin([2, 3]))
+    ].copy()
+    out["gatekeeper"] = True
+    return out.sort_values(["top10_weeks", "weeks_charting"], ascending=False)
+
+
+def _hof_wing_one_hit_titans(agg: pd.DataFrame) -> pd.DataFrame:
+    if agg.empty:
+        return agg
+    out = agg[(agg["weeks_at_1"] == 1) & (agg["weeks_charting"] <= 6)].copy()
+    out["onehit"] = True
+    return out.sort_values(["weeks_charting", "total_ye_points"], ascending=False)
+
+
+def _hof_wing_comeback_kids(df: pd.DataFrame, gap_weeks: int = 13, min_runs: int = 2) -> pd.DataFrame:
+    """Return per-show comeback metadata: max_gap_weeks, runs, total_weeks."""
+    if df.empty:
+        return pd.DataFrame()
+
+    use_weeknum = df["week_number"].notna().sum() > 0
+    out_rows = []
+
+    for (sid, title), g in df.groupby(["show_id", "canonical_title"], dropna=False):
+        gg = g.sort_values(["week_number" if use_weeknum else "week_ending_dt"]).copy()
+
+        if use_weeknum:
+            idx = pd.to_numeric(gg["week_number"], errors="coerce").astype("Int64")
+            diffs = idx.diff()
+            gaps = diffs.fillna(1).astype("float")
+        else:
+            dt = pd.to_datetime(gg["week_ending_dt"], errors="coerce")
+            gaps = dt.diff().dt.days.div(7.0)
+
+        gaps = pd.to_numeric(gaps, errors="coerce").fillna(1.0)
+
+        # New run whenever gap >= gap_weeks
+        new_run = (gaps >= float(gap_weeks)).astype(int)
+        run_id = new_run.cumsum()
+
+        runs = int(run_id.nunique())
+        if runs < min_runs:
+            continue
+
+        max_gap = float(gaps.max())
+        if max_gap < float(gap_weeks):
+            continue
+
+        out_rows.append({
+            "show_id": sid,
+            "canonical_title": title,
+            "runs": runs,
+            "max_gap_weeks": max_gap,
+            "weeks_charting": int(gg["week_ending"].nunique()),
+        })
+
+    out = pd.DataFrame(out_rows)
+    if out.empty:
+        return out
+    out["comeback"] = True
+    return out.sort_values(["max_gap_weeks", "runs", "weeks_charting"], ascending=False)
+
+
+def _hof_wing_dynasty_champions(df: pd.DataFrame, entity: str = "show") -> pd.DataFrame:
+    """Return multi-year champion streaks for show/company by year using ye_points (fallback to gross)."""
+    if df.empty:
+        return pd.DataFrame()
+
+    if entity == "company":
+        base = _hof_company_universe(df)
+        grp_cols = ["year", "company"]
+        label_col = "company"
+    else:
+        base = df
+        grp_cols = ["year", "canonical_title"]
+        label_col = "canonical_title"
+
+    base = base.dropna(subset=["year"])
+    if base.empty:
+        return pd.DataFrame()
+
+    yearly = (
+        base.groupby(grp_cols, dropna=False)
+        .agg(points=("ye_points", lambda s: float(pd.to_numeric(s, errors="coerce").fillna(0).sum())),
+             gross=("gross_millions", lambda s: float(pd.to_numeric(s, errors="coerce").fillna(0).sum())))
+        .reset_index()
+    )
+    # champion per year by points, tie-breaker gross
+    yearly = yearly.sort_values(["year", "points", "gross"], ascending=[True, False, False])
+    champs = yearly.groupby("year", as_index=False).first()
+    champs = champs.sort_values("year")
+
+    # compute streaks of consecutive years
+    champs["prev_year"] = champs["year"].shift(1)
+    champs["prev_label"] = champs[label_col].shift(1)
+    champs["new_streak"] = (champs["year"] != (champs["prev_year"] + 1)) | (champs[label_col] != champs["prev_label"])
+    champs["streak_id"] = champs["new_streak"].cumsum()
+
+    streaks = (
+        champs.groupby(["streak_id", label_col], dropna=False)
+        .agg(start_year=("year", "min"), end_year=("year", "max"), years=("year", "count"))
+        .reset_index()
+    )
+    streaks = streaks[streaks["years"] >= 2].copy()
+    if streaks.empty:
+        return pd.DataFrame(columns=["label","start_year","end_year","years"])
+
+    streaks["label"] = streaks[label_col].astype("string")
+    return streaks.sort_values(["years", "end_year"], ascending=False)[["label", "start_year", "end_year", "years"]]
+
+
+def _hof_company_deep_bench_flags(df_company: pd.DataFrame) -> dict[str, bool]:
+    """Return {company: deep_bench_bool} based on year-level depth."""
+    if df_company.empty:
+        return {}
+
+    # points per (company, show, year)
+    base = df_company.dropna(subset=["year"]).copy()
+    base["ye_points"] = pd.to_numeric(base["ye_points"], errors="coerce").fillna(0.0)
+
+    show_year = (
+        base.groupby(["company", "show_id", "year"], dropna=False)["ye_points"]
+        .sum()
+        .reset_index(name="year_points")
+    )
+    show_year["is_strong"] = show_year["year_points"] >= float(HOF_DEEP_BENCH_YEAR_POINTS_X)
+
+    depth = (
+        show_year.groupby(["company", "year"], dropna=False)["is_strong"]
+        .sum()
+        .reset_index(name="strong_shows")
+    )
+
+    best = depth.groupby("company", dropna=False)["strong_shows"].max()
+    return {c: bool(v >= HOF_DEEP_BENCH_MIN_SHOWS) for c, v in best.items()}
+
+
+def _hof_company_dynasty_year_flags(df_company: pd.DataFrame) -> dict[str, bool]:
+    """Return {company: dynasty_year_bool} if the company is a year champion at least once.
+
+    Accepts company-universe weekly rows (must include a 'company' column). If a show-week
+    frame is passed accidentally, we will explode it into the company universe.
+    """
+    if df_company is None or df_company.empty:
+        return {}
+
+    base = df_company
+    if "company" not in base.columns:
+        base = _hof_company_universe(base)
+
+    base = base.dropna(subset=["year"]).copy()
+    if base.empty:
+        return {}
+
+    # Per (year, company) totals
+    base["ye_points"] = pd.to_numeric(base.get("ye_points"), errors="coerce").fillna(0.0)
+    base["gross_millions"] = pd.to_numeric(base.get("gross_millions"), errors="coerce").fillna(0.0)
+
+    yearly = (
+        base.groupby(["year", "company"], dropna=False)
+        .agg(points=("ye_points", "sum"), gross=("gross_millions", "sum"))
+        .reset_index()
+    )
+    yearly = yearly.sort_values(["year", "points", "gross"], ascending=[True, False, False])
+
+    # Champion per year (top points; tiebreak gross)
+    champs = yearly.groupby("year", as_index=False).first()
+    return {str(c): True for c in champs["company"].dropna().tolist()}
+
+
+def tab_hall_of_fame():
+    st.subheader("Hall of Fame")
+    st.caption("A narrative-first museum of dominance, longevity, and weird, fun chart lore — powered by your ye_points system.")
+
+    db_path = str(DB_PATH)
+    db_mtime = DB_PATH.stat().st_mtime
+    base = _load_hof_weekly_base(db_path, db_mtime)
+
+    if base is None or base.empty:
+        st.info("No chart rows found yet.")
+        return
+
+    with st.sidebar:
+        st.header("Hall of Fame filters")
+        date_min = st.text_input("Start date (YYYY-MM-DD)", value="", key="hof_date_min")
+        date_max = st.text_input("End date (YYYY-MM-DD)", value="", key="hof_date_max")
+        rank_min, rank_max = st.slider("Rank range (HOF)", 1, 50, (1, 10), key="hof_rank_range")
+        top_n = st.slider("Top N (tables)", 10, 300, 50, step=10, key="hof_top_n")
+        comeback_gap = st.selectbox("Comeback gap (weeks)", [13, 26], index=0, key="hof_comeback_gap")
+        badge_scope = st.radio("Badges scope", ["Lifetime", "Current filters"], index=0, key="hof_badge_scope")
+
+    df_filt = _hof_apply_filters(
+        base,
+        date_min.strip() or None,
+        date_max.strip() or None,
+        int(rank_min),
+        int(rank_max),
+    )
+
+    # Lifetime aggregates for badges / profile toggles
+    agg_life = _hof_agg_shows(base)
+    agg_cur = _hof_agg_shows(df_filt)
+
+    # Wings (computed on current-filter rows for coherence)
+    wing_gate = _hof_wing_gatekeepers(agg_cur)
+    wing_onehit = _hof_wing_one_hit_titans(agg_cur)
+    wing_comeback = _hof_wing_comeback_kids(df_filt, gap_weeks=int(comeback_gap), min_runs=2)
+
+    gate_ids = set(wing_gate["show_id"].tolist()) if not wing_gate.empty else set()
+    onehit_ids = set(wing_onehit["show_id"].tolist()) if not wing_onehit.empty else set()
+    comeback_ids = set(wing_comeback["show_id"].tolist()) if not wing_comeback.empty else set()
+
+    # Company universe + flags
+    comp_life_rows = _hof_company_universe(base)
+    comp_cur_rows = _hof_company_universe(df_filt)
+    comp_agg_life = _hof_agg_companies(comp_life_rows)
+    comp_agg_cur = _hof_agg_companies(comp_cur_rows)
+
+    deep_bench_flags = _hof_company_deep_bench_flags(comp_cur_rows if badge_scope == "Current filters" else comp_life_rows)
+    dynasty_year_flags = _hof_company_dynasty_year_flags(comp_cur_rows if badge_scope == "Current filters" else comp_life_rows)
+
+    # Distinct years for "Era Staple" (based on year_points>=200)
+    def _years_distinct(company_rows: pd.DataFrame) -> dict[str, int]:
+        if company_rows.empty:
+            return {}
+        tmp = company_rows.dropna(subset=["year"]).copy()
+        tmp["ye_points"] = pd.to_numeric(tmp["ye_points"], errors="coerce").fillna(0.0)
+        yr = tmp.groupby(["company", "year"])["ye_points"].sum().reset_index(name="year_points")
+        yr = yr[yr["year_points"] >= 200.0]
+        return yr.groupby("company")["year"].nunique().to_dict()
+
+    years_distinct = _years_distinct(comp_cur_rows if badge_scope == "Current filters" else comp_life_rows)
+
+    # Which aggregate to use for badges / views
+    agg_for_badges = agg_life if badge_scope == "Lifetime" else agg_cur
+    comp_for_badges = comp_agg_life if badge_scope == "Lifetime" else comp_agg_cur
+
+    # Sub-tabs
+    sub = st.tabs(["Inductees", "Leaderboards", "Wings", "Profiles", "Years & Seasons"])
+
+    # -------------------
+    # Inductees
+    # -------------------
+    with sub[0]:
+        st.markdown("### Inductees")
+        mode = st.radio("Inductees type", ["Shows", "Companies"], horizontal=True, index=0, key="hof_ind_type")
+
+        if mode == "Shows":
+            a = agg_cur.copy()
+            if a.empty:
+                st.info("No shows match your current filters.")
+            else:
+                a = a[a["weeks_charting"] >= int(HOF_INDUCT_MIN_WEEKS)].copy()
+
+                # simple deterministic score
+                a["hof_score"] = (
+                    a["total_ye_points"]
+                    + a["weeks_at_1"] * 50.0
+                    + a["top10_weeks"] * 5.0
+                    + a["total_gross_millions"] * 0.10
+                )
+
+                # badges per row
+                flags_map = {}
+                for sid in a["show_id"].tolist():
+                    flags_map[int(sid)] = {
+                        "comeback": int(sid) in comeback_ids,
+                        "gatekeeper": int(sid) in gate_ids,
+                        "onehit": int(sid) in onehit_ids,
+                    }
+
+                # attach badge summary
+                badge_strs = []
+                for _, r in a.iterrows():
+                    sid = int(r["show_id"])
+                    ref_row = agg_for_badges[agg_for_badges["show_id"] == sid]
+                    rr = (ref_row.iloc[0].to_dict() if not ref_row.empty else r.to_dict())
+                    badges = _hof_badge_pack_show(rr, flags_map.get(sid, {}))
+                    btxt, _ = _hof_pick_badges_for_table(badges, _HOF_BADGE_ORDER_SHOW)
+                    badge_strs.append(btxt)
+                a["badges"] = badge_strs
+
+                out = a.sort_values(["hof_score", "total_ye_points"], ascending=False).head(int(top_n))
+                show_cols = [
+                    "hof_score",
+                    "canonical_title",
+                    "badges",
+                    "total_ye_points",
+                    "weeks_at_1",
+                    "weeks_charting",
+                    "total_gross_millions",
+                    "peak_rank",
+                    "first_week",
+                    "last_week",
+                ]
+                st.dataframe(out[show_cols], use_container_width=True, hide_index=True)
+
+        else:
+            c = comp_agg_cur.copy()
+            if c.empty:
+                st.info("No companies match your current filters.")
+            else:
+                c["years_distinct"] = c["company"].map(years_distinct).fillna(0).astype(int)
+
+                # score
+                c["hof_score"] = (
+                    c["total_ye_points"]
+                    + c["weeks_at_1_sum"] * 25.0
+                    + c["unique_shows_charted"] * 30.0
+                    + c["total_gross_millions"] * 0.05
+                )
+
+                badge_strs = []
+                for _, r in c.iterrows():
+                    company = str(r["company"])
+                    ref = comp_for_badges[comp_for_badges["company"] == company]
+                    rr = (ref.iloc[0].to_dict() if not ref.empty else r.to_dict())
+                    rr["years_distinct"] = years_distinct.get(company, 0)
+                    flags = {
+                        "deep_bench": deep_bench_flags.get(company, False),
+                        "dynasty_year": dynasty_year_flags.get(company, False),
+                        "seasonal": False,
+                    }
+                    badges = _hof_badge_pack_company(rr, flags)
+                    btxt, _ = _hof_pick_badges_for_table(badges, _HOF_BADGE_ORDER_COMPANY)
+                    badge_strs.append(btxt)
+
+                c["badges"] = badge_strs
+                out = c.sort_values(["hof_score", "total_ye_points"], ascending=False).head(int(top_n))
+                cols = [
+                    "hof_score",
+                    "company",
+                    "badges",
+                    "total_ye_points",
+                    "weeks_at_1_sum",
+                    "unique_shows_charted",
+                    "total_gross_millions",
+                    "years_distinct",
+                    "first_week",
+                    "last_week",
+                ]
+                st.dataframe(out[cols], use_container_width=True, hide_index=True)
+
+    # -------------------
+    # Leaderboards
+    # -------------------
+    with sub[1]:
+        st.markdown("### Leaderboards")
+        st.caption("Fast leaderboards — your usual ‘who’s the best at *this* one thing’ view.")
+
+        a = agg_cur.copy()
+        if a.empty:
+            st.info("No shows match your current filters.")
+        else:
+            col1, col2 = st.columns(2)
+            with col1:
+                st.markdown("**Shows — most weeks at #1**")
+                st.dataframe(
+                    a.sort_values(["weeks_at_1", "total_ye_points"], ascending=False)
+                    .head(int(top_n))[["canonical_title", "weeks_at_1", "weeks_charting", "total_ye_points"]],
+                    use_container_width=True,
+                    hide_index=True,
+                )
+                st.markdown("**Shows — most total points**")
+                st.dataframe(
+                    a.sort_values(["total_ye_points", "weeks_charting"], ascending=False)
+                    .head(int(top_n))[["canonical_title", "total_ye_points", "weeks_at_1", "weeks_charting"]],
+                    use_container_width=True,
+                    hide_index=True,
+                )
+            with col2:
+                st.markdown("**Shows — most weeks charting**")
+                st.dataframe(
+                    a.sort_values(["weeks_charting", "total_ye_points"], ascending=False)
+                    .head(int(top_n))[["canonical_title", "weeks_charting", "peak_rank", "total_ye_points"]],
+                    use_container_width=True,
+                    hide_index=True,
+                )
+                st.markdown("**Shows — most total gross**")
+                st.dataframe(
+                    a.sort_values(["total_gross_millions", "total_ye_points"], ascending=False)
+                    .head(int(top_n))[["canonical_title", "total_gross_millions", "weeks_charting", "total_ye_points"]],
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
+        st.divider()
+
+        c = comp_agg_cur.copy()
+        if c.empty:
+            st.info("No companies match your current filters.")
+        else:
+            c["years_distinct"] = c["company"].map(years_distinct).fillna(0).astype(int)
+            col1, col2 = st.columns(2)
+            with col1:
+                st.markdown("**Companies — most total points**")
+                st.dataframe(
+                    c.sort_values(["total_ye_points"], ascending=False)
+                    .head(int(top_n))[["company", "total_ye_points", "unique_shows_charted", "weeks_at_1_sum"]],
+                    use_container_width=True,
+                    hide_index=True,
+                )
+                st.markdown("**Companies — most weeks at #1 (sum)**")
+                st.dataframe(
+                    c.sort_values(["weeks_at_1_sum", "total_ye_points"], ascending=False)
+                    .head(int(top_n))[["company", "weeks_at_1_sum", "total_ye_points", "unique_shows_charted"]],
+                    use_container_width=True,
+                    hide_index=True,
+                )
+            with col2:
+                st.markdown("**Companies — most total gross**")
+                st.dataframe(
+                    c.sort_values(["total_gross_millions", "total_ye_points"], ascending=False)
+                    .head(int(top_n))[["company", "total_gross_millions", "total_ye_points", "unique_shows_charted"]],
+                    use_container_width=True,
+                    hide_index=True,
+                )
+                st.markdown("**Companies — deepest catalog**")
+                st.dataframe(
+                    c.sort_values(["unique_shows_charted", "total_ye_points"], ascending=False)
+                    .head(int(top_n))[["company", "unique_shows_charted", "total_ye_points", "years_distinct"]],
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
+    # -------------------
+    # Wings
+    # -------------------
+    with sub[2]:
+        st.markdown("### Wings")
+        st.caption("The museum exhibits. Each one is a different flavor of greatness (or chaos).")
+
+        # Expanders default behavior
+        with st.expander("Dynasties", expanded=True):
+            with st.expander("Company Dynasties (Year)", expanded=True):
+                dco = _hof_wing_dynasty_champions(comp_cur_rows, entity="company")
+                if dco.empty:
+                    st.info("No multi-year company champion streaks in this filter range.")
+                else:
+                    st.dataframe(dco, use_container_width=True, hide_index=True)
+
+            with st.expander("Show Dynasties (Multi-year)", expanded=False):
+                dsh = _hof_wing_dynasty_champions(df_filt, entity="show")
+                if dsh.empty:
+                    st.info("No multi-year show champion streaks in this filter range.")
+                else:
+                    st.dataframe(dsh, use_container_width=True, hide_index=True)
+
+        with st.expander("Prime Runs", expanded=False):
+            st.caption("Longest streaks of being elite (rank ≤ 3) inside the current filters.")
+            if df_filt.empty:
+                st.info("No rows match your filters.")
+            else:
+                use_weeknum = df_filt["week_number"].notna().sum() > 0
+                rows = []
+                for (sid, title), g in df_filt.groupby(["show_id", "canonical_title"], dropna=False):
+                    gg = g.sort_values(["week_number" if use_weeknum else "week_ending_dt"]).copy()
+                    elite = (pd.to_numeric(gg["rank"], errors="coerce") <= 3).astype(int)
+                    # compute longest consecutive 1s
+                    longest = 0
+                    cur = 0
+                    for v in elite.tolist():
+                        if v == 1:
+                            cur += 1
+                            longest = max(longest, cur)
+                        else:
+                            cur = 0
+                    if longest >= 6:
+                        rows.append({"show_id": sid, "canonical_title": title, "prime_run_weeks(rank<=3)": longest})
+                d = pd.DataFrame(rows).sort_values("prime_run_weeks(rank<=3)", ascending=False).head(int(top_n))
+                if d.empty:
+                    st.info("No prime runs found (try widening date/rank filters).")
+                else:
+                    st.dataframe(d, use_container_width=True, hide_index=True)
+
+        with st.expander("Gatekeepers", expanded=False):
+            st.caption("Massive Top 10 presence, peak rank #2–#3, *never* hit #1.")
+            if wing_gate.empty:
+                st.info("No gatekeepers found in this filter range.")
+            else:
+                st.dataframe(
+                    wing_gate.head(int(top_n))[["canonical_title", "top10_weeks", "weeks_charting", "peak_rank", "total_ye_points"]],
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
+        with st.expander("Comeback Kids", expanded=False):
+            st.caption(f"Shows with distinct runs separated by a **{int(comeback_gap)}+ week** gap.")
+            if wing_comeback.empty:
+                st.info("No comeback kids found in this filter range.")
+            else:
+                st.dataframe(
+                    wing_comeback.head(int(top_n))[["canonical_title", "runs", "max_gap_weeks", "weeks_charting"]],
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
+        with st.expander("Seasonal Bosses", expanded=False):
+            st.caption("Month & quarter champs across all years in the current filter range (by total ye_points).")
+            tmp = df_filt.dropna(subset=["month", "quarter", "year"]).copy()
+            if tmp.empty:
+                st.info("Not enough dated rows for seasonal titles.")
+            else:
+                m = (
+                    tmp.groupby(["month", "canonical_title"], dropna=False)["ye_points"]
+                    .sum()
+                    .reset_index(name="points")
+                    .sort_values(["month", "points"], ascending=[True, False])
+                    .groupby("month", as_index=False)
+                    .first()
+                )
+                q = (
+                    tmp.groupby(["quarter", "canonical_title"], dropna=False)["ye_points"]
+                    .sum()
+                    .reset_index(name="points")
+                    .sort_values(["quarter", "points"], ascending=[True, False])
+                    .groupby("quarter", as_index=False)
+                    .first()
+                )
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.markdown("**Month champs**")
+                    st.dataframe(m, use_container_width=True, hide_index=True)
+                with col2:
+                    st.markdown("**Quarter champs**")
+                    st.dataframe(q, use_container_width=True, hide_index=True)
+
+        with st.expander("One-Hit Titans", expanded=False):
+            st.caption("Exactly 1 week at #1, and ≤ 6 total weeks charting.")
+            if wing_onehit.empty:
+                st.info("No one-hit titans found in this filter range.")
+            else:
+                st.dataframe(
+                    wing_onehit.head(int(top_n))[["canonical_title", "weeks_at_1", "weeks_charting", "total_ye_points", "total_gross_millions"]],
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
+    # -------------------
+    # Profiles
+    # -------------------
+    with sub[3]:
+        st.markdown("### Profiles")
+        st.caption("Pick a show or company and see the full badge wall + core stats.")
+
+        mode = st.radio("Profile type", ["Show", "Company"], horizontal=True, index=0, key="hof_profile_type")
+        if mode == "Show":
+            titles = agg_cur.sort_values("canonical_title")["canonical_title"].tolist()
+            if not titles:
+                st.info("No shows match your current filters.")
+            else:
+                pick = st.selectbox("Show", titles, key="hof_profile_show")
+                row = agg_cur[agg_cur["canonical_title"] == pick].iloc[0].to_dict()
+
+                sid = int(row["show_id"])
+                flags = {
+                    "comeback": sid in comeback_ids,
+                    "gatekeeper": sid in gate_ids,
+                    "onehit": sid in onehit_ids,
+                }
+                badge_row = (agg_for_badges[agg_for_badges["show_id"] == sid].iloc[0].to_dict()
+                             if not agg_for_badges[agg_for_badges["show_id"] == sid].empty else row)
+                badges = _hof_badge_pack_show(badge_row, flags)
+
+                c1, c2, c3, c4 = st.columns(4)
+                c1.metric("Weeks charting", int(row.get("weeks_charting", 0)))
+                c2.metric("Weeks at #1", int(row.get("weeks_at_1", 0)))
+                c3.metric("Peak rank", int(row.get("peak_rank", 999)))
+                c4.metric("Total points", f"{float(row.get('total_ye_points', 0)):,.0f}")
+
+                st.write({
+                    "Total gross (M)": float(row.get("total_gross_millions", 0)),
+                    "Top 10 weeks": int(row.get("top10_weeks", 0)),
+                    "Top 5 weeks": int(row.get("top5_weeks", 0)),
+                    "Median rank": float(row.get("median_rank", np.nan)),
+                    "First week": row.get("first_week"),
+                    "Last week": row.get("last_week"),
+                })
+
+                st.markdown("#### Badges")
+                if not badges:
+                    st.caption("No badges earned under this scope.")
+                else:
+                    # Full badge wall
+                    for emo, lbl, how in sorted(badges, key=lambda t: _HOF_BADGE_ORDER_SHOW.index(t[1]) if t[1] in _HOF_BADGE_ORDER_SHOW else 999):
+                        st.write(f"{emo} **{lbl}** — {how}")
+
+                with st.expander("Weekly rows (current filters)", expanded=False):
+                    led = df_filt[df_filt["show_id"] == sid].sort_values("week_ending_dt", ascending=False)
+                    if led.empty:
+                        st.caption("No rows for this show inside your current filters.")
+                    else:
+                        st.dataframe(
+                            led[["week_ending", "rank", "pos", "gross_millions", "ye_points", "imprint_1", "imprint_2"]],
+                            use_container_width=True,
+                            hide_index=True,
+                        )
+
+        else:
+            comps = comp_agg_cur.sort_values("company")["company"].tolist()
+            if not comps:
+                st.info("No companies match your current filters.")
+            else:
+                pick = st.selectbox("Company", comps, key="hof_profile_company")
+                row = comp_agg_cur[comp_agg_cur["company"] == pick].iloc[0].to_dict()
+                row["years_distinct"] = years_distinct.get(pick, 0)
+
+                flags = {
+                    "deep_bench": deep_bench_flags.get(pick, False),
+                    "dynasty_year": dynasty_year_flags.get(pick, False),
+                    "seasonal": False,
+                }
+
+                ref = comp_for_badges[comp_for_badges["company"] == pick]
+                badge_row = (ref.iloc[0].to_dict() if not ref.empty else row)
+                badge_row["years_distinct"] = years_distinct.get(pick, 0)
+                badges = _hof_badge_pack_company(badge_row, flags)
+
+                c1, c2, c3, c4 = st.columns(4)
+                c1.metric("Unique shows", int(row.get("unique_shows_charted", 0)))
+                c2.metric("Weeks at #1 (sum)", int(row.get("weeks_at_1_sum", 0)))
+                c3.metric("Total points", f"{float(row.get('total_ye_points', 0)):,.0f}")
+                c4.metric("Total gross (M)", f"{float(row.get('total_gross_millions', 0)):,.0f}")
+
+                st.write({
+                    "Entries": int(row.get("entries", 0)),
+                    "Distinct years (>=200 pts)": int(row.get("years_distinct", 0)),
+                    "First week": row.get("first_week"),
+                    "Last week": row.get("last_week"),
+                })
+
+                st.markdown("#### Badges")
+                if not badges:
+                    st.caption("No badges earned under this scope.")
+                else:
+                    for emo, lbl, how in sorted(badges, key=lambda t: _HOF_BADGE_ORDER_COMPANY.index(t[1]) if t[1] in _HOF_BADGE_ORDER_COMPANY else 999):
+                        st.write(f"{emo} **{lbl}** — {how}")
+
+                with st.expander("Company rows (current filters)", expanded=False):
+                    led = comp_cur_rows[comp_cur_rows["company"] == pick].sort_values("week_ending_dt", ascending=False)
+                    if led.empty:
+                        st.caption("No rows for this company inside your current filters.")
+                    else:
+                        st.dataframe(
+                            led[["week_ending", "canonical_title", "rank", "gross_millions", "ye_points"]],
+                            use_container_width=True,
+                            hide_index=True,
+                        )
+
+    # -------------------
+    # Years & Seasons
+    # -------------------
+    with sub[4]:
+        st.markdown("### Years & Seasons")
+        st.caption("Who owned which year? And what does each month/quarter ‘belong’ to?")
+
+        tmp = df_filt.dropna(subset=["year"]).copy()
+        if tmp.empty:
+            st.info("Not enough dated rows in this filter range.")
+        else:
+            y = (
+                tmp.groupby(["year", "canonical_title"], dropna=False)["ye_points"]
+                .sum()
+                .reset_index(name="points")
+                .sort_values(["year", "points"], ascending=[True, False])
+            )
+            champs = y.groupby("year", as_index=False).first()
+            champs = champs.rename(columns={"canonical_title": "year_champ_show", "points": "champ_points"})
+            st.markdown("**Year champs (shows)**")
+            st.dataframe(champs.sort_values("year", ascending=False), use_container_width=True, hide_index=True)
+
+            st.divider()
+
+            yc = _hof_company_universe(tmp)
+            y2 = (
+                yc.groupby(["year", "company"], dropna=False)["ye_points"]
+                .sum()
+                .reset_index(name="points")
+                .sort_values(["year", "points"], ascending=[True, False])
+            )
+            champsc = y2.groupby("year", as_index=False).first().rename(columns={"company": "year_champ_company", "points": "champ_points"})
+            st.markdown("**Year champs (companies)**")
+            st.dataframe(champsc.sort_values("year", ascending=False), use_container_width=True, hide_index=True)
+
+
+
 def main():
     st.set_page_config(page_title=APP_TITLE, layout="wide")
     st.title(APP_TITLE)
@@ -6187,6 +7213,7 @@ def main():
         "Streak Analytics",
         "Holidays",
         "Records and Achievements",
+        "Hall of Fame",
         "Admin",
     ])
 
@@ -6221,6 +7248,8 @@ def main():
     with tabs[14]:
         tab_records_achievements()
     with tabs[15]:
+        tab_hall_of_fame()
+    with tabs[16]:
         tab_admin()
 
 
