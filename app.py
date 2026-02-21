@@ -974,7 +974,7 @@ def _compute_show_month_metrics(db_path: str, db_mtime: float, include_bonuses: 
     agg = (
         base.groupby(["month", "month_ord", "show_id", "canonical_title", "imprint_1", "imprint_2"], as_index=False)
         .apply(_agg_one)
-        .reset_index()
+        .reset_index(drop=True)
     )
 
     # Prev-month gross per show
@@ -3181,7 +3181,7 @@ def tab_search():
         date_min = st.text_input("Start date (YYYY-MM-DD)", value="", key="gt_date_min")
         date_max = st.text_input("End date (YYYY-MM-DD)", value="", key="gt_date_max")
         week_num = st.text_input("Week # (e.g. 2500 or 2400-2600)", value="", key="gt_week_num")
-        rank_min, rank_max = st.slider("Rank range", 1, 50, (1, 10))
+        rank_min, rank_max = st.slider("Rank range", 1, 17, (1, 10))
         limit = st.slider("Max results", 50, 10000, 1000, step=50)
 
     filters = FilterSpec(
@@ -3247,7 +3247,7 @@ def tab_show_detail():
         st.header("Show detail filters")
         date_min = st.text_input("Start date (YYYY-MM-DD) ", value="")
         date_max = st.text_input("End date (YYYY-MM-DD)  ", value="")
-        rank_min, rank_max = st.slider("Rank range (show)", 1, 50, (1, 10))
+        rank_min, rank_max = st.slider("Rank range (show)", 1, 17, (1, 10))
 
     filters = FilterSpec(date_min.strip() or None, date_max.strip() or None, int(rank_min), int(rank_max))
 
@@ -3385,7 +3385,7 @@ def tab_compare_two_shows():
         st.header("Compare filters")
         date_min = st.text_input("Start date (YYYY-MM-DD)   ", value="")
         date_max = st.text_input("End date (YYYY-MM-DD)    ", value="")
-        rank_min, rank_max = st.slider("Rank range (compare)", 1, 50, (1, 10))
+        rank_min, rank_max = st.slider("Rank range (compare)", 1, 17, (1, 10))
         align_mode = st.selectbox("Alignment", ["Calendar (Week Ending)", "Relative (weeks since first appearance)"])
 
     filters = FilterSpec(date_min.strip() or None, date_max.strip() or None, int(rank_min), int(rank_max))
@@ -3515,7 +3515,7 @@ def tab_companies():
         st.header("Company filters")
         date_min = st.text_input("Start date (YYYY-MM-DD)    ", value="")
         date_max = st.text_input("End date (YYYY-MM-DD)     ", value="")
-        rank_min, rank_max = st.slider("Rank range (company)", 1, 50, (1, 10))
+        rank_min, rank_max = st.slider("Rank range (company)", 1, 17, (1, 10))
 
     filters = FilterSpec(date_min.strip() or None, date_max.strip() or None, int(rank_min), int(rank_max))
 
@@ -3541,7 +3541,7 @@ def tab_analytics():
         st.header("Analytics filters")
         date_min = st.text_input("Start date (YYYY-MM-DD)     ", value="")
         date_max = st.text_input("End date (YYYY-MM-DD)      ", value="")
-        rank_min, rank_max = st.slider("Rank range (analytics)", 1, 50, (1, 10))
+        rank_min, rank_max = st.slider("Rank range (analytics)", 1, 17, (1, 10))
         top_n = st.slider("Top N", 5, 50, 15)
 
     filters = FilterSpec(date_min.strip() or None, date_max.strip() or None, int(rank_min), int(rank_max))
@@ -4481,7 +4481,7 @@ def tab_streak_analytics():
         st.header("Streak filters")
         date_min = st.text_input("Start date (YYYY-MM-DD)      ", value="")
         date_max = st.text_input("End date (YYYY-MM-DD)        ", value="")
-        rank_min, rank_max = st.slider("Rank range (streaks)", 1, 50, (1, 10))
+        rank_min, rank_max = st.slider("Rank range (streaks)", 1, 17, (1, 10))
         top_n = st.slider("Top N (streaks)", 5, 200, 25)
 
     filters = FilterSpec(date_min.strip() or None, date_max.strip() or None, int(rank_min), int(rank_max))
@@ -6663,7 +6663,7 @@ def tab_hall_of_fame():
         st.header("Hall of Fame filters")
         date_min = st.text_input("Start date (YYYY-MM-DD)", value="", key="hof_date_min")
         date_max = st.text_input("End date (YYYY-MM-DD)", value="", key="hof_date_max")
-        rank_min, rank_max = st.slider("Rank range (HOF)", 1, 50, (1, 10), key="hof_rank_range")
+        rank_min, rank_max = st.slider("Rank range (HOF)", 1, 17, (1, 10), key="hof_rank_range")
         top_n = st.slider("Top N (tables)", 10, 300, 50, step=10, key="hof_top_n")
         comeback_gap = st.selectbox("Comeback gap (weeks)", [13, 26], index=0, key="hof_comeback_gap")
         badge_scope = st.radio("Badges scope", ["Lifetime", "Current filters"], index=0, key="hof_badge_scope")
@@ -7160,8 +7160,6 @@ def tab_hall_of_fame():
             champsc = y2.groupby("year", as_index=False).first().rename(columns={"company": "year_champ_company", "points": "champ_points"})
             st.markdown("**Year champs (companies)**")
             st.dataframe(champsc.sort_values("year", ascending=False), use_container_width=True, hide_index=True)
-
-
 
 def main():
     st.set_page_config(page_title=APP_TITLE, layout="wide")
