@@ -4700,6 +4700,44 @@ def tab_admin():
             load_lists.clear()
             st.success("Alias saved.")
 
+    st.markdown("### Rename canonical show title")
+    r1, r2 = st.columns(2)
+    with r1:
+        rename_from = st.selectbox("Current canonical title", titles, key="rename_canonical_from")
+    with r2:
+        rename_to = st.text_input(
+            "New canonical title",
+            key="rename_canonical_to",
+            placeholder="Type the new canonical title",
+        )
+
+    if st.button("Rename canonical title"):
+        new_title = rename_to.strip()
+        if not new_title:
+            st.error("New canonical title can't be blank.")
+        elif new_title == rename_from:
+            st.error("New title matches the current title.")
+        elif (shows["canonical_title"].astype(str).str.casefold() == new_title.casefold()).any():
+            st.error("That canonical title already exists. Use Merge two canonical shows instead.")
+        else:
+            show_id = int(shows.loc[shows["canonical_title"] == rename_from, "show_id"].iloc[0])
+            con = get_con()
+            try:
+                cur = con.cursor()
+                cur.execute("BEGIN;")
+                cur.execute("UPDATE show SET canonical_title = ? WHERE show_id = ?", (new_title, show_id))
+                cur.execute(
+                    "INSERT OR IGNORE INTO show_alias(alias_title, show_id) VALUES (?, ?)",
+                    (rename_from, show_id),
+                )
+                con.commit()
+            finally:
+                con.close()
+
+            sql_df.clear()
+            load_lists.clear()
+            st.success(f"Renamed '{rename_from}' to '{new_title}'.")
+
     st.markdown("### Merge two canonical shows (combine histories)")
     c1, c2 = st.columns(2)
     with c1:
