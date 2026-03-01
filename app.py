@@ -3625,13 +3625,22 @@ def tab_analytics():
         .rename(columns={"show_id": "num_shows"})
     )
 
+    medians = (
+        dg[dg[gross_col].fillna(0.0) > 0.0]
+        .groupby("week_ending", as_index=False)[gross_col]
+        .median()
+        .rename(columns={gross_col: "weekly_median_millions"})
+    )
+
     wa_ts = weekly.merge(counts, on="week_ending", how="left")
+    wa_ts = wa_ts.merge(medians, on="week_ending", how="left")
     wa_ts["num_shows"] = wa_ts["num_shows"].fillna(0).astype(int)
     wa_ts["weekly_avg_millions"] = np.where(
         wa_ts["num_shows"] > 0,
         wa_ts["gross_millions"] / wa_ts["num_shows"],
         0.0,
     )
+    wa_ts["weekly_median_millions"] = wa_ts["weekly_median_millions"].fillna(0.0).astype(float)
     wa_ts["week_ending_dt"] = pd.to_datetime(wa_ts["week_ending"], errors="coerce")
     wa_ts["year"] = wa_ts["week_ending_dt"].dt.year
     wa_ts["month"] = wa_ts["week_ending_dt"].dt.month
@@ -3679,6 +3688,30 @@ def tab_analytics():
             wa = wa_ts.sort_values("weekly_avg_millions", ascending=False)
             st.dataframe(
                 wa[["week_ending", "gross_millions", "num_shows", "weekly_avg_millions"]].head(int(top_n)),
+                width='stretch',
+            )
+
+        st.markdown("### Weekly median gross")
+        use_med_ma = st.checkbox(
+            "Show moving average instead of raw weekly median",
+            value=False,
+            key="analytics_wm_use_ma",
+        )
+        med_ma_win = st.slider("Median moving average window (weeks)", 2, 52, 13, key="analytics_wm_ma_window")
+        wm_plot = wa_ts.copy()
+        wm_plot["ma"] = wm_plot["weekly_median_millions"].rolling(
+            med_ma_win, min_periods=max(1, med_ma_win // 3)
+        ).mean()
+        med_ycol = "ma" if use_med_ma else "weekly_median_millions"
+        med_ylabel = (
+            f"{med_ma_win}-week moving median avg (Millions)" if use_med_ma else "Weekly median gross (Millions)"
+        )
+        plot_line_dates(wm_plot["week_ending"], wm_plot[med_ycol], "Week Ending", med_ylabel)
+
+        if st.checkbox("Show Top Weekly Medians", key="analytics_show_top_weekly_medians"):
+            wm = wa_ts.sort_values("weekly_median_millions", ascending=False)
+            st.dataframe(
+                wm[["week_ending", "gross_millions", "num_shows", "weekly_avg_millions", "weekly_median_millions"]].head(int(top_n)),
                 width='stretch',
             )
 
