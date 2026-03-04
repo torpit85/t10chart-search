@@ -1389,6 +1389,8 @@ def tab_monthly_smps_t25():
 
     disp["Last Mo Pos"] = disp["show_id"].astype(int).apply(lambda sid: prev_pos_map.get(int(sid)))
     disp["Months on Chart"] = disp["show_id"].astype(int).map(cnt_before).fillna(0).astype(int) + 1
+    # Cast to object before mixing numeric positions with string flags (NEW/RE)
+    disp["Last Mo Pos"] = disp["Last Mo Pos"].astype(object)
 
     # NEW/RE flags folded into Last Mo Pos: if not on last month, NEW if first-ever appearance; else RE
     _lastmo_missing = disp["Last Mo Pos"].isna()
@@ -2796,8 +2798,29 @@ def _longest_run_masked(df: pd.DataFrame, mask: pd.Series) -> dict[str, Any] | N
 
 
 def tab_show_trends():
-    st.header("Show Trends")
+    st.markdown("### Show Trends")
     st.caption("Grossing + rank trends for a single show over time. (Altair charts; ties supported.)")
+
+    # Shrink Show Trends KPI typography so the 6-metric row fits on smaller screens/window widths.
+    st.markdown(
+        """
+        <style>
+        div[data-testid="stMetric"] [data-testid="stMetricLabel"] {
+            font-size: 0.78rem !important;
+            line-height: 1.05 !important;
+        }
+        div[data-testid="stMetric"] [data-testid="stMetricValue"] {
+            font-size: 1.05rem !important;
+            line-height: 1.0 !important;
+        }
+        div[data-testid="stMetric"] [data-testid="stMetricDelta"] {
+            font-size: 0.75rem !important;
+            line-height: 1.0 !important;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
 
     shows_df, _ = load_lists()
     if shows_df is None or shows_df.empty:
@@ -2855,9 +2878,25 @@ def tab_show_trends():
         peak_idx = int(df["gross_use"].idxmax())
         peak_week = df.loc[peak_idx, "week_ending"]
         peak_value = float(df.loc[peak_idx, "gross_use"])
-        total_gross = float(df["gross_use"].sum())
-        avg_gross = float(df["gross_use"].mean()) if len(df) else 0.0
+
+        # Total gross should match Show Details / Gross Races when bonuses are included:
+        # include bonus-only weeks from gross_bonus (weeks with no t10_entry row).
+        if include_bonuses:
+            _ledger = fetch_show_weekly_ledger(show_id)
+            if _ledger is not None and not _ledger.empty:
+                _ledger = _ledger.copy()
+                _ledger["week_ending"] = _as_date_str(_ledger["week_ending"])
+                if year_val is not None:
+                    _ledger = _ledger[_ledger["week_ending"].astype(str).str[:4] == str(year_val)].copy()
+                _ledger["gross_millions"] = pd.to_numeric(_ledger["gross_millions"], errors="coerce").fillna(0.0)
+                total_gross = float(_ledger["gross_millions"].sum())
+            else:
+                total_gross = float(df["gross_use"].sum())
+        else:
+            total_gross = float(df["gross_use"].sum())
+
         weeks_charted = int(df["week_ending"].nunique())
+        avg_gross = (total_gross / weeks_charted) if weeks_charted else 0.0
         n1_weeks = int((df["rank"] == 1).sum())
         top3_weeks = int((df["rank"] <= 3).sum())
 
@@ -5797,11 +5836,13 @@ def tab_records_achievements():
             for j, (_, r) in enumerate(g.iterrows()):
                 rows.append({
                     "Note": r["Note"] if j == 0 else "",
-                    "Order": int(order) if j == 0 else "",
+                    "Order": str(int(order)) if j == 0 else "",
                     "Show": r["canonical_title"],
                     "Week Hit #1": _fmt_date(r["first_n1"]),
                 })
         disp = pd.DataFrame(rows)
+        if not disp.empty and "Order" in disp.columns:
+            disp["Order"] = disp["Order"].astype(str)
         st.dataframe(disp, width='stretch', hide_index=True)
 
     st.divider()
