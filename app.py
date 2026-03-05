@@ -4244,32 +4244,339 @@ def _quarter_cumulative(base: pd.DataFrame, year: int, quarter: int, through_wee
     return qdf, weeks
 
 
-def tab_gross_races():
-    st.subheader("Gross Races")
-    st.caption("All charts on this page include weekly gross **plus all gross bonuses** (annual + quarter bonuses included via gross_bonus).")
 
-    if not DB_PATH.exists():
-        st.error(f"Database not found at {DB_PATH}.")
+@st.cache_data(show_spinner=False)
+def _load_gross_races_show_leaderboard_rows(db_path: str, db_mtime: float) -> pd.DataFrame:
+    """Weekly chart rows (ranked entries only) with annual/quarter bonuses rolled into the week for show leaderboards."""
+    con = sqlite3.connect(db_path)
+    try:
+        df = pd.read_sql_query(
+            """
+            WITH bonus AS (
+              SELECT show_id, week_ending, SUM(COALESCE(bonus_millions, 0.0)) AS bonus_millions
+              FROM gross_bonus
+              WHERE bonus_type IN ('annual', 'quarter')
+              GROUP BY show_id, week_ending
+            )
+            SELECT
+              date(e.week_ending) AS week_ending,
+              e.show_id,
+              s.canonical_title,
+              e.rank,
+              COALESCE(e.gross_millions, 0.0) AS base_gross_millions,
+              COALESCE(b.bonus_millions, 0.0) AS bonus_millions,
+              (COALESCE(e.gross_millions, 0.0) + COALESCE(b.bonus_millions, 0.0)) AS gross_millions
+            FROM t10_entry e
+            JOIN show s ON s.show_id = e.show_id
+            LEFT JOIN bonus b ON b.show_id = e.show_id AND b.week_ending = e.week_ending
+            WHERE e.week_ending IS NOT NULL
+            ORDER BY date(e.week_ending), e.rank, e.show_id
+            """,
+            con,
+        )
+    finally:
+        con.close()
+    if df.empty:
+        return df
+    df["week_ending"] = _as_date_str(df["week_ending"])
+    df["week_ending_dt"] = pd.to_datetime(df["week_ending"], errors="coerce")
+    df["rank"] = pd.to_numeric(df["rank"], errors="coerce")
+    for c in ["base_gross_millions", "bonus_millions", "gross_millions"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    return df
+
+
+def _build_gross_races_show_leaderboards(rows: pd.DataFrame, min_weeks: int, top_n: int, include_bonuses_avg_share: bool, share_mode: str = "peak") -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, str]:
+    if rows.empty:
+        empty = pd.DataFrame()
+        return empty, empty, empty, ("Bonus-adjusted gross" if include_bonuses_avg_share else "Base gross")
+
+    df = rows.copy()
+    df = df[df["canonical_title"].notna()].copy()
+    df["gross_base"] = pd.to_numeric(df["base_gross_millions"], errors="coerce")
+    df["gross_adjusted"] = pd.to_numeric(df["gross_millions"], errors="coerce")
+    sel_col = "gross_adjusted" if include_bonuses_avg_share else "gross_base"
+    basis_label = "Bonus-adjusted gross" if include_bonuses_avg_share else "Base gross"
+    df["gross_for_avg_share"] = pd.to_numeric(df[sel_col], errors="coerce")
+
+    # Weekly totals for share in current filtered rank-range/date universe
+    wk = (
+        df.dropna(subset=["gross_for_avg_share"])
+          .groupby("week_ending", as_index=False)["gross_for_avg_share"]
+          .sum()
+          .rename(columns={"gross_for_avg_share": "weekly_total_for_share"})
+    )
+    df = df.merge(wk, on="week_ending", how="left")
+    df["weekly_share"] = np.where(
+        (df["weekly_total_for_share"].notna()) & (df["weekly_total_for_share"] > 0) & (df["gross_for_avg_share"].notna()),
+        df["gross_for_avg_share"] / df["weekly_total_for_share"],
+        np.nan,
+    )
+
+    # Base stats (median leaderboard stays base-only)
+    df_base = df.dropna(subset=["gross_base"]).copy()
+    g_base = (
+        df_base.groupby(["show_id", "canonical_title"], as_index=False)
+        .agg(
+            weeks=("gross_base", "count"),
+            first_week=("week_ending", "min"),
+            last_week=("week_ending", "max"),
+            avg_gross_base=("gross_base", "mean"),
+            median_gross_base=("gross_base", "median"),
+            peak_gross_base=("gross_base", "max"),
+        )
+    )
+
+    df_sel = df.dropna(subset=["gross_for_avg_share"]).copy()
+    g_sel = (
+        df_sel.groupby(["show_id", "canonical_title"], as_index=False)
+        .agg(
+            avg_gross_selected=("gross_for_avg_share", "mean"),
+            peak_gross_selected=("gross_for_avg_share", "max"),
+            avg_share=("weekly_share", "mean"),
+            median_share=("weekly_share", "median"),
+            peak_share=("weekly_share", "max"),
+        )
+    )
+
+    show_stats = g_base.merge(g_sel, on=["show_id", "canonical_title"], how="left")
+
+    # Peak share week metadata
+    df_share = df_sel[df_sel["weekly_share"].notna()].copy()
+    if not df_share.empty:
+        idx = df_share.groupby(["show_id", "canonical_title"]) ["weekly_share"].idxmax()
+        peak_rows = df_share.loc[idx, [
+            "show_id", "canonical_title", "week_ending", "gross_for_avg_share", "weekly_total_for_share", "weekly_share"
+        ]].rename(columns={
+            "week_ending": "peak_share_week",
+            "gross_for_avg_share": "peak_share_show_gross",
+            "weekly_total_for_share": "peak_share_weekly_total",
+            "weekly_share": "peak_share_confirm",
+        })
+        show_stats = show_stats.merge(peak_rows, on=["show_id", "canonical_title"], how="left")
+    else:
+        show_stats["peak_share_week"] = pd.NA
+        show_stats["peak_share_show_gross"] = np.nan
+        show_stats["peak_share_weekly_total"] = np.nan
+
+    show_stats = show_stats[show_stats["weeks"] >= int(min_weeks)].copy()
+
+    if show_stats.empty:
+        empty = pd.DataFrame()
+        return empty, empty, empty, basis_label
+
+    avg = (
+        show_stats.dropna(subset=["avg_gross_selected"])
+        .sort_values(["avg_gross_selected", "weeks", "median_gross_base", "peak_gross_selected", "canonical_title"], ascending=[False, False, False, False, True])
+        .head(int(top_n)).copy()
+    )
+    med = (
+        show_stats.dropna(subset=["median_gross_base"])
+        .sort_values(["median_gross_base", "avg_gross_base", "weeks", "peak_gross_base", "canonical_title"], ascending=[False, False, False, False, True])
+        .head(int(top_n)).copy()
+    )
+    share_mode_key = str(share_mode or "peak").strip().lower()
+    if share_mode_key not in {"peak", "average", "median"}:
+        share_mode_key = "peak"
+    share_col = {"peak": "peak_share", "average": "avg_share", "median": "median_share"}[share_mode_key]
+
+    shr = (
+        show_stats.dropna(subset=[share_col])
+        .sort_values([share_col, "avg_share", "weeks", "peak_share_show_gross", "canonical_title"], ascending=[False, False, False, False, True])
+        .head(int(top_n)).copy()
+    )
+    shr["_share_mode"] = share_mode_key
+    shr["_share_value"] = pd.to_numeric(shr[share_col], errors="coerce")
+
+    for tbl in (avg, med, shr):
+        if not tbl.empty:
+            tbl.insert(0, "rank", np.arange(1, len(tbl) + 1))
+
+    return avg, med, shr, basis_label
+
+
+def _render_gross_races_show_leaderboards(base_race: pd.DataFrame, latest_date: date, db_path: str, db_mtime: float):
+    st.markdown("### Show Leaderboards")
+    st.caption("By-show all-time leaderboards built from weekly chart rows within the selected filters. Median uses base gross only; bonuses can optionally apply to Average + Share.")
+
+    rows = _load_gross_races_show_leaderboard_rows(db_path, db_mtime)
+    if rows.empty:
+        st.info("No chart rows found for show leaderboards.")
         return
 
-    db_mtime = DB_PATH.stat().st_mtime
-    base = _load_gross_races_base(str(DB_PATH), db_mtime)
-    if base.empty:
-        st.info("No gross data found.")
+    rows = rows[rows["week_ending_dt"] >= pd.Timestamp(GROSS_TRACKING_START)].copy()
+    if rows.empty:
+        st.info("No leaderboard rows found on/after the gross-tracking start date (2001-03-17).")
         return
 
-    base["week_ending_dt"] = pd.to_datetime(base["week_ending"], errors="coerce")
-    # Exclude pre-gross-tracking years (you started tracking grosses the week ending 2001-03-17)
-    base = base[base["week_ending_dt"] >= pd.Timestamp(GROSS_TRACKING_START)].copy()
-    if base.empty:
-        st.info("No gross rows found on/after the gross-tracking start date (2001-03-17).")
+    min_available = rows["week_ending_dt"].min().date()
+    max_available = rows["week_ending_dt"].max().date()
+
+    c1, c2, c3, c4 = st.columns([1.2, 1.2, 1, 1])
+    with c1:
+        dmin = st.date_input("Start date", value=min_available, min_value=min_available, max_value=max_available, key="gr_lead_start")
+    with c2:
+        dmax = st.date_input("End date", value=max_available, min_value=min_available, max_value=max_available, key="gr_lead_end")
+    with c3:
+        top_n = st.slider("Top N", 5, 200, 25, key="gr_lead_topn")
+    with c4:
+        min_weeks = st.slider("Min weeks", 1, 100, 5, key="gr_lead_minweeks")
+
+    r1, r2, r3 = st.columns([2, 2, 1.4])
+    with r1:
+        rank_min, rank_max = st.slider("Rank range", 1, 17, (1, 10), key="gr_lead_rank_range")
+    with r2:
+        include_bon = st.checkbox(
+            "Include bonuses (Average + Share)",
+            value=False,
+            key="gr_lead_include_bonuses",
+            help="Applies bonus-adjusted gross to Average and Share leaderboards. Median leaderboard uses base weekly gross only for comparability.",
+        )
+    with r3:
+        share_mode_label = st.selectbox(
+            "Share mode",
+            options=["Peak", "Average", "Median"],
+            index=0,
+            key="gr_lead_share_mode",
+            help="Chooses which by-show share metric is ranked in the Share leaderboard.",
+        )
+
+    if pd.to_datetime(dmin) > pd.to_datetime(dmax):
+        st.warning("Start date is after end date.")
         return
 
-    latest_dt = pd.to_datetime(base["week_ending_dt"].max())
-    latest_date = latest_dt.date()
+    f = rows[(rows["week_ending_dt"] >= pd.to_datetime(dmin)) & (rows["week_ending_dt"] <= pd.to_datetime(dmax))].copy()
+    f = f[(f["rank"] >= int(rank_min)) & (f["rank"] <= int(rank_max))].copy()
 
-    meta = _load_show_meta_for_gross_races(str(DB_PATH), db_mtime)
+    if f.empty:
+        st.info("No leaderboard rows match the selected filters.")
+        return
 
+    avg, med, shr, basis_label = _build_gross_races_show_leaderboards(
+        f, min_weeks=int(min_weeks), top_n=int(top_n), include_bonuses_avg_share=bool(include_bon), share_mode=str(share_mode_label).lower()
+    )
+
+    st.caption(
+        f"Average/Share basis: **{basis_label}** · Median basis: **Base gross** · "
+        f"Share denominator = total weekly gross within the current filtered rank-range universe."
+    )
+
+    # KPI row (headline leaders)
+    k1, k2, k3 = st.columns(3)
+    with k1:
+        if not avg.empty:
+            row = avg.iloc[0]
+            st.metric("Top Avg Gross Show", row["canonical_title"], f"{float(row['avg_gross_selected']):,.2f}")
+        else:
+            st.metric("Top Avg Gross Show", "—", "")
+    with k2:
+        if not med.empty:
+            row = med.iloc[0]
+            st.metric("Top Median Gross Show", row["canonical_title"], f"{float(row['median_gross_base']):,.2f}")
+        else:
+            st.metric("Top Median Gross Show", "—", "")
+    share_mode_key = (str(share_mode_label).strip().lower() if 'share_mode_label' in locals() else "peak")
+    share_metric_title = {
+        "peak": "Top Peak Share Show",
+        "average": "Top Avg Share Show",
+        "median": "Top Median Share Show",
+    }.get(share_mode_key, "Top Peak Share Show")
+    with k3:
+        if not shr.empty:
+            row = shr.iloc[0]
+            share_val = pd.to_numeric(row.get("_share_value", row.get("peak_share")), errors="coerce")
+            st.metric(share_metric_title, row["canonical_title"], f"{float(share_val):.2%}" if pd.notna(share_val) else "")
+        else:
+            st.metric(share_metric_title, "—", "")
+
+    def _fmt_datestr(x):
+        if pd.isna(x):
+            return x
+        try:
+            return pd.to_datetime(x).date().isoformat()
+        except Exception:
+            return x
+
+    st.markdown("#### Highest Average Gross (By Show)")
+    st.caption("Ranks shows by mean weekly gross across eligible weeks in the current filters.")
+    if avg.empty:
+        st.info("No shows meet the minimum-week threshold for the Average leaderboard.")
+    else:
+        ad = avg[["rank", "canonical_title", "weeks", "avg_gross_selected", "median_gross_base", "peak_gross_selected", "first_week", "last_week"]].copy()
+        ad = ad.rename(columns={
+            "rank": "Rank", "canonical_title": "Show", "weeks": "Weeks",
+            "avg_gross_selected": "Avg Gross", "median_gross_base": "Median Gross (Base)",
+            "peak_gross_selected": "Peak Week Gross", "first_week": "First Week", "last_week": "Last Week"
+        })
+        ad["First Week"] = ad["First Week"].map(_fmt_datestr)
+        ad["Last Week"] = ad["Last Week"].map(_fmt_datestr)
+        st.dataframe(ad, width='stretch', hide_index=True)
+
+    st.markdown("#### Highest Median Gross (By Show)")
+    st.caption("Median leaderboard uses base weekly gross only (bonuses excluded) for comparability.")
+    if med.empty:
+        st.info("No shows meet the minimum-week threshold for the Median leaderboard.")
+    else:
+        md = med[["rank", "canonical_title", "weeks", "median_gross_base", "avg_gross_base", "peak_gross_base", "first_week", "last_week"]].copy()
+        md = md.rename(columns={
+            "rank": "Rank", "canonical_title": "Show", "weeks": "Weeks",
+            "median_gross_base": "Median Gross", "avg_gross_base": "Avg Gross (Base)",
+            "peak_gross_base": "Peak Week Gross", "first_week": "First Week", "last_week": "Last Week"
+        })
+        md["First Week"] = md["First Week"].map(_fmt_datestr)
+        md["Last Week"] = md["Last Week"].map(_fmt_datestr)
+        st.dataframe(md, width='stretch', hide_index=True)
+
+    share_mode_key = (str(share_mode_label).strip().lower() if 'share_mode_label' in locals() else "peak")
+    share_title = {
+        "peak": "Highest Peak Weekly Share (By Show)",
+        "average": "Highest Average Weekly Share (By Show)",
+        "median": "Highest Median Weekly Share (By Show)",
+    }.get(share_mode_key, "Highest Peak Weekly Share (By Show)")
+    share_value_col = {
+        "peak": "peak_share",
+        "average": "avg_share",
+        "median": "median_share",
+    }.get(share_mode_key, "peak_share")
+    share_display_col = {
+        "peak": "Peak Share %",
+        "average": "Avg Share %",
+        "median": "Median Share %",
+    }.get(share_mode_key, "Peak Share %")
+    st.markdown(f"#### {share_title}")
+    st.caption("Share = show gross ÷ total weekly gross in the current filtered rank-range universe (using the selected Average/Share metric basis).")
+    if shr.empty:
+        st.info("No shows meet the minimum-week threshold for the Share leaderboard.")
+    else:
+        sd = shr[["rank", "canonical_title", "weeks", share_value_col, "peak_share_week", "peak_share_show_gross", "peak_share_weekly_total", "avg_share", "median_share", "peak_share"]].copy()
+        sd = sd.rename(columns={
+            "rank": "Rank", "canonical_title": "Show", "weeks": "Weeks",
+            share_value_col: share_display_col, "peak_share_week": "Peak Share Week",
+            "peak_share_show_gross": "Show Gross (Peak Week)", "peak_share_weekly_total": "Weekly Total (Peak Week)",
+            "avg_share": "Avg Share %", "median_share": "Median Share %", "peak_share": "Peak Share %"
+        })
+        sd["Peak Share Week"] = sd["Peak Share Week"].map(_fmt_datestr)
+
+        # Avoid duplicate column names when selected mode is also one of the context columns
+        for dup_name in ["Peak Share %", "Avg Share %", "Median Share %"]:
+            if list(sd.columns).count(dup_name) > 1:
+                first = True
+                new_cols = []
+                for c in sd.columns:
+                    if c != dup_name:
+                        new_cols.append(c)
+                    else:
+                        if first:
+                            new_cols.append(c)
+                            first = False
+                        else:
+                            new_cols.append(f"{c} (Context)")
+                sd.columns = new_cols
+
+        st.dataframe(sd, width='stretch', hide_index=True)
+
+
+def _render_gross_races_race_views(base: pd.DataFrame, meta: pd.DataFrame, latest_dt: pd.Timestamp, latest_date: date):
     # -------------------------
     # 1) All-Time Gross Races Chart (unlimited rank)
     # -------------------------
@@ -4538,6 +4845,38 @@ def tab_gross_races():
 
         series_by_label_m = {c: pivm[c] for c in pivm.columns}
         _plot_multi_line(list(pivm.index), series_by_label_m, "Week Ending", "Cumulative Gross (Millions)")
+
+
+
+def tab_gross_races():
+    st.subheader("Gross Races")
+    st.caption("All charts on this page include weekly gross **plus all gross bonuses** (annual + quarter bonuses included via gross_bonus).")
+
+    if not DB_PATH.exists():
+        st.error(f"Database not found at {DB_PATH}.")
+        return
+
+    db_mtime = DB_PATH.stat().st_mtime
+    base = _load_gross_races_base(str(DB_PATH), db_mtime)
+    if base.empty:
+        st.info("No gross data found.")
+        return
+
+    base["week_ending_dt"] = pd.to_datetime(base["week_ending"], errors="coerce")
+    base = base[base["week_ending_dt"] >= pd.Timestamp(GROSS_TRACKING_START)].copy()
+    if base.empty:
+        st.info("No gross rows found on/after the gross-tracking start date (2001-03-17).")
+        return
+
+    latest_dt = pd.to_datetime(base["week_ending_dt"].max())
+    latest_date = latest_dt.date()
+    meta = _load_show_meta_for_gross_races(str(DB_PATH), db_mtime)
+
+    t_races, t_leads = st.tabs(["Race Views", "Show Leaderboards"])
+    with t_races:
+        _render_gross_races_race_views(base, meta, latest_dt, latest_date)
+    with t_leads:
+        _render_gross_races_show_leaderboards(base, latest_date, str(DB_PATH), db_mtime)
 
 
 # ----------------------------
