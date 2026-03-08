@@ -2083,12 +2083,17 @@ def tab_grossing_trends():
     df_top10_through = df_through[df_through["rank"].between(1, 10)].copy()
     df_n1_through = df_through[df_through["rank"].eq(1)].copy()
 
-    subtabs = st.tabs(["Overview", "Momentum", "Longevity", "Market Structure", "Imprints/Companies", "Anomalies & Eras"])
+    trends_section = st.selectbox(
+        "Grossing Trends section",
+        ["Overview", "Momentum", "Longevity", "Market Structure", "Imprints/Companies", "Anomalies & Eras"],
+        index=0,
+        key="grossing_trends_section",
+    )
 
     # ----------------------------
     # Overview
     # ----------------------------
-    with subtabs[0]:
+    if trends_section == "Overview":
         st.markdown("### Seasonality")
 
         weekly_total = df_top10.groupby("week_ending_dt", as_index=True)["gross_use"].sum().sort_index()
@@ -2112,7 +2117,6 @@ def tab_grossing_trends():
             plt.ylabel("Average total gross (Top 10)")
             plt.title("Average total gross by month-of-year")
             st.pyplot(fig, clear_figure=True)
-            plt.close(fig)
 
             woy_stats = season_df.groupby("week_of_year")["total_gross"].mean().reset_index()
             fig = plt.figure()
@@ -2121,7 +2125,6 @@ def tab_grossing_trends():
             plt.ylabel("Average total gross (Top 10)")
             plt.title("Average total gross by week-of-year")
             st.pyplot(fig, clear_figure=True)
-            plt.close(fig)
 
             with st.expander("Seasonality table"):
                 show_tbl = month_stats[["month_name", "avg", "median", "n"]].rename(columns={"month_name": "Month", "avg": "Avg", "median": "Median", "n": "Weeks"})
@@ -2144,7 +2147,6 @@ def tab_grossing_trends():
             plt.ylabel("Median weekly gross")
             plt.title("Median gross by rank (Top 10)")
             st.pyplot(fig, clear_figure=True)
-            plt.close(fig)
 
             with st.expander("Position decay table"):
                 st.dataframe(pos_stats, width='stretch')
@@ -2162,20 +2164,17 @@ def tab_grossing_trends():
             plt.legend()
             plt.title("Weekly total gross (Top 10)")
             st.pyplot(fig, clear_figure=True)
-            plt.close(fig)
 
             fig = plt.figure()
             plt.plot(roll_std.index, roll_std.values)
             plt.title(f"Rolling {roll_w}-week std dev (volatility)")
             plt.ylabel("Std dev")
             st.pyplot(fig, clear_figure=True)
-            plt.close(fig)
 
             fig = plt.figure()
             plt.plot(vol_score.index, vol_score.values)
             plt.title(f"Volatility score (std/mean) over {roll_w} weeks")
             st.pyplot(fig, clear_figure=True)
-            plt.close(fig)
 
         st.markdown("### #1 premium (#1 vs #2)")
         # Use Top 2 regardless of chosen rank_scope
@@ -2199,18 +2198,16 @@ def tab_grossing_trends():
                 plt.plot(diff.index, diff.values)
                 plt.title("#1 premium (difference: #1 − #2)")
                 st.pyplot(fig, clear_figure=True)
-                plt.close(fig)
 
                 fig = plt.figure()
                 plt.plot(ratio.index, ratio.values)
                 plt.title("#1 premium (ratio: #1 ÷ #2)")
                 st.pyplot(fig, clear_figure=True)
-                plt.close(fig)
 
     # ----------------------------
     # Momentum
     # ----------------------------
-    with subtabs[1]:
+    if trends_section == "Momentum":
         st.markdown("### Momentum")
         st.caption("Biggest week-over-week gains/declines, 4-week moves, hot slopes, and rebounders. Uses consecutive chart appearances (date gaps ignored).")
 
@@ -2314,7 +2311,7 @@ def tab_grossing_trends():
     # ----------------------------
     # Longevity
     # ----------------------------
-    with subtabs[2]:
+    if trends_section == "Longevity":
         st.markdown("### Longevity & lifecycle")
         st.caption("How shows typically rise/fall, time-to-peak, and half-life (time to 50% of peak).")
 
@@ -2349,7 +2346,6 @@ def tab_grossing_trends():
                 plt.ylabel("Gross")
                 plt.title("Typical show lifecycle (median with IQR)")
                 st.pyplot(fig, clear_figure=True)
-                plt.close(fig)
 
                 # Time to peak
                 peak_rows = []
@@ -2366,7 +2362,6 @@ def tab_grossing_trends():
                 plt.ylabel("Count of shows")
                 plt.title("Time-to-peak distribution")
                 st.pyplot(fig, clear_figure=True)
-                plt.close(fig)
 
                 with st.expander("Peak table (top 200 by peak gross)"):
                     st.dataframe(peaks.sort_values("peak_gross", ascending=False).head(200), width='stretch')
@@ -2395,7 +2390,6 @@ def tab_grossing_trends():
                     plt.ylabel("Count of shows")
                     plt.title("Half-life distribution")
                     st.pyplot(fig, clear_figure=True)
-                    plt.close(fig)
 
                     with st.expander("Half-life table (top 200 slowest to decay)"):
                         st.dataframe(half_df.sort_values("weeks_to_half", ascending=False).head(200), width='stretch')
@@ -2403,7 +2397,7 @@ def tab_grossing_trends():
     # ----------------------------
     # Market Structure
     # ----------------------------
-    with subtabs[3]:
+    if trends_section == "Market Structure":
         st.markdown("### Concentration / dominance")
         wk_total = df_top10.groupby("week_ending_dt")["gross_use"].sum().sort_index()
         if wk_total.empty:
@@ -2420,7 +2414,6 @@ def tab_grossing_trends():
             plt.legend()
             plt.title("Share of total gross captured by #1 and Top 3")
             st.pyplot(fig, clear_figure=True)
-            plt.close(fig)
 
             # HHI concentration across shows each week
             hhi_rows = []
@@ -2437,7 +2430,6 @@ def tab_grossing_trends():
                 plt.plot(hhi_df["week_ending_dt"], hhi_df["hhi"])
                 plt.title("HHI-style concentration index (higher = more dominated)")
                 st.pyplot(fig, clear_figure=True)
-                plt.close(fig)
 
         st.markdown("### Turnover")
         # New shows per week (first appearance in the FULL df, then filtered to current range)
@@ -2455,7 +2447,6 @@ def tab_grossing_trends():
         plt.plot(new_counts["first_week"], new_counts["new_shows"])
         plt.title("New shows entering Top 10 (first-ever appearance) per week")
         st.pyplot(fig, clear_figure=True)
-        plt.close(fig)
 
         with st.expander("Newest shows (top 200)"):
             newest = df_first.sort_values("first_week", ascending=False).head(200)
@@ -2465,7 +2456,7 @@ def tab_grossing_trends():
     # ----------------------------
     # Imprints / Companies
     # ----------------------------
-    with subtabs[4]:
+    if trends_section == "Imprints/Companies":
         st.markdown("### Imprints / Companies")
         st.caption("Share, momentum, and hit rate. By default, assigns gross to imprint_1 to avoid double-counting.")
 
@@ -2510,7 +2501,6 @@ def tab_grossing_trends():
             plt.legend(loc="upper left", ncol=2)
             plt.title("Weekly gross by imprint (Top N + Other)")
             st.pyplot(fig, clear_figure=True)
-            plt.close(fig)
 
             share_tbl = (totals / totals.sum()).reset_index()
             share_tbl.columns = ["Imprint", "Share"]
@@ -2573,7 +2563,7 @@ def tab_grossing_trends():
     # ----------------------------
     # Anomalies & Eras
     # ----------------------------
-    with subtabs[5]:
+    if trends_section == "Anomalies & Eras":
         st.markdown("### Outlier weeks")
         weekly_total = df_top10.groupby("week_ending_dt")["gross_use"].sum().sort_index()
         if weekly_total.empty:
@@ -2593,7 +2583,6 @@ def tab_grossing_trends():
             plt.plot(weekly_total.index, weekly_total.values)
             plt.title("Weekly total gross (Top 10)")
             st.pyplot(fig, clear_figure=True)
-            plt.close(fig)
 
             if out.empty:
                 st.info("No outliers at the current threshold/window.")
@@ -2658,7 +2647,6 @@ def tab_grossing_trends():
                 plt.axvline(idx[bi], linestyle="--")
             plt.title("Weekly total gross with detected era boundaries")
             st.pyplot(fig, clear_figure=True)
-            plt.close(fig)
 
             if eras_df.empty:
                 st.info("No eras detected at current settings.")
@@ -2890,7 +2878,7 @@ def tab_show_trends():
     # ----------------------------
     # Trend
     # ----------------------------
-    with subtabs[0]:
+    if trends_section == "Overview":
         # KPIs
         peak_idx = int(df["gross_use"].idxmax())
         peak_week = df.loc[peak_idx, "week_ending"]
@@ -2981,7 +2969,7 @@ def tab_show_trends():
     # ----------------------------
     # Momentum
     # ----------------------------
-    with subtabs[1]:
+    if trends_section == "Momentum":
         g = df.sort_values(["week_number", "week_ending_dt"]).reset_index(drop=True).copy()
         g["prev_gross"] = g["gross_use"].shift(1)
         g["delta"] = g["gross_use"] - g["prev_gross"]
@@ -3050,7 +3038,7 @@ def tab_show_trends():
     # ----------------------------
     # Runs & peaks
     # ----------------------------
-    with subtabs[2]:
+    if trends_section == "Longevity":
         # Longest consecutive charted run (all rows)
         run_all = _longest_run_masked(df, pd.Series([True] * len(df)))
         if run_all:
@@ -3096,7 +3084,7 @@ def tab_show_trends():
     # ----------------------------
     # Context
     # ----------------------------
-    with subtabs[3]:
+    if trends_section == "Market Structure":
         # Share of Top 10 each week
         top10_tot = _fetch_top10_totals_by_week(year_val)
         ctx = df.merge(top10_tot, on="week_ending", how="left")
@@ -3167,7 +3155,7 @@ def tab_show_trends():
     # ----------------------------
     # Anomalies (show-level z-scores)
     # ----------------------------
-    with subtabs[4]:
+    if trends_section == "Imprints/Companies":
         st.markdown("### Anomalies (z-scores)")
         st.caption("Detect weeks where this show over- or under-performed versus its own recent history (rolling window).")
 
@@ -3341,65 +3329,74 @@ def tab_show_detail():
             st.dataframe(led, width='stretch', hide_index=True)
 
     with st.expander("All-Time Gross Races rank history (every chart week since debut/era start)"):
-            # We compute the show's all-time rank as-of *every* chart week in the grossing era,
-            # because other shows can keep grossing after this show disappears from the weekly chart.
-            hist_mode = st.radio(
-                "History view",
-                ["All weeks", "Rank changes only"],
-                index=0,
-                horizontal=True,
-                key=f"show_rankhist_mode_{show_id}",
+            load_rank_history = st.checkbox(
+                "Load all-time rank history",
+                value=False,
+                key=f"show_rankhist_load_{show_id}",
+                help="This is one of the heaviest Show Detail calculations, especially on mobile.",
             )
-            db_mtime = DB_PATH.stat().st_mtime if DB_PATH.exists() else 0.0
-            base = _load_gross_races_base(str(DB_PATH), db_mtime)
-
-            if base.empty:
-                st.caption("No gross races base rows found (cannot compute all-time ranks).")
+            if not load_rank_history:
+                st.caption("Turn on 'Load all-time rank history' to compute this section.")
             else:
-                weeks = pd.to_datetime(base["week_ending"], errors="coerce").dropna().dt.normalize()
-
-                # Start the history at the show's debut (first chart week) if it debuted after the grossing era began.
-                # If it debuted before the grossing era, start at the grossing era start (2001-03-17).
-                debut_df = sql_df(
-                    "SELECT MIN(date(week_ending)) AS debut FROM t10_entry WHERE show_id = ?;",
-                    (int(show_id),),
+                # We compute the show's all-time rank as-of *every* chart week in the grossing era,
+            # because other shows can keep grossing after this show disappears from the weekly chart.
+                hist_mode = st.radio(
+                    "History view",
+                    ["All weeks", "Rank changes only"],
+                    index=0,
+                    horizontal=True,
+                    key=f"show_rankhist_mode_{show_id}",
                 )
-                debut_str = None
-                if debut_df is not None and not debut_df.empty:
-                    debut_str = debut_df.loc[0, "debut"]
-                debut_ts = pd.to_datetime(debut_str, errors="coerce")
-                start_ts = pd.Timestamp(GROSS_TRACKING_START)
-                if debut_ts is not None and not pd.isna(debut_ts):
-                    start_ts = max(start_ts, debut_ts.normalize())
-
-                weeks = weeks[weeks >= start_ts]
-                weeks = sorted(pd.unique(weeks).tolist())
-
-                # Apply the same date window as the Show detail filters (if set)
-                tmin = pd.to_datetime(filters.date_min, errors="coerce") if filters.date_min else None
-                tmax = pd.to_datetime(filters.date_max, errors="coerce") if filters.date_max else None
-                if tmin is not None and not pd.isna(tmin):
-                    weeks = [w for w in weeks if w >= tmin.normalize()]
-                if tmax is not None and not pd.isna(tmax):
-                    weeks = [w for w in weeks if w <= tmax.normalize()]
-
-                rt = _alltime_rank_table_for_show_weeks(str(DB_PATH), db_mtime, show_id, weeks)
-
-                if rt.empty:
-                    st.caption("No all-time rank rows could be computed for the selected weeks.")
+                db_mtime = DB_PATH.stat().st_mtime if DB_PATH.exists() else 0.0
+                base = _load_gross_races_base(str(DB_PATH), db_mtime)
+    
+                if base.empty:
+                    st.caption("No gross races base rows found (cannot compute all-time ranks).")
                 else:
-                    rt2 = rt.copy()
-                    rt2["rank"] = pd.to_numeric(rt2["rank"], errors="coerce").astype("Int64")
-                    rt2["rank_change"] = pd.to_numeric(rt2["rank_change"], errors="coerce").astype("Int64")
-                    rt2["total_gross_millions"] = pd.to_numeric(rt2["total_gross_millions"], errors="coerce")
-                    if hist_mode == "Rank changes only":
-                        # Keep the first row, then only weeks where the rank changed vs the prior week.
-                        ch = pd.to_numeric(rt2["rank_change"], errors="coerce").fillna(0)
-                        keep = (ch != 0)
-                        if len(rt2) > 0:
-                            keep.iloc[0] = True
-                        rt2 = rt2.loc[keep].copy()
-                    st.dataframe(rt2, width='stretch', hide_index=True)
+                    weeks = pd.to_datetime(base["week_ending"], errors="coerce").dropna().dt.normalize()
+    
+                    # Start the history at the show's debut (first chart week) if it debuted after the grossing era began.
+                    # If it debuted before the grossing era, start at the grossing era start (2001-03-17).
+                    debut_df = sql_df(
+                        "SELECT MIN(date(week_ending)) AS debut FROM t10_entry WHERE show_id = ?;",
+                        (int(show_id),),
+                    )
+                    debut_str = None
+                    if debut_df is not None and not debut_df.empty:
+                        debut_str = debut_df.loc[0, "debut"]
+                    debut_ts = pd.to_datetime(debut_str, errors="coerce")
+                    start_ts = pd.Timestamp(GROSS_TRACKING_START)
+                    if debut_ts is not None and not pd.isna(debut_ts):
+                        start_ts = max(start_ts, debut_ts.normalize())
+    
+                    weeks = weeks[weeks >= start_ts]
+                    weeks = sorted(pd.unique(weeks).tolist())
+    
+                    # Apply the same date window as the Show detail filters (if set)
+                    tmin = pd.to_datetime(filters.date_min, errors="coerce") if filters.date_min else None
+                    tmax = pd.to_datetime(filters.date_max, errors="coerce") if filters.date_max else None
+                    if tmin is not None and not pd.isna(tmin):
+                        weeks = [w for w in weeks if w >= tmin.normalize()]
+                    if tmax is not None and not pd.isna(tmax):
+                        weeks = [w for w in weeks if w <= tmax.normalize()]
+    
+                    rt = _alltime_rank_table_for_show_weeks(str(DB_PATH), db_mtime, show_id, weeks)
+    
+                    if rt.empty:
+                        st.caption("No all-time rank rows could be computed for the selected weeks.")
+                    else:
+                        rt2 = rt.copy()
+                        rt2["rank"] = pd.to_numeric(rt2["rank"], errors="coerce").astype("Int64")
+                        rt2["rank_change"] = pd.to_numeric(rt2["rank_change"], errors="coerce").astype("Int64")
+                        rt2["total_gross_millions"] = pd.to_numeric(rt2["total_gross_millions"], errors="coerce")
+                        if hist_mode == "Rank changes only":
+                            # Keep the first row, then only weeks where the rank changed vs the prior week.
+                            ch = pd.to_numeric(rt2["rank_change"], errors="coerce").fillna(0)
+                            keep = (ch != 0)
+                            if len(rt2) > 0:
+                                keep.iloc[0] = True
+                            rt2 = rt2.loc[keep].copy()
+                        st.dataframe(rt2, width='stretch', hide_index=True)
 
     df = fetch_show_entries(show_id, filters)
     st.dataframe(df, width='stretch')
@@ -3706,19 +3703,17 @@ def tab_analytics():
     # -------------------------
     # Analytics sub-tabs
     # -------------------------
-    t_overview, t_heat, t_dist, t_outliers = st.tabs(
-        [
-            "Overview",
-            "Heatmaps",
-            "Distribution",
-            "Outliers",
-        ]
+    analytics_section = st.selectbox(
+        "Analytics section",
+        ["Overview", "Heatmaps", "Distribution", "Outliers"],
+        index=0,
+        key="analytics_section",
     )
 
     # -------------------------
     # Overview
     # -------------------------
-    with t_overview:
+    if analytics_section == "Overview":
         st.markdown("### Total gross over time (weekly sum)")
         plot_line_dates(weekly["week_ending"], weekly["gross_millions"], "Week Ending", "Total Gross (Millions)")
 
@@ -3820,7 +3815,7 @@ def tab_analytics():
     # -------------------------
     # Heatmaps
     # -------------------------
-    with t_heat:
+    if analytics_section == "Heatmaps":
         metric = st.selectbox(
             "Heatmap metric",
             options=["Weekly average gross", "Total gross"],
@@ -3892,7 +3887,7 @@ def tab_analytics():
     # -------------------------
     # Distribution (boxplots)
     # -------------------------
-    with t_dist:
+    if analytics_section == "Distribution":
         metric = st.selectbox(
             "Distribution metric",
             options=["Weekly average gross", "Total gross"],
@@ -3974,7 +3969,7 @@ def tab_analytics():
     # -------------------------
     # Outlier weeks detector
     # -------------------------
-    with t_outliers:
+    if analytics_section == "Outliers":
 
         # -------------------------
         # Week-level outliers
@@ -6599,7 +6594,6 @@ def tab_t10_chart_number_shows() -> None:
     st.caption("All #1 and #2 shows, grouped by year, with streak and total summaries.")
 
     subtabs = st.tabs(["#1 Shows", "#2 Shows"])
-
     with subtabs[0]:
         _render_t10_rank_view(1, "#1 Shows")
     with subtabs[1]:
@@ -7293,6 +7287,16 @@ def tab_hall_of_fame():
         comeback_gap = st.selectbox("Comeback gap (weeks)", [13, 26], index=0, key="hof_comeback_gap")
         badge_scope = st.radio("Badges scope", ["Lifetime", "Current filters"], index=0, key="hof_badge_scope")
 
+    hof_load = st.checkbox(
+        "Load Hall of Fame results",
+        value=False,
+        key="hof_load_results",
+        help="Hall of Fame is one of the heaviest sections in the app. Leave this off on mobile until you want to use it.",
+    )
+    if not hof_load:
+        st.info("Turn on 'Load Hall of Fame results' when you want to run Hall of Fame calculations.")
+        return
+
     df_filt = _hof_apply_filters(
         base,
         date_min.strip() or None,
@@ -7339,13 +7343,17 @@ def tab_hall_of_fame():
     agg_for_badges = agg_life if badge_scope == "Lifetime" else agg_cur
     comp_for_badges = comp_agg_life if badge_scope == "Lifetime" else comp_agg_cur
 
-    # Sub-tabs
-    sub = st.tabs(["Inductees", "Leaderboards", "Wings", "Profiles", "Years & Seasons"])
+    hof_section = st.selectbox(
+        "Hall of Fame section",
+        ["Inductees", "Leaderboards", "Wings", "Profiles", "Years & Seasons"],
+        index=0,
+        key="hof_section",
+    )
 
     # -------------------
     # Inductees
     # -------------------
-    with sub[0]:
+    if hof_section == "Inductees":
         st.markdown("### Inductees")
         mode = st.radio("Inductees type", ["Shows", "Companies"], horizontal=True, index=0, key="hof_ind_type")
 
@@ -7448,7 +7456,7 @@ def tab_hall_of_fame():
     # -------------------
     # Leaderboards
     # -------------------
-    with sub[1]:
+    if hof_section == "Leaderboards":
         st.markdown("### Leaderboards")
         st.caption("Fast leaderboards — your usual ‘who’s the best at *this* one thing’ view.")
 
@@ -7530,7 +7538,7 @@ def tab_hall_of_fame():
     # -------------------
     # Wings
     # -------------------
-    with sub[2]:
+    if hof_section == "Wings":
         st.markdown("### Wings")
         st.caption("The museum exhibits. Each one is a different flavor of greatness (or chaos).")
 
@@ -7643,7 +7651,7 @@ def tab_hall_of_fame():
     # -------------------
     # Profiles
     # -------------------
-    with sub[3]:
+    if hof_section == "Profiles":
         st.markdown("### Profiles")
         st.caption("Pick a show or company and see the full badge wall + core stats.")
 
@@ -7754,7 +7762,7 @@ def tab_hall_of_fame():
     # -------------------
     # Years & Seasons
     # -------------------
-    with sub[4]:
+    if hof_section == "Years & Seasons":
         st.markdown("### Years & Seasons")
         st.caption("Who owned which year? And what does each month/quarter ‘belong’ to?")
 
