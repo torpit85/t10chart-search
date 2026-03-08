@@ -973,7 +973,7 @@ def _compute_show_month_metrics(db_path: str, db_mtime: float, include_bonuses: 
 
     agg = (
         base.groupby(["month", "month_ord", "show_id", "canonical_title", "imprint_1", "imprint_2"], as_index=False)
-        .apply(_agg_one)
+        .apply(_agg_one, include_groups=False)
         .reset_index(drop=True)
     )
 
@@ -2112,6 +2112,7 @@ def tab_grossing_trends():
             plt.ylabel("Average total gross (Top 10)")
             plt.title("Average total gross by month-of-year")
             st.pyplot(fig, clear_figure=True)
+            plt.close(fig)
 
             woy_stats = season_df.groupby("week_of_year")["total_gross"].mean().reset_index()
             fig = plt.figure()
@@ -2120,6 +2121,7 @@ def tab_grossing_trends():
             plt.ylabel("Average total gross (Top 10)")
             plt.title("Average total gross by week-of-year")
             st.pyplot(fig, clear_figure=True)
+            plt.close(fig)
 
             with st.expander("Seasonality table"):
                 show_tbl = month_stats[["month_name", "avg", "median", "n"]].rename(columns={"month_name": "Month", "avg": "Avg", "median": "Median", "n": "Weeks"})
@@ -2142,6 +2144,7 @@ def tab_grossing_trends():
             plt.ylabel("Median weekly gross")
             plt.title("Median gross by rank (Top 10)")
             st.pyplot(fig, clear_figure=True)
+            plt.close(fig)
 
             with st.expander("Position decay table"):
                 st.dataframe(pos_stats, width='stretch')
@@ -2159,17 +2162,20 @@ def tab_grossing_trends():
             plt.legend()
             plt.title("Weekly total gross (Top 10)")
             st.pyplot(fig, clear_figure=True)
+            plt.close(fig)
 
             fig = plt.figure()
             plt.plot(roll_std.index, roll_std.values)
             plt.title(f"Rolling {roll_w}-week std dev (volatility)")
             plt.ylabel("Std dev")
             st.pyplot(fig, clear_figure=True)
+            plt.close(fig)
 
             fig = plt.figure()
             plt.plot(vol_score.index, vol_score.values)
             plt.title(f"Volatility score (std/mean) over {roll_w} weeks")
             st.pyplot(fig, clear_figure=True)
+            plt.close(fig)
 
         st.markdown("### #1 premium (#1 vs #2)")
         # Use Top 2 regardless of chosen rank_scope
@@ -2193,11 +2199,13 @@ def tab_grossing_trends():
                 plt.plot(diff.index, diff.values)
                 plt.title("#1 premium (difference: #1 − #2)")
                 st.pyplot(fig, clear_figure=True)
+                plt.close(fig)
 
                 fig = plt.figure()
                 plt.plot(ratio.index, ratio.values)
                 plt.title("#1 premium (ratio: #1 ÷ #2)")
                 st.pyplot(fig, clear_figure=True)
+                plt.close(fig)
 
     # ----------------------------
     # Momentum
@@ -2341,6 +2349,7 @@ def tab_grossing_trends():
                 plt.ylabel("Gross")
                 plt.title("Typical show lifecycle (median with IQR)")
                 st.pyplot(fig, clear_figure=True)
+                plt.close(fig)
 
                 # Time to peak
                 peak_rows = []
@@ -2357,6 +2366,7 @@ def tab_grossing_trends():
                 plt.ylabel("Count of shows")
                 plt.title("Time-to-peak distribution")
                 st.pyplot(fig, clear_figure=True)
+                plt.close(fig)
 
                 with st.expander("Peak table (top 200 by peak gross)"):
                     st.dataframe(peaks.sort_values("peak_gross", ascending=False).head(200), width='stretch')
@@ -2385,6 +2395,7 @@ def tab_grossing_trends():
                     plt.ylabel("Count of shows")
                     plt.title("Half-life distribution")
                     st.pyplot(fig, clear_figure=True)
+                    plt.close(fig)
 
                     with st.expander("Half-life table (top 200 slowest to decay)"):
                         st.dataframe(half_df.sort_values("weeks_to_half", ascending=False).head(200), width='stretch')
@@ -2409,6 +2420,7 @@ def tab_grossing_trends():
             plt.legend()
             plt.title("Share of total gross captured by #1 and Top 3")
             st.pyplot(fig, clear_figure=True)
+            plt.close(fig)
 
             # HHI concentration across shows each week
             hhi_rows = []
@@ -2425,6 +2437,7 @@ def tab_grossing_trends():
                 plt.plot(hhi_df["week_ending_dt"], hhi_df["hhi"])
                 plt.title("HHI-style concentration index (higher = more dominated)")
                 st.pyplot(fig, clear_figure=True)
+                plt.close(fig)
 
         st.markdown("### Turnover")
         # New shows per week (first appearance in the FULL df, then filtered to current range)
@@ -2442,6 +2455,7 @@ def tab_grossing_trends():
         plt.plot(new_counts["first_week"], new_counts["new_shows"])
         plt.title("New shows entering Top 10 (first-ever appearance) per week")
         st.pyplot(fig, clear_figure=True)
+        plt.close(fig)
 
         with st.expander("Newest shows (top 200)"):
             newest = df_first.sort_values("first_week", ascending=False).head(200)
@@ -2496,6 +2510,7 @@ def tab_grossing_trends():
             plt.legend(loc="upper left", ncol=2)
             plt.title("Weekly gross by imprint (Top N + Other)")
             st.pyplot(fig, clear_figure=True)
+            plt.close(fig)
 
             share_tbl = (totals / totals.sum()).reset_index()
             share_tbl.columns = ["Imprint", "Share"]
@@ -2578,6 +2593,7 @@ def tab_grossing_trends():
             plt.plot(weekly_total.index, weekly_total.values)
             plt.title("Weekly total gross (Top 10)")
             st.pyplot(fig, clear_figure=True)
+            plt.close(fig)
 
             if out.empty:
                 st.info("No outliers at the current threshold/window.")
@@ -2642,6 +2658,7 @@ def tab_grossing_trends():
                 plt.axvline(idx[bi], linestyle="--")
             plt.title("Weekly total gross with detected era boundaries")
             st.pyplot(fig, clear_figure=True)
+            plt.close(fig)
 
             if eras_df.empty:
                 st.info("No eras detected at current settings.")
