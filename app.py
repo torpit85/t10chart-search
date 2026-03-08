@@ -2093,7 +2093,7 @@ def tab_grossing_trends():
     # ----------------------------
     # Overview
     # ----------------------------
-    if trends_section == "Overview":
+    if trends_section == "Trend":
         st.markdown("### Seasonality")
 
         weekly_total = df_top10.groupby("week_ending_dt", as_index=True)["gross_use"].sum().sort_index()
@@ -2311,7 +2311,7 @@ def tab_grossing_trends():
     # ----------------------------
     # Longevity
     # ----------------------------
-    if trends_section == "Longevity":
+    if trends_section == "Runs & peaks":
         st.markdown("### Longevity & lifecycle")
         st.caption("How shows typically rise/fall, time-to-peak, and half-life (time to 50% of peak).")
 
@@ -2397,7 +2397,7 @@ def tab_grossing_trends():
     # ----------------------------
     # Market Structure
     # ----------------------------
-    if trends_section == "Market Structure":
+    if trends_section == "Context":
         st.markdown("### Concentration / dominance")
         wk_total = df_top10.groupby("week_ending_dt")["gross_use"].sum().sort_index()
         if wk_total.empty:
@@ -2456,7 +2456,7 @@ def tab_grossing_trends():
     # ----------------------------
     # Imprints / Companies
     # ----------------------------
-    if trends_section == "Imprints/Companies":
+    if trends_section == "Anomalies":
         st.markdown("### Imprints / Companies")
         st.caption("Share, momentum, and hit rate. By default, assigns gross to imprint_1 to avoid double-counting.")
 
@@ -2873,12 +2873,17 @@ def tab_show_trends():
     else:
         df["gross_ma"] = np.nan
 
-    subtabs = st.tabs(["Trend", "Momentum", "Runs & peaks", "Context", "Anomalies"])
+    trends_section = st.selectbox(
+        "Show Trends section",
+        ["Trend", "Momentum", "Runs & peaks", "Context", "Anomalies"],
+        index=0,
+        key="show_trends_section",
+    )
 
     # ----------------------------
     # Trend
     # ----------------------------
-    if trends_section == "Overview":
+    if trends_section == "Trend":
         # KPIs
         peak_idx = int(df["gross_use"].idxmax())
         peak_week = df.loc[peak_idx, "week_ending"]
@@ -3038,7 +3043,7 @@ def tab_show_trends():
     # ----------------------------
     # Runs & peaks
     # ----------------------------
-    if trends_section == "Longevity":
+    if trends_section == "Runs & peaks":
         # Longest consecutive charted run (all rows)
         run_all = _longest_run_masked(df, pd.Series([True] * len(df)))
         if run_all:
@@ -3084,7 +3089,7 @@ def tab_show_trends():
     # ----------------------------
     # Context
     # ----------------------------
-    if trends_section == "Market Structure":
+    if trends_section == "Context":
         # Share of Top 10 each week
         top10_tot = _fetch_top10_totals_by_week(year_val)
         ctx = df.merge(top10_tot, on="week_ending", how="left")
@@ -3155,7 +3160,7 @@ def tab_show_trends():
     # ----------------------------
     # Anomalies (show-level z-scores)
     # ----------------------------
-    if trends_section == "Imprints/Companies":
+    if trends_section == "Anomalies":
         st.markdown("### Anomalies (z-scores)")
         st.caption("Detect weeks where this show over- or under-performed versus its own recent history (rolling window).")
 
