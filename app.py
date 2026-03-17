@@ -22,26 +22,6 @@ import matplotlib.pyplot as plt
 from charts import chart_top_gross_weeks
 
 
-def _hide_raw_pos_in_display(data):
-    """Hide raw weekly `pos` from rendered table-like displays while preserving logic."""
-    try:
-        if isinstance(data, pd.DataFrame):
-            return data.drop(columns=["pos"], errors="ignore")
-    except Exception:
-        pass
-    return data
-
-
-_orig_st_dataframe = st.dataframe
-
-
-def _st_dataframe_no_raw_pos(data=None, *args, **kwargs):
-    return _orig_st_dataframe(_hide_raw_pos_in_display(data), *args, **kwargs)
-
-
-st.dataframe = _st_dataframe_no_raw_pos
-
-
 # ----------------------------
 # Configuration
 # ----------------------------
@@ -206,6 +186,46 @@ def _chart_month_series(week_ending_dt: pd.Series) -> pd.Series:
 
     out = pd.Series([_ym_from_year_month(a, b) for a, b in zip(ny, nm)], index=week_ending_dt.index)
     return out
+
+
+def _apply_chart_month_logic(
+    df: pd.DataFrame,
+    *,
+    week_dt_col: str = "week_ending_dt",
+    week_str_col: str = "week_ending",
+) -> pd.DataFrame:
+    """Apply the shared chart-month logic used by monthly grossing views."""
+    if df is None or df.empty:
+        out = df.copy() if isinstance(df, pd.DataFrame) else pd.DataFrame()
+        if isinstance(out, pd.DataFrame):
+            for col in ("month", "month_ord"):
+                if col not in out.columns:
+                    out[col] = pd.Series(dtype="object")
+        return out
+
+    out = df.copy()
+    if week_dt_col not in out.columns:
+        if week_str_col not in out.columns:
+            raise KeyError(f"Expected '{week_dt_col}' or '{week_str_col}' in dataframe.")
+        out[week_dt_col] = pd.to_datetime(out[week_str_col], errors="coerce")
+
+    out = out.dropna(subset=[week_dt_col]).copy()
+    out[week_str_col] = _as_date_str(out[week_str_col]) if week_str_col in out.columns else _as_date_str(out[week_dt_col])
+    out["month"] = _chart_month_series(out[week_dt_col])
+
+    # Special rule: April 2001 uses only Mar 17 + Mar 24, 2001 weeks.
+    out = out[
+        ~(
+            (out["month"] == "2001-04")
+            & (~out[week_str_col].isin(["2001-03-17", "2001-03-24"]))
+        )
+    ].copy()
+
+    y = out["month"].str.slice(0, 4).astype(int)
+    m = out["month"].str.slice(5, 7).astype(int)
+    out["month_ord"] = y * 12 + (m - 1)
+    return out
+
 
 
 def _ensure_smps_schema() -> None:
@@ -600,17 +620,60 @@ def plot_scatter(x: pd.Series, y: pd.Series, xlabel: str, ylabel: str):
 # ----------------------------
 # New: Streaks + Holidays helpers
 # ----------------------------
+@st.cache_data(show_spinner=False)
+def _fetch_chart_week_sequence() -> pd.DataFrame:
+    """Distinct chart weeks in chronological order for consecutive-run logic."""
+    df = sql_df(
+        """
+        SELECT DISTINCT
+          date(week_ending) AS week_ending,
+          week_number
+        FROM t10_entry
+        WHERE week_ending IS NOT NULL
+        ORDER BY date(week_ending) ASC, week_number ASC
+        """
+    )
+    if df is None or df.empty:
+        return pd.DataFrame(columns=["week_ending", "week_number"])
+    df["week_ending"] = _as_date_str(df["week_ending"])
+    df["week_number"] = pd.to_numeric(df["week_number"], errors="coerce")
+    return df.drop_duplicates(subset=["week_ending", "week_number"]).reset_index(drop=True)
+
+
 def _consecutive_by_week_number(wn: pd.Series) -> pd.Series:
-    """Boolean series: True where current row continues a streak from prior row."""
-    d = wn.diff()
-    return d.eq(1)
+    """True where the current row is the next available chart week by week_number."""
+    seq = _fetch_chart_week_sequence()
+    pos_map: dict[int, int] = {}
+    if not seq.empty and seq["week_number"].notna().any():
+        valid = seq.dropna(subset=["week_number"]).drop_duplicates(subset=["week_number"]).reset_index(drop=True)
+        pos_map = {int(v): i for i, v in enumerate(valid["week_number"].astype(int).tolist())}
+
+    vals = pd.to_numeric(wn, errors="coerce")
+    pos = vals.map(lambda v: pos_map.get(int(v)) if pd.notna(v) and int(v) in pos_map else np.nan)
+    return pos.diff().eq(1)
+
 
 def _consecutive_by_date(week_ending_str: pd.Series) -> pd.Series:
-    """Boolean series: True where current row continues a streak from prior row (by ~7 day spacing)."""
-    dt = pd.to_datetime(week_ending_str, errors="coerce")
-    dd = dt.diff().dt.days
-    lo, hi = CONSECUTIVE_DAY_TOLERANCE
-    return dd.between(lo, hi)
+    """True where the current row is the next available chart week by date."""
+    seq = _fetch_chart_week_sequence()
+    pos_map: dict[str, int] = {}
+    if not seq.empty:
+        valid = seq.dropna(subset=["week_ending"]).drop_duplicates(subset=["week_ending"]).reset_index(drop=True)
+        pos_map = {str(v): i for i, v in enumerate(valid["week_ending"].tolist())}
+
+    weeks = _as_date_str(pd.Series(week_ending_str, copy=True))
+    pos = weeks.map(lambda v: pos_map.get(str(v)) if pd.notna(v) and str(v) in pos_map else np.nan)
+    out = pos.diff().eq(1)
+
+    # Fallback for any dates not found in the chart-week map.
+    missing = pos.isna()
+    if bool(missing.any()):
+        dt = pd.to_datetime(weeks, errors="coerce")
+        dd = dt.diff().dt.days
+        lo, hi = CONSECUTIVE_DAY_TOLERANCE
+        fallback = dd.between(lo, hi)
+        out = out.where(~missing, fallback)
+    return out
 
 def compute_longest_streaks(rows: pd.DataFrame) -> pd.DataFrame:
     """
@@ -950,22 +1013,7 @@ def _compute_show_month_metrics(db_path: str, db_mtime: float, include_bonuses: 
 
     base = base[base["week_ending_dt"].dt.date >= GROSS_TRACKING_START].copy()
 
-    # chart-month mapping (cutoff day 28)
-    base["month"] = _chart_month_series(base["week_ending_dt"])
-
-    # Special rule: April 2001 uses only Mar 17 + Mar 24, 2001 weeks
-    base = base[
-        ~(
-            (base["month"] == "2001-04")
-            & (~base["week_ending"].isin(["2001-03-17", "2001-03-24"]))
-        )
-    ].copy()
-
-    # month ordering helper
-    y = base["month"].str.slice(0, 4).astype(int)
-    m = base["month"].str.slice(5, 7).astype(int)
-    base["month_ord"] = y * 12 + (m - 1)
-
+    base = _apply_chart_month_logic(base, week_dt_col="week_ending_dt", week_str_col="week_ending")
     base["gross_millions"] = pd.to_numeric(base["gross_millions"], errors="coerce").fillna(0.0)
 
     # Aggregate per show/month
@@ -2726,7 +2774,8 @@ def _fetch_show_trends_rows(show_id: int, year: str | None) -> pd.DataFrame:
                 "week_number",
                 "week_ending",
                 "rank",
-                    "last_week",
+                "pos",
+                "last_week",
                 "canonical_title",
                 "imprint_1",
                 "imprint_2",
@@ -2869,7 +2918,7 @@ def tab_show_trends():
         year_val = None if year == "All" else year
 
     with c3:
-        include_bonuses = st.checkbox("Include bonuses", value=False, key="show_trends_bonus")
+        include_bonuses = st.checkbox("Include bonuses", value=True, key="show_trends_bonus")
 
     with c4:
         smoothing = st.selectbox("Smoothing", ["None", "4-week MA", "8-week MA"], index=0, key="show_trends_smooth")
@@ -2949,6 +2998,7 @@ def tab_show_trends():
                     alt.Tooltip("week_ending:N", title="Week"),
                     alt.Tooltip("week_number:Q", title="Week #"),
                     alt.Tooltip("rank:Q", title="Rank"),
+                    alt.Tooltip("pos:Q", title="Pos"),
                     alt.Tooltip("gross_use:Q", title="Gross", format=",.1f"),
                 ],
             )
@@ -2976,6 +3026,7 @@ def tab_show_trends():
             "week_number",
             "week_ending",
             "rank",
+            "pos",
             "last_week",
             "canonical_title",
             "imprint_1",
@@ -3006,7 +3057,7 @@ def tab_show_trends():
         st.markdown("### Biggest week-over-week % gains")
         st.dataframe(
             _top(g[g["delta_pct"] > 0], "delta_pct", 10, asc=False)[
-                ["week_number", "week_ending", "rank", "gross_use", "prev_gross", "delta_pct", "delta"]
+                ["week_number", "week_ending", "rank", "pos", "gross_use", "prev_gross", "delta_pct", "delta"]
             ],
             width='stretch',
             hide_index=True,
@@ -3015,7 +3066,7 @@ def tab_show_trends():
         st.markdown("### Biggest week-over-week % drops")
         st.dataframe(
             _top(g[g["delta_pct"] < 0], "delta_pct", 10, asc=True)[
-                ["week_number", "week_ending", "rank", "gross_use", "prev_gross", "delta_pct", "delta"]
+                ["week_number", "week_ending", "rank", "pos", "gross_use", "prev_gross", "delta_pct", "delta"]
             ],
             width='stretch',
             hide_index=True,
@@ -3024,7 +3075,7 @@ def tab_show_trends():
         st.markdown("### Biggest absolute gains")
         st.dataframe(
             _top(g[g["delta"] > 0], "delta", 10, asc=False)[
-                ["week_number", "week_ending", "rank", "gross_use", "prev_gross", "delta", "delta_pct"]
+                ["week_number", "week_ending", "rank", "pos", "gross_use", "prev_gross", "delta", "delta_pct"]
             ],
             width='stretch',
             hide_index=True,
@@ -3033,7 +3084,7 @@ def tab_show_trends():
         st.markdown("### Biggest absolute drops")
         st.dataframe(
             _top(g[g["delta"] < 0], "delta", 10, asc=True)[
-                ["week_number", "week_ending", "rank", "gross_use", "prev_gross", "delta", "delta_pct"]
+                ["week_number", "week_ending", "rank", "pos", "gross_use", "prev_gross", "delta", "delta_pct"]
             ],
             width='stretch',
             hide_index=True,
@@ -3077,18 +3128,18 @@ def tab_show_trends():
 
         st.markdown("### Top 10 peak weeks (by gross)")
         top10 = df.sort_values("gross_use", ascending=False).head(10)[
-            ["week_number", "week_ending", "rank", "base_gross_millions", "bonus_millions", "gross_use"]
+            ["week_number", "week_ending", "rank", "pos", "base_gross_millions", "bonus_millions", "gross_use"]
         ].copy()
         st.dataframe(top10.rename(columns={"gross_use": "gross_millions (selected)"}), width='stretch', hide_index=True)
 
         # Aggregates
         g = df.dropna(subset=["week_ending_dt"]).copy()
         g["year"] = g["week_ending_dt"].dt.year
-        g["month"] = g["week_ending_dt"].dt.to_period("M").astype(str)
 
         st.markdown("### Top months")
+        m = _apply_chart_month_logic(g, week_dt_col="week_ending_dt", week_str_col="week_ending")
         top_months = (
-            g.groupby("month", as_index=False)["gross_use"].sum()
+            m.groupby("month", as_index=False)["gross_use"].sum()
             .sort_values("gross_use", ascending=False)
             .head(12)
             .rename(columns={"gross_use": "gross_millions (selected)"})
@@ -3669,7 +3720,7 @@ def tab_analytics():
 
     ignore_bonus = st.checkbox(
         "Ignore gross bonuses in most analytics (Top shows/companies + yearly totals still include bonuses)",
-        value=False,
+        value=True,
         key="analytics_ignore_bonus",
     )
     gross_col = "base_gross_millions" if ignore_bonus else "gross_millions"
@@ -4690,11 +4741,20 @@ def _render_gross_races_race_views(base: pd.DataFrame, meta: pd.DataFrame, lates
 
         leaders = leaders.sort_values("cum_gross_millions", ascending=False).reset_index(drop=True)
         leaders.insert(0, "rank", np.arange(1, len(leaders) + 1))
+        leader_total = float(leaders["cum_gross_millions"].iloc[0]) if not leaders.empty else 0.0
+        leaders["grosses_behind_leader"] = leader_total - pd.to_numeric(leaders["cum_gross_millions"], errors="coerce").fillna(0.0)
+        leaders = leaders[["rank", "canonical_title", "imprint_1", "imprint_2", "cum_gross_millions", "grosses_behind_leader"]].copy()
+        leaders_disp = leaders.copy()
+        leaders_disp["grosses_behind_leader"] = leaders_disp["grosses_behind_leader"].map(
+            lambda x: "Leader" if pd.notna(x) and abs(float(x)) < 1e-12 else f"-{float(x):,.1f}"
+        )
+        leaders_styler = leaders_disp.style.format({"cum_gross_millions": "{:,.1f}"}).map(
+            lambda v: "color: red;" if isinstance(v, str) and v.startswith("-") else "",
+            subset=["grosses_behind_leader"],
+        )
 
-        leaders = leaders[["rank", "canonical_title", "imprint_1", "imprint_2", "cum_gross_millions"]].copy()
-
-        st.caption(f"Leaderboard for **{pick_dt.year}** (through **{pick_dt.isoformat()}**)")
-        st.dataframe(leaders, width='stretch', hide_index=True)
+        st.caption(f"Leaderboard for **{pick_dt.year}** (through **{pick_dt.isoformat()}**)" )
+        st.dataframe(leaders_styler, width='stretch', hide_index=True)
 
         # Line chart for top K at the selected date
         top_k = st.slider("Shows to plot (annual)", 2, min(50, int(len(leaders))), min(10, int(len(leaders))))
@@ -4785,11 +4845,20 @@ def _render_gross_races_race_views(base: pd.DataFrame, meta: pd.DataFrame, lates
 
     leaders_q = leaders_q.sort_values("cum_gross_millions", ascending=False).reset_index(drop=True)
     leaders_q.insert(0, "rank", np.arange(1, len(leaders_q) + 1))
+    leader_total_q = float(leaders_q["cum_gross_millions"].iloc[0]) if not leaders_q.empty else 0.0
+    leaders_q["grosses_behind_leader"] = leader_total_q - pd.to_numeric(leaders_q["cum_gross_millions"], errors="coerce").fillna(0.0)
+    leaders_q = leaders_q[["rank", "canonical_title", "imprint_1", "imprint_2", "cum_gross_millions", "grosses_behind_leader"]].copy()
+    leaders_q_disp = leaders_q.copy()
+    leaders_q_disp["grosses_behind_leader"] = leaders_q_disp["grosses_behind_leader"].map(
+        lambda x: "Leader" if pd.notna(x) and abs(float(x)) < 1e-12 else f"-{float(x):,.1f}"
+    )
+    leaders_q_styler = leaders_q_disp.style.format({"cum_gross_millions": "{:,.1f}"}).map(
+        lambda v: "color: red;" if isinstance(v, str) and v.startswith("-") else "",
+        subset=["grosses_behind_leader"],
+    )
 
-    leaders_q = leaders_q[["rank", "canonical_title", "imprint_1", "imprint_2", "cum_gross_millions"]].copy()
-
-    st.caption(f"Leaderboard for **Q{int(quarter)} {int(year_pick)}** (through **{wk_dt.date().isoformat()}**)")
-    st.dataframe(leaders_q, width='stretch', hide_index=True)
+    st.caption(f"Leaderboard for **Q{int(quarter)} {int(year_pick)}** (through **{wk_dt.date().isoformat()}**)" )
+    st.dataframe(leaders_q_styler, width='stretch', hide_index=True)
 
     top_kq = st.slider("Shows to plot (quarter)", 2, min(50, int(len(leaders_q))), min(10, int(len(leaders_q))), key="q_race_topk")
     top_titles_q = leaders_q.head(int(top_kq))["canonical_title"].tolist()
@@ -4804,13 +4873,13 @@ def _render_gross_races_race_views(base: pd.DataFrame, meta: pd.DataFrame, lates
     st.divider()
 
     # -------------------------
-    # 4) Monthly Gross Races (28th → 27th)
+    # 4) Monthly Gross Races (shared chart-month logic)
     # -------------------------
     st.markdown("### Monthly Gross Races")
-    st.caption("Cumulative grosses reset on the 28th of each month (e.g., Dec 28 → Jan 27).")
+    st.caption("Uses the same chart-month logic as the monthly charts and records (cutoff day 28).")
 
     pick_m_dt = st.date_input(
-        "As-of date (pick any date to view that cycle's race)",
+        "As-of date (pick any date to view that chart-month race)",
         value=latest_date,
         min_value=GROSS_TRACKING_START,
         max_value=latest_date,
@@ -4818,20 +4887,18 @@ def _render_gross_races_race_views(base: pd.DataFrame, meta: pd.DataFrame, lates
     )
     through_m_dt = pd.to_datetime(pick_m_dt)
 
-    # Cycle start (28th)
-    if through_m_dt.day >= 28:
-        cycle_start = pd.Timestamp(year=int(through_m_dt.year), month=int(through_m_dt.month), day=28)
-    else:
-        prev = through_m_dt - pd.DateOffset(months=1)
-        cycle_start = pd.Timestamp(year=int(prev.year), month=int(prev.month), day=28)
-    cycle_end_excl = cycle_start + pd.DateOffset(months=1)
-    cycle_end_incl = (cycle_end_excl - pd.Timedelta(days=1)).date()
+    mbase = _apply_chart_month_logic(base, week_dt_col="week_ending_dt", week_str_col="week_ending")
+    pick_month = _apply_chart_month_logic(
+        pd.DataFrame({"week_ending": [through_m_dt.date().isoformat()], "week_ending_dt": [through_m_dt]}),
+        week_dt_col="week_ending_dt",
+        week_str_col="week_ending",
+    )["month"].iloc[0]
 
-    mbase = base[(base["week_ending_dt"] >= cycle_start) & (base["week_ending_dt"] < cycle_end_excl)].copy()
+    mbase = mbase[mbase["month"].eq(pick_month)].copy()
     mbase = mbase[mbase["week_ending_dt"] <= through_m_dt].copy()
 
     if mbase.empty:
-        st.info("No monthly data available for that date range (gross-tracking era filter applied).")
+        st.info("No monthly data available for that chart-month/date range (gross-tracking era filter applied).")
     else:
         mdf = mbase.sort_values(["show_id", "week_ending_dt"]).reset_index(drop=True)
         mdf["cum_gross_millions"] = mdf.groupby("show_id")["gross_millions"].cumsum()
@@ -4853,9 +4920,11 @@ def _render_gross_races_race_views(base: pd.DataFrame, meta: pd.DataFrame, lates
         leaders_m.insert(0, "rank", np.arange(1, len(leaders_m) + 1))
         leaders_m = leaders_m[["rank", "canonical_title", "imprint_1", "imprint_2", "cum_gross_millions"]].copy()
 
+        cycle_start = pd.to_datetime(mdf["week_ending_dt"].min()).date().isoformat()
+        cycle_end = pd.to_datetime(mdf["week_ending_dt"].max()).date().isoformat()
         st.caption(
-            f"Leaderboard for cycle **{cycle_start.date().isoformat()} → {cycle_end_incl.isoformat()}** "
-            f"(through **{through_m_dt.date().isoformat()}**)"
+            f"Leaderboard for chart-month **{pick_month}** "
+            f"(weeks currently in range: **{cycle_start} → {cycle_end}**, through **{through_m_dt.date().isoformat()}** )"
         )
         st.dataframe(leaders_m, width='stretch', hide_index=True)
 
@@ -4880,87 +4949,7 @@ def _render_gross_races_race_views(base: pd.DataFrame, meta: pd.DataFrame, lates
         series_by_label_m = {c: pivm[c] for c in pivm.columns}
         _plot_multi_line(list(pivm.index), series_by_label_m, "Week Ending", "Cumulative Gross (Millions)")
 
-
-
-def tab_gross_races():
-    st.subheader("Gross Races")
-    st.caption("All charts on this page include weekly gross **plus all gross bonuses** (annual + quarter bonuses included via gross_bonus).")
-
-    if not DB_PATH.exists():
-        st.error(f"Database not found at {DB_PATH}.")
-        return
-
-    db_mtime = DB_PATH.stat().st_mtime
-    base = _load_gross_races_base(str(DB_PATH), db_mtime)
-    if base.empty:
-        st.info("No gross data found.")
-        return
-
-    base["week_ending_dt"] = pd.to_datetime(base["week_ending"], errors="coerce")
-    base = base[base["week_ending_dt"] >= pd.Timestamp(GROSS_TRACKING_START)].copy()
-    if base.empty:
-        st.info("No gross rows found on/after the gross-tracking start date (2001-03-17).")
-        return
-
-    latest_dt = pd.to_datetime(base["week_ending_dt"].max())
-    latest_date = latest_dt.date()
-    meta = _load_show_meta_for_gross_races(str(DB_PATH), db_mtime)
-
-    t_races, t_leads = st.tabs(["Race Views", "Show Leaderboards"])
-    with t_races:
-        _render_gross_races_race_views(base, meta, latest_dt, latest_date)
-    with t_leads:
-        _render_gross_races_show_leaderboards(base, latest_date, str(DB_PATH), db_mtime)
-
-
-# ----------------------------
-# New tab: Streak Analytics
-# ----------------------------
-def tab_streak_analytics():
-    st.subheader("Streak Analytics")
-    st.caption("Longest consecutive-week streaks for a show at a given rank. (Uses week_number when available.)")
-
-    shows, _ = load_lists()
-
-    with st.sidebar:
-        st.header("Streak filters")
-        date_min = st.text_input("Start date (YYYY-MM-DD)      ", value="")
-        date_max = st.text_input("End date (YYYY-MM-DD)        ", value="")
-        rank_min, rank_max = st.slider("Rank range (streaks)", 1, 17, (1, 10))
-        top_n = st.slider("Top N (streaks)", 5, 200, 25)
-
-    filters = FilterSpec(date_min.strip() or None, date_max.strip() or None, int(rank_min), int(rank_max))
-    where, params = build_where(filters, "e")
-
-    rows = sql_df(f"""
-        SELECT
-          e.week_ending,
-          e.week_number,
-          e.rank,
-          e.pos,
-          e.show_id,
-          s.canonical_title
-        FROM t10_entry e
-        JOIN show s ON s.show_id = e.show_id
-        WHERE {where}
-        ORDER BY e.week_number ASC, e.rank ASC, e.pos ASC
-    """, tuple(params))
-
-    if rows.empty:
-        st.info("No rows match your filters.")
-        return
-
-    streaks = compute_longest_streaks(rows)
-    if streaks.empty:
-        st.info("Not enough data to compute streaks.")
-        return
-
-    st.markdown("### Longest streaks by rank")
-    ranks = sorted(streaks["rank"].dropna().unique().tolist())
-    rank_pick = st.selectbox("Rank", ranks, index=0)
-
-    block = streaks[streaks["rank"] == rank_pick].head(int(top_n)).copy()
-    st.dataframe(block, width='stretch')
+    return
 
     st.divider()
     st.markdown("### Per-show streak breakdown")
@@ -4978,7 +4967,45 @@ def tab_streak_analytics():
     # Useful for validating consecutive week_number behavior
     show_rows = rows[rows["show_id"] == show_id].copy()
     show_rows["week_ending"] = _as_date_str(show_rows["week_ending"])
-    st.dataframe(show_rows.sort_values(["week_number", "rank", "pos"]).drop(columns=["pos"], errors="ignore"), width='stretch')
+    st.dataframe(show_rows.sort_values(["week_number", "rank", "pos"]), width='stretch')
+
+
+def tab_gross_races():
+    st.subheader("Gross Races")
+    st.caption("All-time, annual, quarter, and monthly gross races, plus by-show gross leaderboards.")
+
+    if not DB_PATH.exists():
+        st.error(f"Database not found at {DB_PATH}.")
+        return
+
+    db_mtime = DB_PATH.stat().st_mtime
+    base = _load_gross_races_base(str(DB_PATH), db_mtime)
+    if base.empty:
+        st.info("No gross rows found in the database.")
+        return
+
+    base = base.copy()
+    if "week_ending" not in base.columns:
+        st.error("Gross Races data is missing week_ending.")
+        return
+
+    base["week_ending"] = _as_date_str(base["week_ending"])
+    base["week_ending_dt"] = pd.to_datetime(base["week_ending"], errors="coerce")
+    base = base.dropna(subset=["week_ending_dt"]).copy()
+    base = base[base["week_ending_dt"].dt.date >= GROSS_TRACKING_START].copy()
+    if base.empty:
+        st.info("No gross rows found on or after the gross-tracking start date (2001-03-17).")
+        return
+
+    latest_dt = pd.to_datetime(base["week_ending_dt"].max())
+    latest_date = latest_dt.date()
+    meta = _load_show_meta_for_gross_races(str(DB_PATH), db_mtime)
+
+    subtab_race, subtab_lead = st.tabs(["Race Views", "Show Leaderboards"])
+    with subtab_race:
+        _render_gross_races_race_views(base, meta, latest_dt, latest_date)
+    with subtab_lead:
+        _render_gross_races_show_leaderboards(base, latest_date, str(DB_PATH), db_mtime)
 
 
 # ----------------------------
@@ -5907,26 +5934,12 @@ def tab_records_achievements():
     # -------------------------
     st.markdown("### List of shows holding single-show monthly grossing record")
 
-    # Compute chart-month totals (cutoff day 28) using weekly gross only.
-    m_base = base_gross.copy()
-    m_base["month"] = _chart_month_series(m_base["week_ending_dt"])
-
-    # Special rule: April 2001 uses only Mar 17 + Mar 24, 2001 weeks
-    m_base = m_base[
-        ~(
-            (m_base["month"] == "2001-04")
-            & (~m_base["week_ending"].isin(["2001-03-17", "2001-03-24"]))
-        )
-    ].copy()
+    # Compute chart-month totals using the shared monthly grossing logic.
+    m_base = _apply_chart_month_logic(base_gross, week_dt_col="week_ending_dt", week_str_col="week_ending")
 
     if m_base.empty:
         st.info("No gross rows available for monthly aggregation.")
     else:
-        # month ordering
-        y = m_base["month"].str.slice(0, 4).astype(int)
-        mo = m_base["month"].str.slice(5, 7).astype(int)
-        m_base["month_ord"] = y * 12 + (mo - 1)
-
         month_totals = (
             m_base.groupby(["month", "month_ord", "show_id", "canonical_title", "imprint_1", "imprint_2"], as_index=False)
             .agg(gross_millions=("gross_millions", "sum"))
@@ -7725,7 +7738,7 @@ def tab_hall_of_fame():
                         st.caption("No rows for this show inside your current filters.")
                     else:
                         st.dataframe(
-                            led[["week_ending", "rank", "gross_millions", "ye_points", "imprint_1", "imprint_2"]],
+                            led[["week_ending", "rank", "pos", "gross_millions", "ye_points", "imprint_1", "imprint_2"]],
                             width='stretch',
                             hide_index=True,
                         )
@@ -7851,6 +7864,74 @@ def tab_hall_of_fame():
                         width="stretch",
                         hide_index=True,
                     )
+
+
+# ----------------------------
+# New tab: Streak Analytics
+# ----------------------------
+def tab_streak_analytics():
+    st.subheader("Streak Analytics")
+    st.caption("Longest consecutive-week streaks for a show at a given rank. (Uses week_number when available.)")
+
+    shows, _ = load_lists()
+
+    with st.sidebar:
+        st.header("Streak filters")
+        date_min = st.text_input("Start date (YYYY-MM-DD)      ", value="")
+        date_max = st.text_input("End date (YYYY-MM-DD)        ", value="")
+        rank_min, rank_max = st.slider("Rank range (streaks)", 1, 17, (1, 10))
+        top_n = st.slider("Top N (streaks)", 5, 200, 25)
+
+    filters = FilterSpec(date_min.strip() or None, date_max.strip() or None, int(rank_min), int(rank_max))
+    where, params = build_where(filters, "e")
+
+    rows = sql_df(f"""
+        SELECT
+          e.week_ending,
+          e.week_number,
+          e.rank,
+          e.pos,
+          e.show_id,
+          s.canonical_title
+        FROM t10_entry e
+        JOIN show s ON s.show_id = e.show_id
+        WHERE {where}
+        ORDER BY e.week_number ASC, e.rank ASC, e.pos ASC
+    """, tuple(params))
+
+    if rows.empty:
+        st.info("No rows match your filters.")
+        return
+
+    streaks = compute_longest_streaks(rows)
+    if streaks.empty:
+        st.info("Not enough data to compute streaks.")
+        return
+
+    st.markdown("### Longest streaks by rank")
+    ranks = sorted(streaks["rank"].dropna().unique().tolist())
+    rank_pick = st.selectbox("Rank", ranks, index=0)
+
+    block = streaks[streaks["rank"] == rank_pick].head(int(top_n)).copy()
+    st.dataframe(block, width='stretch')
+
+    st.divider()
+    st.markdown("### Per-show streak breakdown")
+    title_pick = st.selectbox("Show (canonical)", shows["canonical_title"].tolist(), key="streak_show_pick")
+    show_id = int(shows.loc[shows["canonical_title"] == title_pick, "show_id"].iloc[0])
+
+    show_block = streaks[streaks["show_id"] == show_id].sort_values(["rank"]).copy()
+    if show_block.empty:
+        st.info("No streak data for this show in the selected filters.")
+        return
+
+    st.dataframe(show_block, width='stretch')
+
+    st.markdown("### Quick peek: raw weeks for this show (filtered)")
+    # Useful for validating consecutive week_number behavior
+    show_rows = rows[rows["show_id"] == show_id].copy()
+    show_rows["week_ending"] = _as_date_str(show_rows["week_ending"])
+    st.dataframe(show_rows.sort_values(["week_number", "rank", "pos"]), width='stretch')
 
 def main():
     st.set_page_config(page_title=APP_TITLE, layout="wide")
