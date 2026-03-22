@@ -22,20 +22,6 @@ import matplotlib.pyplot as plt
 from charts import chart_top_gross_weeks
 
 
-# Hide raw weekly `pos` in visible dataframe renders throughout the app.
-_st_dataframe_orig = st.dataframe
-
-def _st_dataframe_hide_pos(data=None, *args, **kwargs):
-    try:
-        if isinstance(data, pd.DataFrame) and "pos" in data.columns:
-            data = data.drop(columns=["pos"], errors="ignore")
-    except Exception:
-        pass
-    return _st_dataframe_orig(data, *args, **kwargs)
-
-st.dataframe = _st_dataframe_hide_pos
-
-
 # ----------------------------
 # Configuration
 # ----------------------------
@@ -753,6 +739,75 @@ def compute_longest_streaks(rows: pd.DataFrame) -> pd.DataFrame:
 
     out = pd.DataFrame(out_rows)
     out = out.sort_values(["rank", "streak_len", "canonical_title"], ascending=[True, False, True]).reset_index(drop=True)
+    return out
+
+
+def compute_longest_charted_runs(rows: pd.DataFrame) -> pd.DataFrame:
+    """Compute longest consecutive charted run per show across filtered chart weeks."""
+    if rows.empty:
+        return pd.DataFrame(columns=[
+            "show_id", "canonical_title", "run_len", "start_week_ending", "end_week_ending"
+        ])
+
+    df = rows.copy()
+    df["week_ending"] = _as_date_str(df["week_ending"])
+    df["week_number"] = pd.to_numeric(df["week_number"], errors="coerce")
+
+    out_rows = []
+    for sid, g in df.groupby("show_id", dropna=False):
+        g = g.sort_values(["week_number", "week_ending", "rank", "pos"], ascending=[True, True, True, True]).copy()
+        if g.empty:
+            continue
+
+        # De-duplicate to one row per chart week for this show.
+        g = g.drop_duplicates(subset=["week_ending"], keep="first").reset_index(drop=True)
+        title = g["canonical_title"].iloc[0] if "canonical_title" in g.columns else None
+
+        if g["week_number"].notna().all():
+            cont = _consecutive_by_week_number(g["week_number"])
+        else:
+            cont = _consecutive_by_date(g["week_ending"])
+
+        best_len = 1
+        best_start = g.loc[0, "week_ending"]
+        best_end = g.loc[0, "week_ending"]
+
+        cur_len = 1
+        cur_start = g.loc[0, "week_ending"]
+        cur_end = g.loc[0, "week_ending"]
+
+        for i in range(1, len(g)):
+            if bool(cont.iloc[i]):
+                cur_len += 1
+                cur_end = g.loc[i, "week_ending"]
+            else:
+                if cur_len > best_len:
+                    best_len = cur_len
+                    best_start = cur_start
+                    best_end = cur_end
+                cur_len = 1
+                cur_start = g.loc[i, "week_ending"]
+                cur_end = g.loc[i, "week_ending"]
+
+        if cur_len > best_len:
+            best_len = cur_len
+            best_start = cur_start
+            best_end = cur_end
+
+        out_rows.append({
+            "show_id": int(sid) if pd.notna(sid) else sid,
+            "canonical_title": title,
+            "run_len": int(best_len),
+            "start_week_ending": best_start,
+            "end_week_ending": best_end,
+        })
+
+    out = pd.DataFrame(out_rows)
+    if out.empty:
+        return pd.DataFrame(columns=[
+            "show_id", "canonical_title", "run_len", "start_week_ending", "end_week_ending"
+        ])
+    out = out.sort_values(["run_len", "end_week_ending", "canonical_title"], ascending=[False, False, True]).reset_index(drop=True)
     return out
 
 @st.cache_data(show_spinner=False)
@@ -2777,7 +2832,8 @@ def _fetch_show_trends_rows(show_id: int, year: str | None) -> pd.DataFrame:
                 "week_number",
                 "week_ending",
                 "rank",
-                    "last_week",
+                "pos",
+                "last_week",
                 "canonical_title",
                 "imprint_1",
                 "imprint_2",
@@ -3000,6 +3056,7 @@ def tab_show_trends():
                     alt.Tooltip("week_ending:N", title="Week"),
                     alt.Tooltip("week_number:Q", title="Week #"),
                     alt.Tooltip("rank:Q", title="Rank"),
+                    alt.Tooltip("pos:Q", title="Pos"),
                     alt.Tooltip("gross_use:Q", title="Gross", format=",.1f"),
                 ],
             )
@@ -3027,6 +3084,7 @@ def tab_show_trends():
             "week_number",
             "week_ending",
             "rank",
+            "pos",
             "last_week",
             "canonical_title",
             "imprint_1",
@@ -3057,7 +3115,7 @@ def tab_show_trends():
         st.markdown("### Biggest week-over-week % gains")
         st.dataframe(
             _top(g[g["delta_pct"] > 0], "delta_pct", 10, asc=False)[
-                ["week_number", "week_ending", "rank", "gross_use", "prev_gross", "delta_pct", "delta"]
+                ["week_number", "week_ending", "rank", "pos", "gross_use", "prev_gross", "delta_pct", "delta"]
             ],
             width='stretch',
             hide_index=True,
@@ -3066,7 +3124,7 @@ def tab_show_trends():
         st.markdown("### Biggest week-over-week % drops")
         st.dataframe(
             _top(g[g["delta_pct"] < 0], "delta_pct", 10, asc=True)[
-                ["week_number", "week_ending", "rank", "gross_use", "prev_gross", "delta_pct", "delta"]
+                ["week_number", "week_ending", "rank", "pos", "gross_use", "prev_gross", "delta_pct", "delta"]
             ],
             width='stretch',
             hide_index=True,
@@ -3075,7 +3133,7 @@ def tab_show_trends():
         st.markdown("### Biggest absolute gains")
         st.dataframe(
             _top(g[g["delta"] > 0], "delta", 10, asc=False)[
-                ["week_number", "week_ending", "rank", "gross_use", "prev_gross", "delta", "delta_pct"]
+                ["week_number", "week_ending", "rank", "pos", "gross_use", "prev_gross", "delta", "delta_pct"]
             ],
             width='stretch',
             hide_index=True,
@@ -3084,7 +3142,7 @@ def tab_show_trends():
         st.markdown("### Biggest absolute drops")
         st.dataframe(
             _top(g[g["delta"] < 0], "delta", 10, asc=True)[
-                ["week_number", "week_ending", "rank", "gross_use", "prev_gross", "delta", "delta_pct"]
+                ["week_number", "week_ending", "rank", "pos", "gross_use", "prev_gross", "delta", "delta_pct"]
             ],
             width='stretch',
             hide_index=True,
@@ -3128,7 +3186,7 @@ def tab_show_trends():
 
         st.markdown("### Top 10 peak weeks (by gross)")
         top10 = df.sort_values("gross_use", ascending=False).head(10)[
-            ["week_number", "week_ending", "rank", "base_gross_millions", "bonus_millions", "gross_use"]
+            ["week_number", "week_ending", "rank", "pos", "base_gross_millions", "bonus_millions", "gross_use"]
         ].copy()
         st.dataframe(top10.rename(columns={"gross_use": "gross_millions (selected)"}), width='stretch', hide_index=True)
 
@@ -3981,41 +4039,55 @@ def tab_analytics():
     # -------------------------
     if analytics_section == "Premiums":
         st.markdown("### #1 premium tables (#1 vs #2)")
-        st.caption("These tables follow the current Analytics sidebar filters.")
 
         if premium_ts.empty:
             st.info("Not enough data for #1 premium tables in the selected filters.")
         else:
-            premium_top_n = st.slider("Top N", 5, 200, min(50, max(5, int(top_n))), key="analytics_premium_topn")
+            min_available = pd.to_datetime(premium_ts["week_ending_dt"].min()).date()
+            max_available = pd.to_datetime(premium_ts["week_ending_dt"].max()).date()
 
-            pt = premium_ts.copy()
-            diff_tbl = pt.sort_values(["premium_diff", "week_ending_dt"], ascending=[False, False]).head(int(premium_top_n)).copy()
-            diff_tbl.insert(0, "Rank", np.arange(1, len(diff_tbl) + 1))
-            diff_tbl = diff_tbl.rename(columns={
-                "week_ending": "Week Ending",
-                "n1_show": "#1 Show",
-                "n1_gross": "#1 Gross",
-                "n2_show": "#2 Show",
-                "n2_gross": "#2 Gross",
-                "premium_diff": "Premium Difference",
-                "premium_ratio": "Premium Ratio",
-            })
-            st.markdown("#### Biggest #1 premium gaps")
-            st.dataframe(diff_tbl[["Rank", "Week Ending", "#1 Show", "#1 Gross", "#2 Show", "#2 Gross", "Premium Difference", "Premium Ratio"]], width='stretch', hide_index=True)
+            c1, c2, c3 = st.columns([1.15, 1.15, 1])
+            with c1:
+                pmin = st.date_input("Start date", value=min_available, min_value=min_available, max_value=max_available, key="analytics_premium_start")
+            with c2:
+                pmax = st.date_input("End date", value=max_available, min_value=min_available, max_value=max_available, key="analytics_premium_end")
+            with c3:
+                premium_top_n = st.slider("Top N", 5, 200, min(50, max(5, int(top_n))), key="analytics_premium_topn")
 
-            ratio_tbl = pt.dropna(subset=["premium_ratio"]).sort_values(["premium_ratio", "week_ending_dt"], ascending=[False, False]).head(int(premium_top_n)).copy()
-            ratio_tbl.insert(0, "Rank", np.arange(1, len(ratio_tbl) + 1))
-            ratio_tbl = ratio_tbl.rename(columns={
-                "week_ending": "Week Ending",
-                "n1_show": "#1 Show",
-                "n1_gross": "#1 Gross",
-                "n2_show": "#2 Show",
-                "n2_gross": "#2 Gross",
-                "premium_diff": "Premium Difference",
-                "premium_ratio": "Premium Ratio",
-            })
-            st.markdown("#### Biggest #1 premium ratios")
-            st.dataframe(ratio_tbl[["Rank", "Week Ending", "#1 Show", "#1 Gross", "#2 Show", "#2 Gross", "Premium Difference", "Premium Ratio"]], width='stretch', hide_index=True)
+            if pd.to_datetime(pmin) > pd.to_datetime(pmax):
+                st.warning("Start date is after end date.")
+            else:
+                pt = premium_ts[(premium_ts["week_ending_dt"] >= pd.Timestamp(pmin)) & (premium_ts["week_ending_dt"] <= pd.Timestamp(pmax))].copy()
+                if pt.empty:
+                    st.info("No #1 premium rows found for that date range.")
+                else:
+                    diff_tbl = pt.sort_values(["premium_diff", "week_ending_dt"], ascending=[False, False]).head(int(premium_top_n)).copy()
+                    diff_tbl.insert(0, "Rank", np.arange(1, len(diff_tbl) + 1))
+                    diff_tbl = diff_tbl.rename(columns={
+                        "week_ending": "Week Ending",
+                        "n1_show": "#1 Show",
+                        "n1_gross": "#1 Gross",
+                        "n2_show": "#2 Show",
+                        "n2_gross": "#2 Gross",
+                        "premium_diff": "Premium Difference",
+                        "premium_ratio": "Premium Ratio",
+                    })
+                    st.markdown("#### Biggest #1 premium gaps")
+                    st.dataframe(diff_tbl[["Rank", "Week Ending", "#1 Show", "#1 Gross", "#2 Show", "#2 Gross", "Premium Difference", "Premium Ratio"]], width='stretch', hide_index=True)
+
+                    ratio_tbl = pt.dropna(subset=["premium_ratio"]).sort_values(["premium_ratio", "week_ending_dt"], ascending=[False, False]).head(int(premium_top_n)).copy()
+                    ratio_tbl.insert(0, "Rank", np.arange(1, len(ratio_tbl) + 1))
+                    ratio_tbl = ratio_tbl.rename(columns={
+                        "week_ending": "Week Ending",
+                        "n1_show": "#1 Show",
+                        "n1_gross": "#1 Gross",
+                        "n2_show": "#2 Show",
+                        "n2_gross": "#2 Gross",
+                        "premium_diff": "Premium Difference",
+                        "premium_ratio": "Premium Ratio",
+                    })
+                    st.markdown("#### Biggest #1 premium ratios")
+                    st.dataframe(ratio_tbl[["Rank", "Week Ending", "#1 Show", "#1 Gross", "#2 Show", "#2 Gross", "Premium Difference", "Premium Ratio"]], width='stretch', hide_index=True)
 
     # -------------------------
     # Distribution (boxplots)
@@ -4455,21 +4527,21 @@ def _build_number_one_premium_table(df: pd.DataFrame, gross_col: str) -> pd.Data
         )
     )
 
-    gross_pivot = (
+    gross_wide = (
         agg.pivot(index=["week_ending", "week_ending_dt"], columns="rank", values="gross_use")
         .rename(columns={1: "n1_gross", 2: "n2_gross"})
         .reset_index()
     )
-    if "n1_gross" not in gross_pivot.columns or "n2_gross" not in gross_pivot.columns:
+    if "n1_gross" not in gross_wide.columns or "n2_gross" not in gross_wide.columns:
         return pd.DataFrame()
 
-    name_pivot = (
+    names_wide = (
         agg.pivot(index=["week_ending", "week_ending_dt"], columns="rank", values="canonical_title")
         .rename(columns={1: "n1_show", 2: "n2_show"})
         .reset_index()
     )
 
-    out = gross_pivot.merge(name_pivot, on=["week_ending", "week_ending_dt"], how="left")
+    out = gross_wide.merge(names_wide, on=["week_ending", "week_ending_dt"], how="left")
     if "n1_show" not in out.columns:
         out["n1_show"] = pd.NA
     if "n2_show" not in out.columns:
@@ -4547,30 +4619,24 @@ def _render_gross_races_all_gross_entries(base: pd.DataFrame, meta: pd.DataFrame
                 rows = rows.drop(columns=[meta_col], errors="ignore")
 
     rows = rows.sort_values([gross_col, "week_ending_dt", "canonical_title"], ascending=[False, False, True]).head(int(top_n)).copy()
+    rows = rows.reset_index(drop=True)
+    rows.insert(0, "table_rank", np.arange(1, len(rows) + 1))
 
-    show_cols = ["week_ending", "rank", "canonical_title", "imprint_1", "imprint_2", "bonus_millions"]
-    rename_map = {
+    base_cols = ["table_rank", "week_ending", "rank", "canonical_title", "imprint_1", "imprint_2", "base_gross_millions"]
+    if include_bon:
+        base_cols.extend(["bonus_millions", gross_col])
+    show = rows[base_cols].copy()
+    show = show.rename(columns={
+        "table_rank": "Rank",
         "week_ending": "Week Ending",
-        "rank": "Rank",
+        "rank": "Week Rank",
         "canonical_title": "Show",
         "imprint_1": "Imprint 1",
         "imprint_2": "Imprint 2",
+        "base_gross_millions": "Base gross (millions)",
         "bonus_millions": "Bonuses",
-    }
-
-    if include_bon:
-        show_cols.extend(["base_gross_millions", "gross_millions"])
-        rename_map.update({
-            "base_gross_millions": "Base Gross (millions)",
-            "gross_millions": gross_label,
-        })
-    else:
-        show_cols.append("base_gross_millions")
-        rename_map.update({
-            "base_gross_millions": gross_label,
-        })
-
-    show = rows[show_cols].copy().rename(columns=rename_map)
+        gross_col: gross_label,
+    })
     st.dataframe(show, width='stretch', hide_index=True)
 
 def _build_gross_races_show_leaderboards(rows: pd.DataFrame, min_weeks: int, top_n: int, include_bonuses_avg_share: bool, share_mode: str = "peak") -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, str]:
@@ -5169,8 +5235,7 @@ def _render_gross_races_race_views(base: pd.DataFrame, meta: pd.DataFrame, lates
     # Useful for validating consecutive week_number behavior
     show_rows = rows[rows["show_id"] == show_id].copy()
     show_rows["week_ending"] = _as_date_str(show_rows["week_ending"])
-    show_rows_disp = show_rows.sort_values(["week_number", "rank", "pos"]).drop(columns=["pos"], errors="ignore")
-    st.dataframe(show_rows_disp, width='stretch')
+    st.dataframe(show_rows.sort_values(["week_number", "rank", "pos"]), width='stretch')
 
 
 def tab_gross_races():
@@ -7943,7 +8008,7 @@ def tab_hall_of_fame():
                         st.caption("No rows for this show inside your current filters.")
                     else:
                         st.dataframe(
-                            led[["week_ending", "rank", "gross_millions", "ye_points", "imprint_1", "imprint_2"]],
+                            led[["week_ending", "rank", "pos", "gross_millions", "ye_points", "imprint_1", "imprint_2"]],
                             width='stretch',
                             hide_index=True,
                         )
@@ -8113,31 +8178,48 @@ def tab_streak_analytics():
         st.info("Not enough data to compute streaks.")
         return
 
-    st.markdown("### Longest streaks by rank")
-    ranks = sorted(streaks["rank"].dropna().unique().tolist())
-    rank_pick = st.selectbox("Rank", ranks, index=0)
+    rank_tab, charted_tab = st.tabs(["By Rank", "Longest Charted Runs"])
 
-    block = streaks[streaks["rank"] == rank_pick].head(int(top_n)).copy()
-    st.dataframe(block, width='stretch')
+    with rank_tab:
+        st.markdown("### Longest streaks by rank")
+        ranks = sorted(streaks["rank"].dropna().unique().tolist())
+        rank_pick = st.selectbox("Rank", ranks, index=0)
 
-    st.divider()
-    st.markdown("### Per-show streak breakdown")
-    title_pick = st.selectbox("Show (canonical)", shows["canonical_title"].tolist(), key="streak_show_pick")
-    show_id = int(shows.loc[shows["canonical_title"] == title_pick, "show_id"].iloc[0])
+        block = streaks[streaks["rank"] == rank_pick].head(int(top_n)).copy()
+        st.dataframe(block, width='stretch')
 
-    show_block = streaks[streaks["show_id"] == show_id].sort_values(["rank"]).copy()
-    if show_block.empty:
-        st.info("No streak data for this show in the selected filters.")
-        return
+        st.divider()
+        st.markdown("### Per-show streak breakdown")
+        title_pick = st.selectbox("Show (canonical)", shows["canonical_title"].tolist(), key="streak_show_pick")
+        show_id = int(shows.loc[shows["canonical_title"] == title_pick, "show_id"].iloc[0])
 
-    st.dataframe(show_block, width='stretch')
+        show_block = streaks[streaks["show_id"] == show_id].sort_values(["rank"]).copy()
+        if show_block.empty:
+            st.info("No streak data for this show in the selected filters.")
+        else:
+            st.dataframe(show_block, width='stretch')
 
-    st.markdown("### Quick peek: raw weeks for this show (filtered)")
-    # Useful for validating consecutive week_number behavior
-    show_rows = rows[rows["show_id"] == show_id].copy()
-    show_rows["week_ending"] = _as_date_str(show_rows["week_ending"])
-    show_rows_disp = show_rows.sort_values(["week_number", "rank", "pos"]).drop(columns=["pos"], errors="ignore")
-    st.dataframe(show_rows_disp, width='stretch')
+            st.markdown("### Quick peek: raw weeks for this show (filtered)")
+            # Useful for validating consecutive week_number behavior
+            show_rows = rows[rows["show_id"] == show_id].copy()
+            show_rows["week_ending"] = _as_date_str(show_rows["week_ending"])
+            show_rows_disp = show_rows.sort_values(["week_number", "rank", "pos"]).drop(columns=["pos"], errors="ignore")
+            st.dataframe(show_rows_disp, width='stretch')
+
+    with charted_tab:
+        st.markdown("### Longest consecutive charted runs")
+        run_df = compute_longest_charted_runs(rows)
+        if run_df.empty:
+            st.info("No charted-run data available in the selected filters.")
+        else:
+            run_show = run_df.head(int(top_n)).copy().rename(columns={
+                "canonical_title": "Show",
+                "run_len": "Weeks",
+                "start_week_ending": "Start",
+                "end_week_ending": "End",
+            })
+            run_show.insert(0, "Rank", range(1, len(run_show) + 1))
+            st.dataframe(run_show[["Rank", "Show", "Weeks", "Start", "End"]], width='stretch', hide_index=True)
 
 def main():
     st.set_page_config(page_title=APP_TITLE, layout="wide")
