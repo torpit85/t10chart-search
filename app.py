@@ -22,6 +22,33 @@ import matplotlib.pyplot as plt
 from charts import chart_top_gross_weeks
 
 
+def _drop_raw_pos_column(obj):
+    try:
+        if isinstance(obj, pd.DataFrame):
+            drop_cols = [c for c in obj.columns if isinstance(c, str) and c.strip().lower() == "pos"]
+            return obj.drop(columns=drop_cols) if drop_cols else obj
+        if isinstance(obj, pd.Series):
+            return obj.drop(labels=[c for c in obj.index if isinstance(c, str) and c.strip().lower() == "pos"], errors="ignore")
+    except Exception:
+        return obj
+    return obj
+
+
+if not getattr(st, "_t10_pos_hidden_patch", False):
+    _orig_st_dataframe = st.dataframe
+    _orig_st_table = st.table
+
+    def _patched_dataframe(data=None, *args, **kwargs):
+        return _orig_st_dataframe(_drop_raw_pos_column(data), *args, **kwargs)
+
+    def _patched_table(data=None, *args, **kwargs):
+        return _orig_st_table(_drop_raw_pos_column(data), *args, **kwargs)
+
+    st.dataframe = _patched_dataframe
+    st.table = _patched_table
+    st._t10_pos_hidden_patch = True
+
+
 # ----------------------------
 # Configuration
 # ----------------------------
@@ -729,7 +756,7 @@ def compute_longest_streaks(rows: pd.DataFrame) -> pd.DataFrame:
             best_end = cur_end
 
         out_rows.append({
-            "show_id": int(sid) if pd.notna(sid) else sid,
+            "show_id": int(sid[0]) if isinstance(sid, tuple) and len(sid) == 1 and pd.notna(sid[0]) else (int(sid) if pd.notna(sid) and not isinstance(sid, tuple) else sid),
             "canonical_title": title,
             "rank": int(rnk) if pd.notna(rnk) else rnk,
             "streak_len": int(best_len),
@@ -795,7 +822,7 @@ def compute_longest_charted_runs(rows: pd.DataFrame) -> pd.DataFrame:
             best_end = cur_end
 
         out_rows.append({
-            "show_id": int(sid) if pd.notna(sid) else sid,
+            "show_id": int(sid[0]) if isinstance(sid, tuple) and len(sid) == 1 and pd.notna(sid[0]) else (int(sid) if pd.notna(sid) and not isinstance(sid, tuple) else sid),
             "canonical_title": title,
             "run_len": int(best_len),
             "start_week_ending": best_start,
@@ -2976,7 +3003,7 @@ def tab_show_trends():
         year_val = None if year == "All" else year
 
     with c3:
-        include_bonuses = st.checkbox("Include bonuses", value=True, key="show_trends_bonus")
+        include_bonuses = st.checkbox("Include bonuses", value=False, key="show_trends_bonus")
 
     with c4:
         smoothing = st.selectbox("Smoothing", ["None", "4-week MA", "8-week MA"], index=0, key="show_trends_smooth")
@@ -4560,39 +4587,19 @@ def _build_number_one_premium_table(df: pd.DataFrame, gross_col: str) -> pd.Data
 
 
 def _render_gross_races_all_gross_entries(base: pd.DataFrame, meta: pd.DataFrame, latest_date: date):
-    st.markdown("### Top Gross Entries")
-    st.caption("Table view of all ranked weekly gross entries in the selected slice, sorted by gross.")
-
-    if base.empty:
-        st.info("No gross rows found.")
-        return
-
-    min_available = pd.to_datetime(base["week_ending_dt"].min()).date()
-    max_available = pd.to_datetime(base["week_ending_dt"].max()).date()
-
-    c1, c2, c3, c4 = st.columns([1.15, 1.15, 1, 1])
+    st.markdown("#### Top Gross Entries")
+    c1, c2, c3, c4 = st.columns([1, 1, 1, 1])
     with c1:
-        dmin = st.date_input("Start date", value=min_available, min_value=min_available, max_value=max_available, key="gr_entries_start")
+        top_n = st.slider("Top N", 10, 500, 100, 10, key="gr_all_entries_topn")
     with c2:
-        dmax = st.date_input("End date", value=max_available, min_value=min_available, max_value=max_available, key="gr_entries_end")
+        rank_pick = st.selectbox("Rank", list(range(1, 18)), index=0, key="gr_all_entries_rank")
     with c3:
-        top_n = st.slider("Top N", 5, 500, 200, key="gr_entries_topn")
+        dmin = st.date_input("Start date", value=date(2001, 3, 17), key="gr_all_entries_dmin")
     with c4:
-        rank_pick = st.selectbox("Rank", options=list(range(1, 18)), index=0, key="gr_entries_rank")
+        dmax = st.date_input("End date", value=latest_date, key="gr_all_entries_dmax")
 
-    include_bon = st.checkbox(
-        "Include bonuses",
-        value=False,
-        key="gr_entries_include_bonuses",
-        help="Uses bonus-adjusted gross when checked. Base gross only when unchecked.",
-    )
-
-    if pd.to_datetime(dmin) > pd.to_datetime(dmax):
-        st.warning("Start date is after end date.")
-        return
-
+    include_bon = st.checkbox("Include bonuses", value=False, key="gr_all_entries_include_bon")
     gross_col = "gross_millions" if include_bon else "base_gross_millions"
-    gross_label = "Gross + bonuses (millions)" if include_bon else "Base gross (millions)"
 
     rows = base.copy()
     rows = rows[(rows["week_ending_dt"] >= pd.Timestamp(dmin)) & (rows["week_ending_dt"] <= pd.Timestamp(dmax))].copy()
@@ -4604,6 +4611,8 @@ def _render_gross_races_all_gross_entries(base: pd.DataFrame, meta: pd.DataFrame
         return
 
     rows[gross_col] = pd.to_numeric(rows[gross_col], errors="coerce")
+    rows["base_gross_millions"] = pd.to_numeric(rows.get("base_gross_millions"), errors="coerce")
+    rows["bonus_millions"] = pd.to_numeric(rows.get("bonus_millions"), errors="coerce").fillna(0.0)
     rows = rows[rows[gross_col].fillna(0.0) > 0.0].copy()
     if rows.empty:
         st.info("No gross entries found for the selected filters.")
@@ -4619,24 +4628,39 @@ def _render_gross_races_all_gross_entries(base: pd.DataFrame, meta: pd.DataFrame
                 rows = rows.drop(columns=[meta_col], errors="ignore")
 
     rows = rows.sort_values([gross_col, "week_ending_dt", "canonical_title"], ascending=[False, False, True]).head(int(top_n)).copy()
-    rows = rows.reset_index(drop=True)
-    rows.insert(0, "table_rank", np.arange(1, len(rows) + 1))
+    rows.insert(0, "table_rank", range(1, len(rows) + 1))
 
-    base_cols = ["table_rank", "week_ending", "rank", "canonical_title", "imprint_1", "imprint_2", "base_gross_millions"]
     if include_bon:
-        base_cols.extend(["bonus_millions", gross_col])
-    show = rows[base_cols].copy()
-    show = show.rename(columns={
-        "table_rank": "Rank",
-        "week_ending": "Week Ending",
-        "rank": "Week Rank",
-        "canonical_title": "Show",
-        "imprint_1": "Imprint 1",
-        "imprint_2": "Imprint 2",
-        "base_gross_millions": "Base gross (millions)",
-        "bonus_millions": "Bonuses",
-        gross_col: gross_label,
-    })
+        show = rows[[
+            "table_rank", "week_ending", "rank", "canonical_title", "imprint_1", "imprint_2",
+            "base_gross_millions", "bonus_millions", "gross_millions"
+        ]].copy()
+        show = show.rename(columns={
+            "table_rank": "Rank",
+            "week_ending": "Week Ending",
+            "rank": "Week Rank",
+            "canonical_title": "Show",
+            "imprint_1": "Imprint 1",
+            "imprint_2": "Imprint 2",
+            "base_gross_millions": "Base gross (millions)",
+            "bonus_millions": "Bonuses",
+            "gross_millions": "Gross + bonuses (millions)",
+        })
+    else:
+        show = rows[[
+            "table_rank", "week_ending", "rank", "canonical_title", "imprint_1", "imprint_2",
+            "base_gross_millions"
+        ]].copy()
+        show = show.rename(columns={
+            "table_rank": "Rank",
+            "week_ending": "Week Ending",
+            "rank": "Week Rank",
+            "canonical_title": "Show",
+            "imprint_1": "Imprint 1",
+            "imprint_2": "Imprint 2",
+            "base_gross_millions": "Base gross (millions)",
+        })
+
     st.dataframe(show, width='stretch', hide_index=True)
 
 def _build_gross_races_show_leaderboards(rows: pd.DataFrame, min_weeks: int, top_n: int, include_bonuses_avg_share: bool, share_mode: str = "peak") -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, str]:
