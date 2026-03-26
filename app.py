@@ -22,6 +22,39 @@ import matplotlib.pyplot as plt
 from charts import chart_top_gross_weeks
 
 
+def _drop_raw_pos_column(data):
+    """Drop the raw visible `pos` column from Streamlit table renders."""
+    try:
+        if isinstance(data, pd.io.formats.style.Styler):
+            styler = data
+            df = styler.data
+            if isinstance(df, pd.DataFrame) and "pos" in df.columns:
+                styler.data = df.drop(columns=["pos"], errors="ignore")
+            return styler
+    except Exception:
+        pass
+
+    if isinstance(data, pd.DataFrame) and "pos" in data.columns:
+        return data.drop(columns=["pos"], errors="ignore")
+    return data
+
+
+_orig_st_dataframe = st.dataframe
+_orig_st_table = st.table
+
+
+def _patched_dataframe(data=None, *args, **kwargs):
+    return _orig_st_dataframe(_drop_raw_pos_column(data), *args, **kwargs)
+
+
+def _patched_table(data=None, *args, **kwargs):
+    return _orig_st_table(_drop_raw_pos_column(data), *args, **kwargs)
+
+
+st.dataframe = _patched_dataframe
+st.table = _patched_table
+
+
 # ----------------------------
 # Configuration
 # ----------------------------
@@ -2918,7 +2951,7 @@ def tab_show_trends():
         year_val = None if year == "All" else year
 
     with c3:
-        include_bonuses = st.checkbox("Include bonuses", value=True, key="show_trends_bonus")
+        include_bonuses = st.checkbox("Include bonuses", value=False, key="show_trends_bonus")
 
     with c4:
         smoothing = st.selectbox("Smoothing", ["None", "4-week MA", "8-week MA"], index=0, key="show_trends_smooth")
@@ -3708,6 +3741,228 @@ def _build_number_one_premium_table(df: pd.DataFrame, gross_col: str) -> pd.Data
     out = out.sort_values("week_ending_dt").reset_index(drop=True)
     return out[["week_ending", "week_ending_dt", "n1_show", "n1_gross", "n2_show", "n2_gross", "premium_diff", "premium_ratio"]]
 
+
+def _build_chart_depth_table(df: pd.DataFrame, gross_col: str) -> pd.DataFrame:
+    """Weekly chart-depth metrics for the current filtered rank universe."""
+    empty = pd.DataFrame(columns=[
+        "week_ending", "week_ending_dt", "leader_rank", "leader_show", "leader_gross",
+        "median_gross", "total_gross", "top3_gross", "lower_half_gross", "num_rows",
+        "depth_ratio", "lower_half_share", "leader_share", "top3_share", "leader_to_median_gap"
+    ])
+    if df is None or df.empty or gross_col not in df.columns:
+        return empty
+
+    use = df.copy()
+    use["week_ending"] = _as_date_str(use["week_ending"])
+    use["week_ending_dt"] = pd.to_datetime(use.get("week_ending_dt", use["week_ending"]), errors="coerce")
+    use["rank"] = pd.to_numeric(use.get("rank"), errors="coerce")
+    use[gross_col] = pd.to_numeric(use[gross_col], errors="coerce")
+    use = use.dropna(subset=["week_ending", "week_ending_dt", "rank", gross_col]).copy()
+    if use.empty:
+        return empty
+
+    rows = []
+    for week, wk in use.groupby("week_ending", sort=True):
+        wk = wk.sort_values(["rank", gross_col, "canonical_title"], ascending=[True, False, True]).copy()
+        total_gross = float(wk[gross_col].sum())
+        if total_gross <= 0:
+            continue
+
+        ranks = sorted(pd.to_numeric(wk["rank"], errors="coerce").dropna().astype(int).unique().tolist())
+        if not ranks:
+            continue
+        leader_rank = int(ranks[0])
+        leader_block = wk[wk["rank"].astype(int).eq(leader_rank)].copy()
+        leader_row = leader_block.sort_values([gross_col, "canonical_title"], ascending=[False, True]).iloc[0]
+        leader_gross = float(pd.to_numeric(leader_row[gross_col], errors="coerce") or 0.0)
+        leader_show = leader_row.get("canonical_title", "")
+
+        top3_ranks = set(ranks[:3])
+        top3_gross = float(wk[wk["rank"].astype(int).isin(top3_ranks)][gross_col].sum())
+
+        half_idx = len(ranks) // 2
+        lower_half_ranks = set(ranks[half_idx:])
+        lower_half_gross = float(wk[wk["rank"].astype(int).isin(lower_half_ranks)][gross_col].sum())
+
+        positive = wk.loc[wk[gross_col] > 0, gross_col].astype(float)
+        median_gross = float(positive.median()) if not positive.empty else 0.0
+
+        rows.append({
+            "week_ending": week,
+            "week_ending_dt": pd.to_datetime(leader_row.get("week_ending_dt"), errors="coerce"),
+            "leader_rank": leader_rank,
+            "leader_show": leader_show,
+            "leader_gross": leader_gross,
+            "median_gross": median_gross,
+            "total_gross": total_gross,
+            "top3_gross": top3_gross,
+            "lower_half_gross": lower_half_gross,
+            "num_rows": int(len(wk)),
+        })
+
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return empty
+
+    out["depth_ratio"] = np.where(out["leader_gross"] > 0, out["median_gross"] / out["leader_gross"], np.nan)
+    out["lower_half_share"] = np.where(out["total_gross"] > 0, out["lower_half_gross"] / out["total_gross"], np.nan)
+    out["leader_share"] = np.where(out["total_gross"] > 0, out["leader_gross"] / out["total_gross"], np.nan)
+    out["top3_share"] = np.where(out["total_gross"] > 0, out["top3_gross"] / out["total_gross"], np.nan)
+    out["leader_to_median_gap"] = out["leader_gross"] - out["median_gross"]
+    out = out.sort_values("week_ending_dt").reset_index(drop=True)
+    return out
+
+
+def _render_chart_depth_section(dg: pd.DataFrame, gross_col: str, top_n: int) -> None:
+    st.markdown("### Chart Depth")
+    st.caption("Depth metrics are computed within the current Analytics rank/date filters.")
+
+    depth_ts = _build_chart_depth_table(dg, gross_col)
+    if depth_ts.empty:
+        st.info("No chart-depth data is available for the selected filters.")
+        return
+
+    metric_map = {
+        "Depth Ratio": ("depth_ratio", True, "Median gross ÷ leader gross"),
+        "Lower-Half Share": ("lower_half_share", True, "Lower-half gross ÷ total gross"),
+        "Leader Share": ("leader_share", False, "Leader gross ÷ total gross"),
+        "Top 3 Share": ("top3_share", False, "Top-3 gross ÷ total gross"),
+        "Leader-to-Median Gap": ("leader_to_median_gap", False, "Leader gross - median gross"),
+    }
+
+    metric_label = st.selectbox(
+        "Depth metric",
+        options=list(metric_map.keys()),
+        index=0,
+        key="analytics_depth_metric",
+    )
+    metric_col, higher_is_deeper, metric_help = metric_map[metric_label]
+    st.caption(metric_help)
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Median depth ratio", f"{depth_ts['depth_ratio'].median():.3f}")
+    c2.metric("Median lower-half share", f"{depth_ts['lower_half_share'].median():.1%}")
+    c3.metric("Median leader share", f"{depth_ts['leader_share'].median():.1%}")
+    c4.metric("Median top-3 share", f"{depth_ts['top3_share'].median():.1%}")
+
+    show_ma = st.checkbox("Show moving average", value=False, key="analytics_depth_show_ma")
+    ma_win = st.slider("Depth moving average window (weeks)", 2, 52, 13, key="analytics_depth_ma_window")
+    plot_df = depth_ts[["week_ending", "week_ending_dt", metric_col]].copy()
+    plot_df["metric_value"] = pd.to_numeric(plot_df[metric_col], errors="coerce")
+    plot_df["metric_ma"] = plot_df["metric_value"].rolling(ma_win, min_periods=max(1, ma_win // 3)).mean()
+    ycol = "metric_ma" if show_ma else "metric_value"
+    ylabel = f"{metric_label} ({ma_win}-week MA)" if show_ma else metric_label
+    plot_line_dates(plot_df["week_ending"], plot_df[ycol], "Week Ending", ylabel)
+
+    deeper = depth_ts.sort_values(metric_col, ascending=not higher_is_deeper).head(int(top_n)).copy()
+    thinner = depth_ts.sort_values(metric_col, ascending=higher_is_deeper).head(int(top_n)).copy()
+
+    display_cols = [
+        "week_ending", "leader_show", "leader_rank", "leader_gross", "median_gross",
+        "total_gross", "depth_ratio", "lower_half_share", "leader_share", "top3_share", "leader_to_median_gap"
+    ]
+
+    st.markdown("#### Deepest weeks")
+    st.dataframe(
+        deeper[display_cols].rename(columns={
+            "week_ending": "Week Ending",
+            "leader_show": "Leader Show",
+            "leader_rank": "Leader Rank",
+            "leader_gross": "Leader Gross",
+            "median_gross": "Median Gross",
+            "total_gross": "Total Gross",
+            "depth_ratio": "Depth Ratio",
+            "lower_half_share": "Lower-Half Share",
+            "leader_share": "Leader Share",
+            "top3_share": "Top 3 Share",
+            "leader_to_median_gap": "Leader-Median Gap",
+        }),
+        width='stretch',
+        hide_index=True,
+    )
+
+    st.markdown("#### Thinnest weeks")
+    st.dataframe(
+        thinner[display_cols].rename(columns={
+            "week_ending": "Week Ending",
+            "leader_show": "Leader Show",
+            "leader_rank": "Leader Rank",
+            "leader_gross": "Leader Gross",
+            "median_gross": "Median Gross",
+            "total_gross": "Total Gross",
+            "depth_ratio": "Depth Ratio",
+            "lower_half_share": "Lower-Half Share",
+            "leader_share": "Leader Share",
+            "top3_share": "Top 3 Share",
+            "leader_to_median_gap": "Leader-Median Gap",
+        }),
+        width='stretch',
+        hide_index=True,
+    )
+
+    st.markdown("#### Weekly Shape Comparison")
+    week_options = depth_ts["week_ending"].tolist()
+    if not week_options:
+        st.info("No weeks available for shape comparison.")
+        return
+
+    default_weeks = week_options[-min(3, len(week_options)):]
+    pick_weeks = st.multiselect(
+        "Compare weeks",
+        options=week_options,
+        default=default_weeks,
+        max_selections=3,
+        key="analytics_depth_compare_weeks",
+    )
+    normalize_shape = st.checkbox("Normalize each week so leader = 100", value=False, key="analytics_depth_normalize")
+
+    if not pick_weeks:
+        st.caption("Pick 1 to 3 weeks above to compare rank profiles.")
+        return
+
+    shape = dg[dg["week_ending"].isin(pick_weeks)].copy()
+    if shape.empty:
+        st.info("No rows found for the selected comparison weeks.")
+        return
+
+    shape["gross_use"] = pd.to_numeric(shape[gross_col], errors="coerce")
+    shape["rank"] = pd.to_numeric(shape["rank"], errors="coerce")
+    shape = shape.dropna(subset=["rank", "gross_use"]).copy()
+    shape = (
+        shape.groupby(["week_ending", "rank"], as_index=False)
+        .agg(gross_use=("gross_use", "sum"))
+        .sort_values(["week_ending", "rank"])
+    )
+    if shape.empty:
+        st.info("No comparable rank-profile data is available.")
+        return
+
+    if normalize_shape:
+        leaders = shape.groupby("week_ending")["gross_use"].transform("max").replace(0, np.nan)
+        shape["plot_value"] = (shape["gross_use"] / leaders) * 100.0
+        y_title = "Gross (% of leader)"
+    else:
+        shape["plot_value"] = shape["gross_use"]
+        y_title = "Gross (Millions)"
+
+    chart = (
+        alt.Chart(shape)
+        .mark_line(point=True)
+        .encode(
+            x=alt.X("rank:Q", title="Rank"),
+            y=alt.Y("plot_value:Q", title=y_title),
+            color=alt.Color("week_ending:N", title="Week Ending"),
+            tooltip=[
+                alt.Tooltip("week_ending:N", title="Week Ending"),
+                alt.Tooltip("rank:Q", title="Rank"),
+                alt.Tooltip("gross_use:Q", title="Gross", format=",.1f"),
+                alt.Tooltip("plot_value:Q", title=y_title, format=",.1f"),
+            ],
+        )
+        .properties(height=360)
+    )
+    st.altair_chart(chart, width='stretch')
+
 def tab_analytics():
     st.subheader("Analytics (grossing + movement)")
     st.caption("All metrics are computed from stored rows.")
@@ -3829,7 +4084,7 @@ def tab_analytics():
     # -------------------------
     analytics_section = st.selectbox(
         "Analytics section",
-        ["Overview", "Heatmaps", "Premiums", "Distribution", "Outliers"],
+        ["Overview", "Chart Depth", "Heatmaps", "Premiums", "Distribution", "Outliers"],
         index=0,
         key="analytics_section",
     )
@@ -3935,6 +4190,12 @@ def tab_analytics():
         plt.tight_layout()
         st.pyplot(fig)
         plt.close(fig)
+
+    # -------------------------
+    # Chart Depth
+    # -------------------------
+    if analytics_section == "Chart Depth":
+        _render_chart_depth_section(dg, gross_col, int(top_n))
 
     # -------------------------
     # Heatmaps
