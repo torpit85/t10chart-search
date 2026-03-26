@@ -5420,7 +5420,11 @@ def _render_gross_races_top_gross_entries(latest_date: date, db_path: str, db_mt
     f = f.sort_values([gross_col, "week_ending_dt", "canonical_title"], ascending=[False, False, True]).head(int(top_n)).copy()
     f.insert(0, "Rank", np.arange(1, len(f) + 1))
 
-    disp = f[["Rank", "week_ending", "week_number", "rank", "canonical_title", "imprint_1", "imprint_2", "base_gross_millions", "bonus_millions", gross_col]].copy()
+    disp_cols = ["Rank", "week_ending", "week_number", "rank", "canonical_title", "imprint_1", "imprint_2", "base_gross_millions", "bonus_millions"]
+    if gross_col != "base_gross_millions":
+        disp_cols.append(gross_col)
+
+    disp = f[disp_cols].copy()
     disp = disp.rename(columns={
         "week_ending": "Week Ending",
         "week_number": "Week #",
@@ -5428,7 +5432,7 @@ def _render_gross_races_top_gross_entries(latest_date: date, db_path: str, db_mt
         "canonical_title": "Show",
         "imprint_1": "Imprint 1",
         "imprint_2": "Imprint 2",
-        "base_gross_millions": "Base Gross",
+        "base_gross_millions": "Gross (base)",
         "bonus_millions": "Bonuses",
         gross_col: gross_label,
     })
