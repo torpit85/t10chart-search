@@ -8436,13 +8436,13 @@ def tab_streak_analytics():
         else:
             longest_runs = longest_runs.sort_values(["charted_run_weeks", "best_rank", "canonical_title"], ascending=[False, True, True]).head(int(top_n)).reset_index(drop=True)
             longest_runs.insert(0, "Rank", np.arange(1, len(longest_runs) + 1))
+            longest_runs_disp = longest_runs[["Rank", "canonical_title", "charted_run_weeks", "start_week_ending", "end_week_ending"]].copy()
             st.dataframe(
-                longest_runs.rename(columns={
+                longest_runs_disp.rename(columns={
                     "canonical_title": "Show",
                     "charted_run_weeks": "Weeks",
                     "start_week_ending": "Start Week",
                     "end_week_ending": "End Week",
-                    "best_rank": "Best Rank",
                 }),
                 width='stretch',
                 hide_index=True,
