@@ -5323,6 +5323,118 @@ def _render_gross_races_race_views(base: pd.DataFrame, meta: pd.DataFrame, lates
     st.dataframe(show_rows.sort_values(["week_number", "rank", "pos"]), width='stretch')
 
 
+@st.cache_data(show_spinner=False)
+def _load_gross_races_top_entries_rows(db_path: str, db_mtime: float) -> pd.DataFrame:
+    """Weekly top-gross entry rows for Gross Races -> Top Gross Entries."""
+    con = sqlite3.connect(db_path)
+    try:
+        df = pd.read_sql_query(
+            """
+            WITH bonus_by_row AS (
+              SELECT show_id, week_ending, SUM(bonus_millions) AS bonus_millions
+              FROM gross_bonus
+              GROUP BY show_id, week_ending
+            )
+            SELECT
+              date(e.week_ending) AS week_ending,
+              e.week_number,
+              e.rank,
+              e.pos,
+              e.show_id,
+              s.canonical_title,
+              COALESCE(e.imprint_1, '') AS imprint_1,
+              COALESCE(e.imprint_2, '') AS imprint_2,
+              COALESCE(e.gross_millions, 0.0) AS base_gross_millions,
+              COALESCE(b.bonus_millions, 0.0) AS bonus_millions,
+              (COALESCE(e.gross_millions, 0.0) + COALESCE(b.bonus_millions, 0.0)) AS gross_millions
+            FROM t10_entry e
+            JOIN show s ON s.show_id = e.show_id
+            LEFT JOIN bonus_by_row b ON b.show_id = e.show_id AND b.week_ending = e.week_ending
+            WHERE e.week_ending IS NOT NULL
+            ORDER BY date(e.week_ending) ASC, e.rank ASC, e.pos ASC
+            """,
+            con,
+        )
+    finally:
+        con.close()
+
+    if df.empty:
+        return df
+
+    df["week_ending"] = _as_date_str(df["week_ending"])
+    df["week_ending_dt"] = pd.to_datetime(df["week_ending"], errors="coerce")
+    df["week_number"] = pd.to_numeric(df["week_number"], errors="coerce")
+    df["rank"] = pd.to_numeric(df["rank"], errors="coerce")
+    df["pos"] = pd.to_numeric(df["pos"], errors="coerce")
+    return df.dropna(subset=["week_ending_dt"]).copy()
+
+
+def _render_gross_races_top_gross_entries(latest_date: date, db_path: str, db_mtime: float):
+    st.markdown("### Top Gross Entries")
+    st.caption("Highest-grossing weekly entries within the selected rank/date filters. Week Rank follows the chart position for that week.")
+
+    rows = _load_gross_races_top_entries_rows(db_path, db_mtime)
+    if rows.empty:
+        st.info("No chart rows found for Top Gross Entries.")
+        return
+
+    rows = rows[rows["week_ending_dt"] >= pd.Timestamp(GROSS_TRACKING_START)].copy()
+    if rows.empty:
+        st.info("No Top Gross Entries rows found on/after the gross-tracking start date (2001-03-17).")
+        return
+
+    min_available = rows["week_ending_dt"].min().date()
+    max_available = rows["week_ending_dt"].max().date()
+
+    c1, c2, c3, c4 = st.columns([1.1, 1.1, 1, 1.2])
+    with c1:
+        dmin = st.date_input("Start date", value=min_available, min_value=min_available, max_value=max_available, key="gr_top_entries_start")
+    with c2:
+        dmax = st.date_input("End date", value=max_available, min_value=min_available, max_value=max_available, key="gr_top_entries_end")
+    with c3:
+        top_n = st.slider("Top N", 5, 200, 25, key="gr_top_entries_topn")
+    with c4:
+        rank_pick = st.selectbox("Rank", options=list(range(1, 18)), index=0, key="gr_top_entries_rank")
+
+    include_bon = st.checkbox(
+        "Include bonuses",
+        value=False,
+        key="gr_top_entries_include_bonuses",
+        help="If checked, the table ranks entries by base gross plus bonuses. If unchecked, it uses base gross only.",
+    )
+
+    if pd.to_datetime(dmin) > pd.to_datetime(dmax):
+        st.warning("Start date is after end date.")
+        return
+
+    gross_col = "gross_millions" if include_bon else "base_gross_millions"
+    gross_label = "Gross (base + bonuses)" if include_bon else "Gross (base)"
+
+    f = rows[(rows["week_ending_dt"] >= pd.to_datetime(dmin)) & (rows["week_ending_dt"] <= pd.to_datetime(dmax))].copy()
+    f = f[f["rank"] == int(rank_pick)].copy()
+
+    if f.empty:
+        st.info("No Top Gross Entries rows match the selected filters.")
+        return
+
+    f = f.sort_values([gross_col, "week_ending_dt", "canonical_title"], ascending=[False, False, True]).head(int(top_n)).copy()
+    f.insert(0, "Rank", np.arange(1, len(f) + 1))
+
+    disp = f[["Rank", "week_ending", "week_number", "rank", "canonical_title", "imprint_1", "imprint_2", "base_gross_millions", "bonus_millions", gross_col]].copy()
+    disp = disp.rename(columns={
+        "week_ending": "Week Ending",
+        "week_number": "Week #",
+        "rank": "Week Rank",
+        "canonical_title": "Show",
+        "imprint_1": "Imprint 1",
+        "imprint_2": "Imprint 2",
+        "base_gross_millions": "Base Gross",
+        "bonus_millions": "Bonuses",
+        gross_col: gross_label,
+    })
+    st.dataframe(disp, width='stretch', hide_index=True)
+
+
 def tab_gross_races():
     st.subheader("Gross Races")
     st.caption("All-time, annual, quarter, and monthly gross races, plus by-show gross leaderboards.")
@@ -5354,11 +5466,13 @@ def tab_gross_races():
     latest_date = latest_dt.date()
     meta = _load_show_meta_for_gross_races(str(DB_PATH), db_mtime)
 
-    subtab_race, subtab_lead = st.tabs(["Race Views", "Show Leaderboards"])
+    subtab_race, subtab_lead, subtab_entries = st.tabs(["Race Views", "Show Leaderboards", "Top Gross Entries"])
     with subtab_race:
         _render_gross_races_race_views(base, meta, latest_dt, latest_date)
     with subtab_lead:
         _render_gross_races_show_leaderboards(base, latest_date, str(DB_PATH), db_mtime)
+    with subtab_entries:
+        _render_gross_races_top_gross_entries(latest_date, str(DB_PATH), db_mtime)
 
 
 # ----------------------------
@@ -8256,35 +8370,79 @@ def tab_streak_analytics():
         st.info("No rows match your filters.")
         return
 
+    rows = rows.copy()
+    rows["week_ending"] = _as_date_str(rows["week_ending"])
+    rows["week_ending_dt"] = pd.to_datetime(rows["week_ending"], errors="coerce")
+
     streaks = compute_longest_streaks(rows)
     if streaks.empty:
         st.info("Not enough data to compute streaks.")
         return
 
-    st.markdown("### Longest streaks by rank")
-    ranks = sorted(streaks["rank"].dropna().unique().tolist())
-    rank_pick = st.selectbox("Rank", ranks, index=0)
+    subtab_main, subtab_runs = st.tabs(["Streak Views", "Longest Charted Runs"])
 
-    block = streaks[streaks["rank"] == rank_pick].head(int(top_n)).copy()
-    st.dataframe(block, width='stretch')
+    with subtab_main:
+        st.markdown("### Longest streaks by rank")
+        ranks = sorted(streaks["rank"].dropna().unique().tolist())
+        rank_pick = st.selectbox("Rank", ranks, index=0, key="streak_rank_pick")
 
-    st.divider()
-    st.markdown("### Per-show streak breakdown")
-    title_pick = st.selectbox("Show (canonical)", shows["canonical_title"].tolist(), key="streak_show_pick")
-    show_id = int(shows.loc[shows["canonical_title"] == title_pick, "show_id"].iloc[0])
+        block = streaks[streaks["rank"] == rank_pick].head(int(top_n)).copy()
+        st.dataframe(block, width='stretch')
 
-    show_block = streaks[streaks["show_id"] == show_id].sort_values(["rank"]).copy()
-    if show_block.empty:
-        st.info("No streak data for this show in the selected filters.")
-        return
+        st.divider()
+        st.markdown("### Per-show streak breakdown")
+        title_pick = st.selectbox("Show (canonical)", shows["canonical_title"].tolist(), key="streak_show_pick")
+        show_id = int(shows.loc[shows["canonical_title"] == title_pick, "show_id"].iloc[0])
 
-    st.dataframe(show_block, width='stretch')
+        show_block = streaks[streaks["show_id"] == show_id].sort_values(["rank"]).copy()
+        if show_block.empty:
+            st.info("No streak data for this show in the selected filters.")
+        else:
+            st.dataframe(show_block, width='stretch')
 
-    st.markdown("### Quick peek: raw weeks for this show (filtered)")
-    # Useful for validating consecutive week_number behavior
-    show_rows = rows[rows["show_id"] == show_id].copy()
-    show_rows["week_ending"] = _as_date_str(show_rows["week_ending"])
-    st.dataframe(show_rows.sort_values(["week_number", "rank", "pos"]), width='stretch')
+        st.markdown("### Quick peek: raw weeks for this show (filtered)")
+        show_rows = rows[rows["show_id"] == show_id].copy()
+        st.dataframe(show_rows.sort_values(["week_number", "rank", "pos"]), width='stretch')
+
+    with subtab_runs:
+        st.markdown("### Longest Charted Runs")
+        st.caption("Uses the same consecutive-week logic as Show Trends → Runs & peaks, continuing across no-chart weeks by the next available chart week in the database.")
+
+        run_rows = []
+        for sid, g in rows.groupby("show_id", sort=False):
+            g = g.sort_values(["week_number", "week_ending_dt", "rank", "pos"]).drop_duplicates(subset=["week_ending"]).reset_index(drop=True)
+            if g.empty:
+                continue
+            run = _longest_run_masked(g, pd.Series(True, index=g.index))
+            if not run:
+                continue
+            best_rank = pd.to_numeric(g["rank"], errors="coerce").min()
+            run_rows.append({
+                "show_id": int(sid),
+                "canonical_title": g["canonical_title"].iloc[0],
+                "charted_run_weeks": int(run["len"]),
+                "start_week_ending": run["start"],
+                "end_week_ending": run["end"],
+                "best_rank": int(best_rank) if pd.notna(best_rank) else pd.NA,
+            })
+
+        longest_runs = pd.DataFrame(run_rows)
+        if longest_runs.empty:
+            st.info("No charted runs found for the selected filters.")
+        else:
+            longest_runs = longest_runs.sort_values(["charted_run_weeks", "best_rank", "canonical_title"], ascending=[False, True, True]).head(int(top_n)).reset_index(drop=True)
+            longest_runs.insert(0, "Rank", np.arange(1, len(longest_runs) + 1))
+            st.dataframe(
+                longest_runs.rename(columns={
+                    "canonical_title": "Show",
+                    "charted_run_weeks": "Weeks",
+                    "start_week_ending": "Start Week",
+                    "end_week_ending": "End Week",
+                    "best_rank": "Best Rank",
+                }),
+                width='stretch',
+                hide_index=True,
+            )
 
 def main():
     st.set_page_config(page_title=APP_TITLE, layout="wide")
