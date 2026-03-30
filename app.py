@@ -1957,9 +1957,89 @@ def _compute_milestones_1k(df_base: pd.DataFrame, step: int = 1000) -> pd.DataFr
     return out
 
 
+@st.cache_data(show_spinner=False)
+def _load_weekly_gross_firsts_base(db_path: str, db_mtime: float) -> pd.DataFrame:
+    """Weekly chart gross rows using base grosses only for first-to-X weekly milestones."""
+    con = sqlite3.connect(db_path)
+    try:
+        df = pd.read_sql_query(
+            """
+            SELECT
+              date(e.week_ending) AS week_ending,
+              e.week_number,
+              e.show_id,
+              s.canonical_title AS canonical_title,
+              COALESCE(e.gross_millions, 0.0) AS base_gross_millions,
+              0.0 AS bonus_millions,
+              COALESCE(e.gross_millions, 0.0) AS gross_millions
+            FROM t10_entry e
+            JOIN show s ON s.show_id = e.show_id
+            ORDER BY date(e.week_ending) ASC, e.week_number ASC, e.show_id ASC
+            """,
+            con,
+        )
+    finally:
+        con.close()
+
+    if df.empty:
+        return df
+
+    df["week_ending"] = _as_date_str(df["week_ending"])
+    df["week_ending_dt"] = pd.to_datetime(df["week_ending"], errors="coerce")
+    df["week_number"] = pd.to_numeric(df["week_number"], errors="coerce")
+    df["gross_millions"] = pd.to_numeric(df["gross_millions"], errors="coerce").fillna(0.0)
+    return df.dropna(subset=["week_ending_dt", "show_id"]).copy()
+
+
+@st.cache_data(show_spinner=False)
+def _compute_weekly_gross_firsts(df_weekly: pd.DataFrame, thresholds: tuple[int, ...] = (100, 200, 300, 400, 500, 600)) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Return first weekly-X rows overall and in a debut week."""
+    empty = pd.DataFrame(columns=["milestone", "canonical_title", "week_ending", "week_gross_millions"])
+    if df_weekly.empty:
+        return empty, empty
+
+    work = df_weekly.copy()
+    work = work.sort_values(["week_ending_dt", "week_number", "canonical_title", "show_id"]).reset_index(drop=True)
+
+    overall_rows: list[dict[str, Any]] = []
+    for thr in thresholds:
+        hit = work[work["gross_millions"] >= float(thr)].copy()
+        if hit.empty:
+            continue
+        row = hit.iloc[0]
+        overall_rows.append(
+            {
+                "milestone": int(thr),
+                "canonical_title": row["canonical_title"],
+                "week_ending": row["week_ending"],
+                "week_gross_millions": float(row["gross_millions"]),
+            }
+        )
+
+    debut = work.sort_values(["show_id", "week_ending_dt", "week_number"]).groupby("show_id", as_index=False).first()
+    debut = debut.sort_values(["week_ending_dt", "week_number", "canonical_title", "show_id"]).reset_index(drop=True)
+
+    debut_rows: list[dict[str, Any]] = []
+    for thr in thresholds:
+        hit = debut[debut["gross_millions"] >= float(thr)].copy()
+        if hit.empty:
+            continue
+        row = hit.iloc[0]
+        debut_rows.append(
+            {
+                "milestone": int(thr),
+                "canonical_title": row["canonical_title"],
+                "week_ending": row["week_ending"],
+                "week_gross_millions": float(row["gross_millions"]),
+            }
+        )
+
+    return pd.DataFrame(overall_rows), pd.DataFrame(debut_rows)
+
+
 def tab_grossing_milestones():
     st.subheader("Grossing milestones")
-    st.caption("Milestones are based on cumulative sum of gross_millions over time (no currency formatting).")
+    st.caption("Milestones are based on cumulative totals and weekly gross thresholds (no currency formatting).")
 
     if not DB_PATH.exists():
         st.error(f"Database not found at {DB_PATH}.")
@@ -1968,6 +2048,7 @@ def tab_grossing_milestones():
     # Cache-buster so this tab refreshes after DB updates/redeploys
     db_mtime = DB_PATH.stat().st_mtime
     base = _load_milestone_base(str(DB_PATH), db_mtime)
+    weekly_base = _load_weekly_gross_firsts_base(str(DB_PATH), db_mtime)
 
     df_m = _compute_milestones_1k(base, step=1000)
     if df_m.empty:
@@ -1977,64 +2058,106 @@ def tab_grossing_milestones():
     def fmt_int(x: int) -> str:
         return f"{int(x):,}"
 
-    # -------------------------
-    # Section 1: Show → milestones (1k increments)
-    # -------------------------
-    st.markdown("### Show → milestones (1k increments)")
-    shows = sorted(df_m["canonical_title"].unique().tolist())
-    pick_show = st.selectbox("Show", shows, key="ms_show_pick")
+    subtab_cume, subtab_firsts = st.tabs(["Cumulative Milestones", "Grossing Firsts"])
 
-    one = df_m[df_m["canonical_title"] == pick_show].copy()
-    one = one.sort_values("milestone").reset_index(drop=True)
+    with subtab_cume:
+        # -------------------------
+        # Section 1: Show → milestones (1k increments)
+        # -------------------------
+        st.markdown("### Show → milestones (1k increments)")
+        shows = sorted(df_m["canonical_title"].unique().tolist())
+        pick_show = st.selectbox("Show", shows, key="ms_show_pick")
 
-    st.dataframe(
-        one[["milestone", "week_ending", "cumulative_gross_millions", "week_gross_millions"]],
-        width='stretch',
-        hide_index=True,
-    )
+        one = df_m[df_m["canonical_title"] == pick_show].copy()
+        one = one.sort_values("milestone").reset_index(drop=True)
 
-    if not one.empty:
-        pick_m = st.selectbox(
-            "Jump to a milestone for this show",
-            options=one["milestone"].tolist(),
+        st.dataframe(
+            one[["milestone", "week_ending", "cumulative_gross_millions", "week_gross_millions"]],
+            width='stretch',
+            hide_index=True,
+        )
+
+        if not one.empty:
+            pick_m = st.selectbox(
+                "Jump to a milestone for this show",
+                options=one["milestone"].tolist(),
+                format_func=fmt_int,
+                key="ms_show_jump",
+            )
+            r = one[one["milestone"] == pick_m].iloc[0]
+            st.success(
+                f"**{pick_show}** first reached **{fmt_int(pick_m)}** on **{r['week_ending']}** "
+                f"(cumulative: **{r['cumulative_gross_millions']:.1f}**, that week: **{r['week_gross_millions']:.1f}**)."
+            )
+
+        st.divider()
+
+        # -------------------------
+        # Section 2: Big milestone → shows (10k/20k/30k club)
+        # -------------------------
+        st.markdown("### Big milestone → shows (10k club)")
+        big_milestones = sorted([m for m in df_m["milestone"].unique().tolist() if int(m) % 10000 == 0])
+        if not big_milestones:
+            st.info("No shows have reached 10,000 gross_millions yet.")
+            return
+
+        pick_big = st.selectbox(
+            "Big milestone",
+            options=big_milestones,
             format_func=fmt_int,
-            key="ms_show_jump",
-        )
-        r = one[one["milestone"] == pick_m].iloc[0]
-        st.success(
-            f"**{pick_show}** first reached **{fmt_int(pick_m)}** on **{r['week_ending']}** "
-            f"(cumulative: **{r['cumulative_gross_millions']:.1f}**, that week: **{r['week_gross_millions']:.1f}**)."
+            key="ms_big_pick",
         )
 
-    st.divider()
+        hit = df_m[df_m["milestone"] == pick_big].copy()
+        hit["week_ending_dt"] = pd.to_datetime(hit["week_ending"], errors="coerce")
+        hit = hit.sort_values(["week_ending_dt", "canonical_title"]).reset_index(drop=True)
 
-    # -------------------------
-    # Section 2: Big milestone → shows (10k/20k/30k club)
-    # -------------------------
-    st.markdown("### Big milestone → shows (10k club)")
-    big_milestones = sorted([m for m in df_m["milestone"].unique().tolist() if int(m) % 10000 == 0])
-    if not big_milestones:
-        st.info("No shows have reached 10,000 gross_millions yet.")
-        return
+        st.caption(f"Shows that first reached {fmt_int(pick_big)} gross_millions (earliest first).")
+        st.dataframe(
+            hit[["canonical_title", "week_ending", "cumulative_gross_millions", "week_gross_millions"]],
+            width='stretch',
+            hide_index=True,
+        )
+        st.write(f"Count: **{len(hit):,}**")
 
-    pick_big = st.selectbox(
-        "Big milestone",
-        options=big_milestones,
-        format_func=fmt_int,
-        key="ms_big_pick",
-    )
+    with subtab_firsts:
+        st.markdown("### Weekly grossing firsts")
+        st.caption("Lists the first show to hit each weekly-gross threshold overall, plus the first show to do it in a debut week. Thresholds run from 100 to 600 million.")
 
-    hit = df_m[df_m["milestone"] == pick_big].copy()
-    hit["week_ending_dt"] = pd.to_datetime(hit["week_ending"], errors="coerce")
-    hit = hit.sort_values(["week_ending_dt", "canonical_title"]).reset_index(drop=True)
+        weekly_firsts, debut_firsts = _compute_weekly_gross_firsts(weekly_base)
 
-    st.caption(f"Shows that first reached {fmt_int(pick_big)} gross_millions (earliest first).")
-    st.dataframe(
-        hit[["canonical_title", "week_ending", "cumulative_gross_millions", "week_gross_millions"]],
-        width='stretch',
-        hide_index=True,
-    )
-    st.write(f"Count: **{len(hit):,}**")
+        left, right = st.columns(2)
+        with left:
+            st.markdown("#### First show to reach X million in a week")
+            if weekly_firsts.empty:
+                st.info("No weekly gross firsts found.")
+            else:
+                st.dataframe(
+                    weekly_firsts.rename(columns={
+                        "milestone": "Threshold",
+                        "canonical_title": "Show",
+                        "week_ending": "Week Ending",
+                        "week_gross_millions": "Weekly Gross",
+                    }),
+                    width='stretch',
+                    hide_index=True,
+                )
+
+        with right:
+            st.markdown("#### First show to reach X million in a debut week")
+            if debut_firsts.empty:
+                st.info("No debut-week firsts found.")
+            else:
+                st.dataframe(
+                    debut_firsts.rename(columns={
+                        "milestone": "Threshold",
+                        "canonical_title": "Show",
+                        "week_ending": "Week Ending",
+                        "week_gross_millions": "Debut Week Gross",
+                    }),
+                    width='stretch',
+                    hide_index=True,
+                )
 # ----------------------------
 # New tab: Grossing Trends
 # ----------------------------
@@ -8342,7 +8465,7 @@ def tab_hall_of_fame():
 # ----------------------------
 def tab_streak_analytics():
     st.subheader("Streak Analytics")
-    st.caption("Longest consecutive-week streaks for a show at a given rank. (Uses week_number when available.)")
+    st.caption("Longest consecutive-week streaks by rank, charted runs, and gross-band streaks. (Uses week_number when available.)")
 
     shows, _ = load_lists()
 
@@ -8352,6 +8475,7 @@ def tab_streak_analytics():
         date_max = st.text_input("End date (YYYY-MM-DD)        ", value="")
         rank_min, rank_max = st.slider("Rank range (streaks)", 1, 17, (1, 10))
         top_n = st.slider("Top N (streaks)", 5, 200, 25)
+        include_bonuses = st.checkbox("Include annual/quarter bonuses in gross streaks", value=False, key="streaks_include_bonuses")
 
     filters = FilterSpec(date_min.strip() or None, date_max.strip() or None, int(rank_min), int(rank_max))
     where, params = build_where(filters, "e")
@@ -8363,8 +8487,16 @@ def tab_streak_analytics():
           e.rank,
           e.pos,
           e.show_id,
-          s.canonical_title
+          s.canonical_title,
+          COALESCE(e.gross_millions, 0) AS base_gross_millions,
+          COALESCE(gb.bonus_millions, 0) AS bonus_millions,
+          (COALESCE(e.gross_millions, 0) + COALESCE(gb.bonus_millions, 0)) AS gross_millions
         FROM t10_entry e
+        LEFT JOIN (
+          SELECT show_id, week_ending, SUM(bonus_millions) AS bonus_millions
+          FROM gross_bonus
+          GROUP BY show_id, week_ending
+        ) gb ON gb.show_id = e.show_id AND gb.week_ending = e.week_ending
         JOIN show s ON s.show_id = e.show_id
         WHERE {where}
         ORDER BY e.week_number ASC, e.rank ASC, e.pos ASC
@@ -8377,13 +8509,17 @@ def tab_streak_analytics():
     rows = rows.copy()
     rows["week_ending"] = _as_date_str(rows["week_ending"])
     rows["week_ending_dt"] = pd.to_datetime(rows["week_ending"], errors="coerce")
+    rows["base_gross_millions"] = pd.to_numeric(rows["base_gross_millions"], errors="coerce").fillna(0.0)
+    rows["bonus_millions"] = pd.to_numeric(rows["bonus_millions"], errors="coerce").fillna(0.0)
+    rows["gross_millions"] = pd.to_numeric(rows["gross_millions"], errors="coerce").fillna(0.0)
+    rows["gross_use"] = rows["gross_millions"] if include_bonuses else rows["base_gross_millions"]
 
     streaks = compute_longest_streaks(rows)
     if streaks.empty:
         st.info("Not enough data to compute streaks.")
         return
 
-    subtab_main, subtab_runs = st.tabs(["Streak Views", "Longest Charted Runs"])
+    subtab_main, subtab_runs, subtab_gross = st.tabs(["Streak Views", "Longest Charted Runs", "Longest Grossing Streaks"])
 
     with subtab_main:
         st.markdown("### Longest streaks by rank")
@@ -8447,6 +8583,63 @@ def tab_streak_analytics():
                 width='stretch',
                 hide_index=True,
             )
+
+    with subtab_gross:
+        st.markdown("### Longest Grossing Streaks")
+        st.caption("Longest consecutive chart-week streaks inside each weekly-gross band (100–200, 200–300, 300–400, etc.).")
+
+        max_gross = float(pd.to_numeric(rows["gross_use"], errors="coerce").fillna(0.0).max()) if not rows.empty else 0.0
+        if max_gross < 100:
+            st.info("No grossing streaks at 100+ million under the selected filters.")
+        else:
+            upper_cap = max(700, int(math.ceil(max_gross / 100.0) * 100) + 100)
+            bands = [(lo, lo + 100) for lo in range(100, upper_cap, 100)]
+
+            gross_run_rows = []
+            for sid, g in rows.groupby("show_id", sort=False):
+                g = g.sort_values(["week_number", "week_ending_dt", "rank", "pos"]).drop_duplicates(subset=["week_ending"]).reset_index(drop=True)
+                if g.empty:
+                    continue
+                title = g["canonical_title"].iloc[0]
+                for lo, hi in bands:
+                    mask = (pd.to_numeric(g["gross_use"], errors="coerce").fillna(0.0) >= float(lo)) & (pd.to_numeric(g["gross_use"], errors="coerce").fillna(0.0) < float(hi))
+                    run = _longest_run_masked(g, mask)
+                    if not run:
+                        continue
+                    band_rows = g.loc[mask, "gross_use"]
+                    gross_run_rows.append({
+                        "show_id": int(sid),
+                        "canonical_title": title,
+                        "gross_band": f"{int(lo)}-{int(hi)}",
+                        "gross_band_min": int(lo),
+                        "gross_band_max": int(hi),
+                        "streak_weeks": int(run["len"]),
+                        "start_week_ending": run["start"],
+                        "end_week_ending": run["end"],
+                        "peak_gross_millions": float(band_rows.max()) if not band_rows.empty else pd.NA,
+                    })
+
+            gross_streaks = pd.DataFrame(gross_run_rows)
+            if gross_streaks.empty:
+                st.info("No gross-band streaks found for the selected filters.")
+            else:
+                band_opts = gross_streaks[["gross_band_min", "gross_band_max", "gross_band"]].drop_duplicates().sort_values(["gross_band_min", "gross_band_max"])
+                band_pick = st.selectbox("Gross band", band_opts["gross_band"].tolist(), key="streak_gross_band_pick")
+
+                band_block = gross_streaks[gross_streaks["gross_band"] == band_pick].copy()
+                band_block = band_block.sort_values(["streak_weeks", "peak_gross_millions", "canonical_title"], ascending=[False, False, True]).head(int(top_n)).reset_index(drop=True)
+                band_block.insert(0, "Rank", np.arange(1, len(band_block) + 1))
+                st.dataframe(
+                    band_block[["Rank", "canonical_title", "streak_weeks", "start_week_ending", "end_week_ending", "peak_gross_millions"]].rename(columns={
+                        "canonical_title": "Show",
+                        "streak_weeks": "Weeks",
+                        "start_week_ending": "Start Week",
+                        "end_week_ending": "End Week",
+                        "peak_gross_millions": "Peak Gross",
+                    }),
+                    width='stretch',
+                    hide_index=True,
+                )
 
 def main():
     st.set_page_config(page_title=APP_TITLE, layout="wide")
