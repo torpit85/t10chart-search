@@ -1435,7 +1435,519 @@ def _write_smps_to_db(month: str, chart_df: pd.DataFrame) -> None:
         con.close()
 
 
+
+# ----------------------------
+# Official Monthly T-25 helpers
+# ----------------------------
+def _official_t25_table_exists(db_path: str, db_mtime: float) -> bool:
+    """Return True when the official Monthly T-25 import table exists and has rows."""
+    try:
+        con = sqlite3.connect(db_path)
+        try:
+            row = con.execute(
+                """
+                SELECT COUNT(*)
+                FROM sqlite_master
+                WHERE type = 'table' AND name = 'official_t25_entry'
+                """
+            ).fetchone()
+            if not row or int(row[0] or 0) == 0:
+                return False
+            cnt = con.execute("SELECT COUNT(*) FROM official_t25_entry").fetchone()
+            return bool(cnt and int(cnt[0] or 0) > 0)
+        finally:
+            con.close()
+    except Exception:
+        return False
+
+
+@st.cache_data(show_spinner=False)
+def _load_official_t25_months(db_path: str, db_mtime: float) -> pd.DataFrame:
+    con = sqlite3.connect(db_path)
+    try:
+        return pd.read_sql_query(
+            """
+            SELECT
+              month,
+              MIN(year) AS year,
+              MIN(month_num) AS month_num,
+              COUNT(*) AS rows,
+              COUNT(DISTINCT show_id) AS unique_shows,
+              MIN(rank) AS best_rank,
+              MAX(rank) AS worst_rank,
+              SUM(points) AS total_points
+            FROM official_t25_entry
+            GROUP BY month
+            ORDER BY month DESC
+            """,
+            con,
+        )
+    finally:
+        con.close()
+
+
+@st.cache_data(show_spinner=False)
+def _load_official_t25_month_chart(db_path: str, db_mtime: float, month: str) -> pd.DataFrame:
+    con = sqlite3.connect(db_path)
+    try:
+        df = pd.read_sql_query(
+            """
+            WITH latest_meta AS (
+              SELECT show_id, imprint_1, imprint_2
+              FROM (
+                SELECT
+                  e.show_id,
+                  COALESCE(NULLIF(TRIM(e.imprint_1), ''), '') AS imprint_1,
+                  COALESCE(NULLIF(TRIM(e.imprint_2), ''), '') AS imprint_2,
+                  ROW_NUMBER() OVER (
+                    PARTITION BY e.show_id
+                    ORDER BY date(e.week_ending) DESC, e.id DESC
+                  ) AS rn
+                FROM t10_entry e
+              )
+              WHERE rn = 1
+            ),
+            chart_cutoff AS (
+              SELECT MAX(week_ending) AS cutoff_week
+              FROM (
+                SELECT
+                  date(e.week_ending) AS week_ending,
+                  strftime(
+                    '%Y-%m',
+                    date(
+                      e.week_ending,
+                      'start of month',
+                      CASE
+                        WHEN CAST(strftime('%d', e.week_ending) AS INTEGER) <= 28
+                        THEN '+1 month'
+                        ELSE '+2 months'
+                      END
+                    )
+                  ) AS chart_month
+                FROM t10_entry e
+                WHERE e.week_ending IS NOT NULL
+              )
+              WHERE chart_month = ?
+            ),
+            asof_gross AS (
+              SELECT
+                show_id,
+                SUM(gross_millions) AS total_gross_asof
+              FROM (
+                SELECT
+                  e.show_id,
+                  COALESCE(e.gross_millions, 0.0) AS gross_millions
+                FROM t10_entry e
+                WHERE (SELECT cutoff_week FROM chart_cutoff) IS NOT NULL
+                  AND date(e.week_ending) <= (SELECT cutoff_week FROM chart_cutoff)
+
+                UNION ALL
+
+                SELECT
+                  gb.show_id,
+                  COALESCE(gb.bonus_millions, 0.0) AS gross_millions
+                FROM gross_bonus gb
+                WHERE (SELECT cutoff_week FROM chart_cutoff) IS NOT NULL
+                  AND date(gb.week_ending) <= (SELECT cutoff_week FROM chart_cutoff)
+              )
+              GROUP BY show_id
+            ),
+            prev_month AS (
+              SELECT MAX(month) AS prev_month
+              FROM official_t25_entry
+              WHERE month < ?
+            ),
+            prev AS (
+              SELECT show_id, rank AS prev_rank
+              FROM official_t25_entry
+              WHERE month = (SELECT prev_month FROM prev_month)
+            ),
+            seen AS (
+              SELECT show_id, COUNT(*) AS months_before
+              FROM official_t25_entry
+              WHERE month < ?
+              GROUP BY show_id
+            ),
+            peak AS (
+              SELECT
+                show_id,
+                MIN(rank) AS peak_rank,
+                COUNT(*) AS months_to_date,
+                SUM(points) AS points_to_date
+              FROM official_t25_entry
+              WHERE month <= ?
+              GROUP BY show_id
+            )
+            SELECT
+              e.month,
+              e.year,
+              e.month_num,
+              e.row_pos,
+              e.rank,
+              e.points,
+              e.show_id,
+              s.canonical_title,
+              e.raw_title,
+              COALESCE(lm.imprint_1, '') AS imprint_1,
+              COALESCE(lm.imprint_2, '') AS imprint_2,
+              p.prev_rank,
+              COALESCE(seen.months_before, 0) AS months_before,
+              pk.peak_rank,
+              pk.months_to_date,
+              pk.points_to_date,
+              COALESCE(ag.total_gross_asof, 0.0) AS total_gross_asof,
+              (SELECT cutoff_week FROM chart_cutoff) AS gross_asof_week_ending,
+              e.source_raw_points,
+              e.source_file,
+              e.source_sheet,
+              e.source_row,
+              e.source_col,
+              e.extraction_method
+            FROM official_t25_entry e
+            JOIN show s ON s.show_id = e.show_id
+            LEFT JOIN latest_meta lm ON lm.show_id = e.show_id
+            LEFT JOIN prev p ON p.show_id = e.show_id
+            LEFT JOIN seen ON seen.show_id = e.show_id
+            LEFT JOIN peak pk ON pk.show_id = e.show_id
+            LEFT JOIN asof_gross ag ON ag.show_id = e.show_id
+            WHERE e.month = ?
+            ORDER BY e.row_pos ASC
+            """,
+            con,
+            params=(month, month, month, month, month),
+        )
+    finally:
+        con.close()
+
+    if df.empty:
+        return df
+
+    def _last_month_pos(row: pd.Series) -> str:
+        prev_rank = row.get("prev_rank")
+        if pd.notna(prev_rank):
+            try:
+                return str(int(prev_rank))
+            except Exception:
+                return str(prev_rank)
+        try:
+            months_before = int(row.get("months_before") or 0)
+        except Exception:
+            months_before = 0
+        return "NEW" if months_before <= 0 else "RE"
+
+    df["last_month_pos"] = df.apply(_last_month_pos, axis=1)
+    df["months_on_chart"] = pd.to_numeric(df.get("months_before"), errors="coerce").fillna(0).astype(int) + 1
+    df["rank"] = pd.to_numeric(df["rank"], errors="coerce").astype("Int64")
+    df["row_pos"] = pd.to_numeric(df["row_pos"], errors="coerce").astype("Int64")
+    df["points"] = pd.to_numeric(df["points"], errors="coerce").astype("Int64")
+    df["peak_rank"] = pd.to_numeric(df["peak_rank"], errors="coerce").astype("Int64")
+    df["points_to_date"] = pd.to_numeric(df["points_to_date"], errors="coerce").fillna(0).astype(int)
+    df["total_gross_asof"] = pd.to_numeric(df.get("total_gross_asof"), errors="coerce").fillna(0.0)
+    if "gross_asof_week_ending" in df.columns:
+        df["gross_asof_week_ending"] = _as_date_str(df["gross_asof_week_ending"])
+    return df
+
+
+@st.cache_data(show_spinner=False)
+def _load_official_t25_years(db_path: str, db_mtime: float) -> list[int]:
+    con = sqlite3.connect(db_path)
+    try:
+        df = pd.read_sql_query(
+            """
+            SELECT DISTINCT year
+            FROM official_t25_entry
+            ORDER BY year DESC
+            """,
+            con,
+        )
+    finally:
+        con.close()
+    return df["year"].dropna().astype(int).tolist() if not df.empty else []
+
+
+@st.cache_data(show_spinner=False)
+def _load_official_t25_year_end(db_path: str, db_mtime: float, year: int) -> pd.DataFrame:
+    con = sqlite3.connect(db_path)
+    try:
+        df = pd.read_sql_query(
+            """
+            WITH latest_meta AS (
+              SELECT show_id, imprint_1, imprint_2
+              FROM (
+                SELECT
+                  e.show_id,
+                  COALESCE(NULLIF(TRIM(e.imprint_1), ''), '') AS imprint_1,
+                  COALESCE(NULLIF(TRIM(e.imprint_2), ''), '') AS imprint_2,
+                  ROW_NUMBER() OVER (
+                    PARTITION BY e.show_id
+                    ORDER BY date(e.week_ending) DESC, e.id DESC
+                  ) AS rn
+                FROM t10_entry e
+              )
+              WHERE rn = 1
+            ),
+            y AS (
+              SELECT
+                e.year,
+                e.show_id,
+                s.canonical_title,
+                SUM(e.points) AS year_end_points,
+                COUNT(*) AS months_on_chart,
+                MIN(e.rank) AS peak_monthly_rank,
+                MIN(e.month) AS first_month,
+                MAX(e.month) AS last_month
+              FROM official_t25_entry e
+              JOIN show s ON s.show_id = e.show_id
+              WHERE e.year = ?
+              GROUP BY e.year, e.show_id, s.canonical_title
+            )
+            SELECT
+              y.year,
+              y.show_id,
+              y.canonical_title,
+              COALESCE(lm.imprint_1, '') AS imprint_1,
+              COALESCE(lm.imprint_2, '') AS imprint_2,
+              y.year_end_points,
+              y.months_on_chart,
+              y.peak_monthly_rank,
+              y.first_month,
+              y.last_month
+            FROM y
+            LEFT JOIN latest_meta lm ON lm.show_id = y.show_id
+            ORDER BY
+              y.year_end_points DESC,
+              y.months_on_chart DESC,
+              y.peak_monthly_rank ASC,
+              y.canonical_title ASC
+            """,
+            con,
+            params=(int(year),),
+        )
+    finally:
+        con.close()
+
+    if df.empty:
+        return df
+    df.insert(0, "position", np.arange(1, len(df) + 1))
+    return df
+
+
+def tab_official_monthly_t25():
+    st.subheader("Official Monthly T-25")
+    st.caption(
+        "Imported official Monthly T-25 charts. Points use the inverse chart system: "
+        "#1 = 25, #2 = 24, ... #25 = 1. Ties are preserved with display rank and physical row order. "
+        "Gross as of cutoff is the show's cumulative overall gross through the final weekly T-10 chart mapped to that monthly chart."
+    )
+
+    if not DB_PATH.exists():
+        st.error(f"Database not found at {DB_PATH}.")
+        return
+
+    db_mtime = DB_PATH.stat().st_mtime
+    if not _official_t25_table_exists(str(DB_PATH), db_mtime):
+        st.info("No official Monthly T-25 import table found yet. Run `import_official_t25.py` first.")
+        return
+
+    months_df = _load_official_t25_months(str(DB_PATH), db_mtime)
+    if months_df.empty:
+        st.info("No official Monthly T-25 rows found.")
+        return
+
+    months = months_df["month"].astype(str).tolist()
+    pick = st.selectbox("Chart month", options=months, index=0, key="official_t25_month_pick")
+    chart = _load_official_t25_month_chart(str(DB_PATH), db_mtime, pick)
+    if chart.empty:
+        st.info("No official chart rows for that month.")
+        return
+
+    month_meta = months_df[months_df["month"].eq(pick)].iloc[0]
+    gross_asof_week = ""
+    if "gross_asof_week_ending" in chart.columns and not chart["gross_asof_week_ending"].dropna().empty:
+        gross_asof_week = str(chart["gross_asof_week_ending"].dropna().iloc[0])
+
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("Rows", int(month_meta["rows"]))
+    c2.metric("Unique shows", int(month_meta["unique_shows"]))
+    c3.metric("Total points", int(month_meta["total_points"]))
+    c4.metric("Rank span", f"{int(month_meta['best_rank'])}–{int(month_meta['worst_rank'])}")
+    c5.metric("Gross through", gross_asof_week or "—")
+
+    disp = chart.copy()
+    disp["total_gross_asof_display"] = pd.to_numeric(disp.get("total_gross_asof"), errors="coerce").fillna(0.0).round(1)
+    display_cols = [
+        "rank",
+        "canonical_title",
+        "last_month_pos",
+        "months_on_chart",
+        "peak_rank",
+        "points",
+        "total_gross_asof_display",
+        "imprint_1",
+        "imprint_2",
+    ]
+    st.dataframe(
+        disp[display_cols].rename(
+            columns={
+                "rank": "Rank",
+                "canonical_title": "Show",
+                "last_month_pos": "Last Mo Pos",
+                "months_on_chart": "Months on Chart",
+                "peak_rank": "Peak Position",
+                "points": "Points",
+                "total_gross_asof_display": "Gross as of Cutoff",
+                "imprint_1": "Imprint 1",
+                "imprint_2": "Imprint 2",
+            }
+        ),
+        width='stretch',
+        hide_index=True,
+    )
+
+    with st.expander("Source / extraction details"):
+        src_cols = [
+            "row_pos",
+            "rank",
+            "points",
+            "raw_title",
+            "source_raw_points",
+            "source_file",
+            "source_sheet",
+            "source_row",
+            "source_col",
+            "extraction_method",
+        ]
+        st.dataframe(
+            disp[src_cols].rename(
+                columns={
+                    "row_pos": "Row Pos",
+                    "rank": "Rank",
+                    "points": "Points",
+                    "raw_title": "Raw Title",
+                    "source_raw_points": "Source Raw Points",
+                    "source_file": "Source File",
+                    "source_sheet": "Source Sheet",
+                    "source_row": "Source Row",
+                    "source_col": "Source Col",
+                    "extraction_method": "Extraction Method",
+                }
+            ),
+            width='stretch',
+            hide_index=True,
+        )
+
+    export_cols = [
+        "month",
+        "row_pos",
+        "rank",
+        "points",
+        "canonical_title",
+        "raw_title",
+        "last_month_pos",
+        "months_on_chart",
+        "peak_rank",
+        "total_gross_asof",
+        "gross_asof_week_ending",
+        "imprint_1",
+        "imprint_2",
+        "source_file",
+        "source_sheet",
+    ]
+    csv = chart[export_cols].to_csv(index=False).encode("utf-8")
+    st.download_button(
+        "Download official monthly chart CSV",
+        data=csv,
+        file_name=f"official_monthly_t25_{pick}.csv",
+        mime="text/csv",
+        key="official_monthly_t25_download",
+    )
+
+
+def tab_official_year_end_t35():
+    st.subheader("Official Year-End — Monthly T-25 inverse points")
+    st.caption(
+        "Year-End rankings are calculated from official Monthly T-25 appearances only: "
+        "#1 = 25 points, #2 = 24, ... #25 = 1. Bonus points and months-on-chart source columns are ignored."
+    )
+
+    if not DB_PATH.exists():
+        st.error(f"Database not found at {DB_PATH}.")
+        return
+
+    db_mtime = DB_PATH.stat().st_mtime
+    if not _official_t25_table_exists(str(DB_PATH), db_mtime):
+        st.info("No official Monthly T-25 import table found yet. Run `import_official_t25.py` first.")
+        return
+
+    years = _load_official_t25_years(str(DB_PATH), db_mtime)
+    if not years:
+        st.info("No official Monthly T-25 years found.")
+        return
+
+    year = int(st.selectbox("Year", options=years, index=0, key="official_t25_year_end_year"))
+    rows_to_show = int(st.slider("Rows to show", min_value=10, max_value=100, value=35, step=5, key="official_t25_year_end_rows"))
+
+    df = _load_official_t25_year_end(str(DB_PATH), db_mtime, year)
+    if df.empty:
+        st.info(f"No official Monthly T-25 rows found for {year}.")
+        return
+
+    out = df.head(rows_to_show).copy()
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Shows ranked", len(df))
+    c2.metric("Total points", int(pd.to_numeric(df["year_end_points"], errors="coerce").fillna(0).sum()))
+    c3.metric("Months represented", int(sql_df("SELECT COUNT(DISTINCT month) AS months FROM official_t25_entry WHERE year = ?", (int(year),)).iloc[0]["months"]))
+
+    display_cols = [
+        "position",
+        "canonical_title",
+        "imprint_1",
+        "imprint_2",
+        "year_end_points",
+        "months_on_chart",
+        "peak_monthly_rank",
+        "first_month",
+        "last_month",
+    ]
+    st.dataframe(
+        out[display_cols].rename(
+            columns={
+                "position": "Rank",
+                "canonical_title": "Show",
+                "imprint_1": "Imprint 1",
+                "imprint_2": "Imprint 2",
+                "year_end_points": "Points",
+                "months_on_chart": "Months on Chart",
+                "peak_monthly_rank": "Peak Monthly Pos",
+                "first_month": "First Month",
+                "last_month": "Last Month",
+            }
+        ),
+        width='stretch',
+        hide_index=True,
+    )
+
+    csv = out.to_csv(index=False).encode("utf-8")
+    st.download_button(
+        "Download official Year-End CSV",
+        data=csv,
+        file_name=f"official_t25_year_end_top{rows_to_show}_{year}.csv",
+        mime="text/csv",
+        key="official_t25_year_end_download",
+    )
+
 def tab_monthly_smps_t25():
+    source_view = st.radio(
+        "Monthly T-25 source",
+        options=["Official Monthly T-25", "Computed SMPS"],
+        index=0,
+        horizontal=True,
+        key="monthly_t25_source_view",
+    )
+    if source_view == "Official Monthly T-25":
+        tab_official_monthly_t25()
+        return
+
     st.subheader("Monthly T-25 (SMPS)")
     st.caption(
         "SMPS_v1 = Share (50; ratio-based to the running record monthly max (no rounding) with exponent 1.4) + Breakout (30) + Heat (20) + carryover (0-gross months only) + continuity bonus (active incumbents). "
@@ -1677,6 +2189,17 @@ def tab_monthly_smps_t25():
 # New tab: Year-End (SMPS) — Top 35
 # ----------------------------
 def tab_year_end_smps_t35():
+    source_view = st.radio(
+        "Year-End source",
+        options=["Official Monthly T-25 inverse points", "Weekly points model"],
+        index=0,
+        horizontal=True,
+        key="year_end_source_view",
+    )
+    if source_view == "Official Monthly T-25 inverse points":
+        tab_official_year_end_t35()
+        return
+
     st.subheader("Year-End (Weekly Points)")
     st.caption(
         "Year-end rankings are calculated by summing weekly points across the selected year. "
@@ -8791,8 +9314,8 @@ def main():
         "Companies",
         "Analytics",
         "Gross Races",
-        "Monthly T-25 (SMPS)",
-        "Year-End (SMPS)",
+        "Monthly T-25",
+        "Year-End",
         "Grossing Milestones",
         "Grossing Trends",
         "Show Trends",
