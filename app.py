@@ -1164,6 +1164,7 @@ def _compute_smps_history(db_path: str, db_mtime: float, include_bonuses: bool) 
 
     inactive: dict[int, int] = {}  # show_id -> consecutive zero-gross months (candidate-only)
     prev_chart: Optional[pd.DataFrame] = None
+    ever_charted: set[int] = set()  # show_ids that have appeared on an earlier SMPS Top 25
 
     out: dict[str, pd.DataFrame] = {}
 
@@ -1377,8 +1378,50 @@ def _compute_smps_history(db_path: str, db_mtime: float, include_bonuses: bool) 
             ascending=[False, False, False, False, True],
         ).reset_index(drop=True)
 
-        df.insert(0, "position", np.arange(1, len(df) + 1))
-        chart = df.head(25).copy()
+        # Traditional official Monthly T-25 entry-placement rules:
+        #   1) First-time debuts cannot enter at #24 or #25.
+        #   2) Re-entries cannot re-enter at #1.
+        #
+        # These rules are applied after the raw SMPS score sort, before final positions
+        # are assigned. Debuts are shows that have never appeared on an earlier SMPS
+        # Top 25. Re-entries are shows that have appeared before, missed the previous
+        # month, and are returning this month.
+        df["smps_raw_rank"] = np.arange(1, len(df) + 1)
+        if "show_id" in df.columns:
+            _sid = pd.to_numeric(df["show_id"], errors="coerce").fillna(-1).astype(int)
+            df["has_prior_smps_top25"] = _sid.isin(ever_charted)
+            df["is_reentry"] = df["has_prior_smps_top25"] & (~_sid.isin(prev_ids))
+            df["is_debut"] = ~df["has_prior_smps_top25"]
+        else:
+            df["has_prior_smps_top25"] = False
+            df["is_reentry"] = False
+            df["is_debut"] = False
+
+        # Re-entry #1 guardrail: promote the highest non-reentry candidate above a
+        # raw #1 re-entry. Debuts are allowed to debut at #1; incumbents are allowed
+        # to hold or climb to #1.
+        if not df.empty and bool(df.loc[0, "is_reentry"]):
+            _non_reentry = df.index[~df["is_reentry"].astype(bool)].tolist()
+            if _non_reentry:
+                _promote_idx = int(_non_reentry[0])
+                df = pd.concat([df.loc[[_promote_idx]], df.drop(index=_promote_idx)], ignore_index=True)
+
+        # Debut #24/#25 guardrail: when filling the final Top 25, skip first-time
+        # debuts that would land at #24 or #25 and continue looking for the next
+        # eligible previously-charted candidate. If there are not enough eligible
+        # candidates, the chart may finish with fewer than 25 rows rather than
+        # forcing a prohibited low-position debut.
+        _selected_idx: list[int] = []
+        for _idx, _row in df.iterrows():
+            _next_pos = len(_selected_idx) + 1
+            if _next_pos in (24, 25) and bool(_row.get("is_debut", False)):
+                continue
+            _selected_idx.append(_idx)
+            if len(_selected_idx) >= 25:
+                break
+
+        chart = df.loc[_selected_idx].copy().reset_index(drop=True) if _selected_idx else df.head(0).copy()
+        chart.insert(0, "position", np.arange(1, len(chart) + 1))
 
         # Keep only needed columns for chart storage
         chart["month"] = m
@@ -1386,6 +1429,8 @@ def _compute_smps_history(db_path: str, db_mtime: float, include_bonuses: bool) 
         chart["method_version"] = SMPS_METHOD_VERSION
 
         out[m] = chart
+        if not chart.empty and "show_id" in chart.columns:
+            ever_charted.update(pd.to_numeric(chart["show_id"], errors="coerce").dropna().astype(int).tolist())
         prev_chart = chart[[
             "show_id",
             "points_total",
@@ -2123,7 +2168,8 @@ def tab_monthly_smps_t25():
     st.subheader("Monthly T-25 (SMPS)")
     st.caption(
         "SMPS_v2 = Share (70; ratio-based to the running record monthly max (no rounding) with exponent 1.4) + Breakout (20) + Heat (10) + carryover (0-gross months only) + continuity bonus (active incumbents). "
-        "Floors use PERCENTILE.INC (10th percentile). Zombie rule: 4 consecutive 0-gross chart-months => ineligible."
+        "Floors use PERCENTILE.INC (10th percentile). Zombie rule: 4 consecutive 0-gross chart-months => ineligible. "
+        "Entry rules: debuts cannot enter at #24/#25; re-entries cannot re-enter at #1."
     )
 
     include_bonuses = st.checkbox(
@@ -3128,6 +3174,7 @@ def tab_grossing_trends():
             plt.ylabel("Average total gross (Top 10)")
             plt.title("Average total gross by month-of-year")
             st.pyplot(fig, clear_figure=True)
+            plt.close(fig)
 
             woy_stats = season_df.groupby("week_of_year")["total_gross"].mean().reset_index()
             fig = plt.figure()
@@ -3136,6 +3183,7 @@ def tab_grossing_trends():
             plt.ylabel("Average total gross (Top 10)")
             plt.title("Average total gross by week-of-year")
             st.pyplot(fig, clear_figure=True)
+            plt.close(fig)
 
             with st.expander("Seasonality table"):
                 show_tbl = month_stats[["month_name", "avg", "median", "n"]].rename(columns={"month_name": "Month", "avg": "Avg", "median": "Median", "n": "Weeks"})
@@ -3158,6 +3206,7 @@ def tab_grossing_trends():
             plt.ylabel("Median weekly gross")
             plt.title("Median gross by rank (Top 10)")
             st.pyplot(fig, clear_figure=True)
+            plt.close(fig)
 
             with st.expander("Position decay table"):
                 st.dataframe(pos_stats, width='stretch')
@@ -3175,17 +3224,20 @@ def tab_grossing_trends():
             plt.legend()
             plt.title("Weekly total gross (Top 10)")
             st.pyplot(fig, clear_figure=True)
+            plt.close(fig)
 
             fig = plt.figure()
             plt.plot(roll_std.index, roll_std.values)
             plt.title(f"Rolling {roll_w}-week std dev (volatility)")
             plt.ylabel("Std dev")
             st.pyplot(fig, clear_figure=True)
+            plt.close(fig)
 
             fig = plt.figure()
             plt.plot(vol_score.index, vol_score.values)
             plt.title(f"Volatility score (std/mean) over {roll_w} weeks")
             st.pyplot(fig, clear_figure=True)
+            plt.close(fig)
 
         st.markdown("### #1 premium (#1 vs #2)")
         # Use Top 2 regardless of chosen rank_scope
@@ -3209,11 +3261,13 @@ def tab_grossing_trends():
                 plt.plot(diff.index, diff.values)
                 plt.title("#1 premium (difference: #1 − #2)")
                 st.pyplot(fig, clear_figure=True)
+                plt.close(fig)
 
                 fig = plt.figure()
                 plt.plot(ratio.index, ratio.values)
                 plt.title("#1 premium (ratio: #1 ÷ #2)")
                 st.pyplot(fig, clear_figure=True)
+                plt.close(fig)
 
     # ----------------------------
     # Momentum
@@ -3357,6 +3411,7 @@ def tab_grossing_trends():
                 plt.ylabel("Gross")
                 plt.title("Typical show lifecycle (median with IQR)")
                 st.pyplot(fig, clear_figure=True)
+                plt.close(fig)
 
                 # Time to peak
                 peak_rows = []
@@ -3373,6 +3428,7 @@ def tab_grossing_trends():
                 plt.ylabel("Count of shows")
                 plt.title("Time-to-peak distribution")
                 st.pyplot(fig, clear_figure=True)
+                plt.close(fig)
 
                 with st.expander("Peak table (top 200 by peak gross)"):
                     st.dataframe(peaks.sort_values("peak_gross", ascending=False).head(200), width='stretch')
@@ -3401,6 +3457,7 @@ def tab_grossing_trends():
                     plt.ylabel("Count of shows")
                     plt.title("Half-life distribution")
                     st.pyplot(fig, clear_figure=True)
+                    plt.close(fig)
 
                     with st.expander("Half-life table (top 200 slowest to decay)"):
                         st.dataframe(half_df.sort_values("weeks_to_half", ascending=False).head(200), width='stretch')
@@ -3425,6 +3482,7 @@ def tab_grossing_trends():
             plt.legend()
             plt.title("Share of total gross captured by #1 and Top 3")
             st.pyplot(fig, clear_figure=True)
+            plt.close(fig)
 
             # HHI concentration across shows each week
             hhi_rows = []
@@ -3441,6 +3499,7 @@ def tab_grossing_trends():
                 plt.plot(hhi_df["week_ending_dt"], hhi_df["hhi"])
                 plt.title("HHI-style concentration index (higher = more dominated)")
                 st.pyplot(fig, clear_figure=True)
+                plt.close(fig)
 
         st.markdown("### Turnover")
         # New shows per week (first appearance in the FULL df, then filtered to current range)
@@ -3458,6 +3517,7 @@ def tab_grossing_trends():
         plt.plot(new_counts["first_week"], new_counts["new_shows"])
         plt.title("New shows entering Top 10 (first-ever appearance) per week")
         st.pyplot(fig, clear_figure=True)
+        plt.close(fig)
 
         with st.expander("Newest shows (top 200)"):
             newest = df_first.sort_values("first_week", ascending=False).head(200)
@@ -3512,6 +3572,7 @@ def tab_grossing_trends():
             plt.legend(loc="upper left", ncol=2)
             plt.title("Weekly gross by imprint (Top N + Other)")
             st.pyplot(fig, clear_figure=True)
+            plt.close(fig)
 
             share_tbl = (totals / totals.sum()).reset_index()
             share_tbl.columns = ["Imprint", "Share"]
@@ -3594,6 +3655,7 @@ def tab_grossing_trends():
             plt.plot(weekly_total.index, weekly_total.values)
             plt.title("Weekly total gross (Top 10)")
             st.pyplot(fig, clear_figure=True)
+            plt.close(fig)
 
             if out.empty:
                 st.info("No outliers at the current threshold/window.")
@@ -3658,6 +3720,7 @@ def tab_grossing_trends():
                 plt.axvline(idx[bi], linestyle="--")
             plt.title("Weekly total gross with detected era boundaries")
             st.pyplot(fig, clear_figure=True)
+            plt.close(fig)
 
             if eras_df.empty:
                 st.info("No eras detected at current settings.")
