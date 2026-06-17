@@ -832,6 +832,7 @@ HOLIDAYS: dict[str, Callable[[int], date]] = {
     "Presidents Day (3rd Mon in Feb)": lambda y: nth_weekday_of_month(y, 2, 0, 3),
     "Easter (variable)": easter_date,
     "Memorial Day (last Mon in May)": lambda y: last_weekday_of_month(y, 5, 0),
+    "Juneteenth (Jun 19)": lambda y: date(y, 6, 19),
     "Independence Day (Jul 4)": lambda y: date(y, 7, 4),
     "Labor Day (1st Mon in Sep)": lambda y: nth_weekday_of_month(y, 9, 0, 1),
     "Halloween (Oct 31)": lambda y: date(y, 10, 31),
@@ -895,6 +896,7 @@ def holiday_week_ending_for_date(all_week_endings: list[date], holiday_dt: date,
     fixed = (
         name.startswith("New Year's Day")
         or name.startswith("Valentine's Day")
+        or name.startswith("Juneteenth")
         or name.startswith("Independence Day")
         or name.startswith("Halloween")
         or name.startswith("Christmas Day")
@@ -1428,8 +1430,24 @@ def _write_smps_to_db(month: str, chart_df: pd.DataFrame) -> None:
             )
 
         cur.executemany(
-            f"INSERT INTO official_t25_entry ({quoted_cols}) VALUES ({placeholders})",
-            values,
+            """
+            INSERT OR REPLACE INTO monthly_chart (
+              month,
+              chart_type,
+              method_version,
+              position,
+              show_id,
+              month_gross_millions,
+              points_total,
+              points_share,
+              points_breakout,
+              points_heat,
+              points_carryover,
+              inactive_streak
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            rows,
         )
         con.commit()
     finally:
@@ -1584,57 +1602,6 @@ def _write_smps_official_t25_to_db(start_month: str, hist: dict[str, pd.DataFram
 # ----------------------------
 # Official Monthly T-25 helpers
 # ----------------------------
-
-# ----------------------------
-# Official T-25 raw-title history links
-# ----------------------------
-def _official_t25_raw_title_key(title: str | None) -> str:
-    """Stable key for matching official T-25 raw titles without renaming them."""
-    return re.sub(r"\s+", " ", str(title or "").strip()).casefold()
-
-
-def _ensure_official_t25_history_link_schema() -> None:
-    """Store display-title -> history-show links for Official T-25 rows.
-
-    This intentionally does not update official_t25_entry.show_id. That avoids the
-    UNIQUE(month, show_id) conflict when multiple official raw titles should use the
-    same T-10/grossing history.
-    """
-    con = get_con()
-    try:
-        cur = con.cursor()
-        cur.execute("BEGIN;")
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS official_t25_raw_title_history_link (
-              raw_title_key TEXT PRIMARY KEY,
-              raw_title TEXT NOT NULL,
-              target_show_id INTEGER NOT NULL REFERENCES show(show_id),
-              note TEXT,
-              created_at TEXT NOT NULL DEFAULT (datetime('now')),
-              updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-            );
-            """
-        )
-        con.commit()
-    finally:
-        con.close()
-
-
-def _clear_official_t25_caches_after_history_link() -> None:
-    for _cache_obj in (
-        sql_df,
-        _load_official_t25_months,
-        _load_official_t25_month_chart,
-        _load_official_t25_years,
-        _load_official_t25_year_end,
-        _load_t25_records_base,
-    ):
-        try:
-            _cache_obj.clear()
-        except Exception:
-            pass
-
 def _official_t25_table_exists(db_path: str, db_mtime: float) -> bool:
     """Return True when the official Monthly T-25 import table exists and has rows."""
     try:
@@ -1682,27 +1649,13 @@ def _load_official_t25_months(db_path: str, db_mtime: float) -> pd.DataFrame:
         con.close()
 
 
-
 @st.cache_data(show_spinner=False)
 def _load_official_t25_month_chart(db_path: str, db_mtime: float, month: str) -> pd.DataFrame:
-    _ensure_official_t25_history_link_schema()
     con = sqlite3.connect(db_path)
     try:
         df = pd.read_sql_query(
             """
-            WITH raw_links AS (
-              SELECT raw_title_key, target_show_id
-              FROM official_t25_raw_title_history_link
-            ),
-            entry_base AS (
-              SELECT
-                e.*,
-                COALESCE(rl.target_show_id, e.show_id) AS history_show_id
-              FROM official_t25_entry e
-              LEFT JOIN raw_links rl
-                ON lower(trim(e.raw_title)) = rl.raw_title_key
-            ),
-            latest_meta AS (
+            WITH latest_meta AS (
               SELECT show_id, imprint_1, imprint_2
               FROM (
                 SELECT
@@ -1728,9 +1681,6 @@ def _load_official_t25_month_chart(db_path: str, db_mtime: float, month: str) ->
                       e.week_ending,
                       'start of month',
                       CASE
-                        WHEN CAST(strftime('%m', e.week_ending) AS INTEGER) = 2
-                         AND CAST(strftime('%d', e.week_ending) AS INTEGER) > 25
-                        THEN '+2 months'
                         WHEN CAST(strftime('%d', e.week_ending) AS INTEGER) <= 28
                         THEN '+1 month'
                         ELSE '+2 months'
@@ -1771,26 +1721,25 @@ def _load_official_t25_month_chart(db_path: str, db_mtime: float, month: str) ->
               WHERE month < ?
             ),
             prev AS (
-              SELECT history_show_id, MIN(rank) AS prev_rank
-              FROM entry_base
+              SELECT show_id, rank AS prev_rank
+              FROM official_t25_entry
               WHERE month = (SELECT prev_month FROM prev_month)
-              GROUP BY history_show_id
             ),
             seen AS (
-              SELECT history_show_id, COUNT(DISTINCT month) AS months_before
-              FROM entry_base
+              SELECT show_id, COUNT(*) AS months_before
+              FROM official_t25_entry
               WHERE month < ?
-              GROUP BY history_show_id
+              GROUP BY show_id
             ),
             peak AS (
               SELECT
-                history_show_id,
+                show_id,
                 MIN(rank) AS peak_rank,
-                COUNT(DISTINCT month) AS months_to_date,
+                COUNT(*) AS months_to_date,
                 SUM(points) AS points_to_date
-              FROM entry_base
+              FROM official_t25_entry
               WHERE month <= ?
-              GROUP BY history_show_id
+              GROUP BY show_id
             )
             SELECT
               e.month,
@@ -1800,9 +1749,7 @@ def _load_official_t25_month_chart(db_path: str, db_mtime: float, month: str) ->
               e.rank,
               e.points,
               e.show_id,
-              e.history_show_id,
-              COALESCE(NULLIF(TRIM(e.raw_title), ''), s.canonical_title) AS canonical_title,
-              s.canonical_title AS history_canonical_title,
+              s.canonical_title,
               e.raw_title,
               COALESCE(lm.imprint_1, '') AS imprint_1,
               COALESCE(lm.imprint_2, '') AS imprint_2,
@@ -1819,13 +1766,13 @@ def _load_official_t25_month_chart(db_path: str, db_mtime: float, month: str) ->
               e.source_row,
               e.source_col,
               e.extraction_method
-            FROM entry_base e
-            JOIN show s ON s.show_id = e.history_show_id
-            LEFT JOIN latest_meta lm ON lm.show_id = e.history_show_id
-            LEFT JOIN prev p ON p.history_show_id = e.history_show_id
-            LEFT JOIN seen ON seen.history_show_id = e.history_show_id
-            LEFT JOIN peak pk ON pk.history_show_id = e.history_show_id
-            LEFT JOIN asof_gross ag ON ag.show_id = e.history_show_id
+            FROM official_t25_entry e
+            JOIN show s ON s.show_id = e.show_id
+            LEFT JOIN latest_meta lm ON lm.show_id = e.show_id
+            LEFT JOIN prev p ON p.show_id = e.show_id
+            LEFT JOIN seen ON seen.show_id = e.show_id
+            LEFT JOIN peak pk ON pk.show_id = e.show_id
+            LEFT JOIN asof_gross ag ON ag.show_id = e.show_id
             WHERE e.month = ?
             ORDER BY e.row_pos ASC
             """,
@@ -1863,6 +1810,7 @@ def _load_official_t25_month_chart(db_path: str, db_mtime: float, month: str) ->
         df["gross_asof_week_ending"] = _as_date_str(df["gross_asof_week_ending"])
     return df
 
+
 @st.cache_data(show_spinner=False)
 def _load_official_t25_years(db_path: str, db_mtime: float) -> list[int]:
     con = sqlite3.connect(db_path)
@@ -1880,26 +1828,13 @@ def _load_official_t25_years(db_path: str, db_mtime: float) -> list[int]:
     return df["year"].dropna().astype(int).tolist() if not df.empty else []
 
 
-
+@st.cache_data(show_spinner=False)
 def _load_official_t25_year_end(db_path: str, db_mtime: float, year: int) -> pd.DataFrame:
-    _ensure_official_t25_history_link_schema()
     con = sqlite3.connect(db_path)
     try:
         df = pd.read_sql_query(
             """
-            WITH raw_links AS (
-              SELECT raw_title_key, target_show_id
-              FROM official_t25_raw_title_history_link
-            ),
-            entry_base AS (
-              SELECT
-                e.*,
-                COALESCE(rl.target_show_id, e.show_id) AS history_show_id
-              FROM official_t25_entry e
-              LEFT JOIN raw_links rl
-                ON lower(trim(e.raw_title)) = rl.raw_title_key
-            ),
-            latest_meta AS (
+            WITH latest_meta AS (
               SELECT show_id, imprint_1, imprint_2
               FROM (
                 SELECT
@@ -1917,17 +1852,17 @@ def _load_official_t25_year_end(db_path: str, db_mtime: float, year: int) -> pd.
             y AS (
               SELECT
                 e.year,
-                e.history_show_id AS show_id,
+                e.show_id,
                 s.canonical_title,
                 SUM(e.points) AS year_end_points,
-                COUNT(DISTINCT e.month) AS months_on_chart,
+                COUNT(*) AS months_on_chart,
                 MIN(e.rank) AS peak_monthly_rank,
                 MIN(e.month) AS first_month,
                 MAX(e.month) AS last_month
-              FROM entry_base e
-              JOIN show s ON s.show_id = e.history_show_id
+              FROM official_t25_entry e
+              JOIN show s ON s.show_id = e.show_id
               WHERE e.year = ?
-              GROUP BY e.year, e.history_show_id, s.canonical_title
+              GROUP BY e.year, e.show_id, s.canonical_title
             )
             SELECT
               y.year,
@@ -1958,6 +1893,7 @@ def _load_official_t25_year_end(db_path: str, db_mtime: float, year: int) -> pd.
         return df
     df.insert(0, "position", np.arange(1, len(df) + 1))
     return df
+
 
 def tab_official_monthly_t25():
     st.subheader("Official Monthly T-25")
@@ -2178,7 +2114,7 @@ def tab_monthly_smps_t25():
         options=["Official Monthly T-25", "Computed SMPS"],
         index=0,
         horizontal=True,
-        key="monthly_t25_source_view",
+        key="monthly_t25_source_view_fast_default_official",
     )
     if source_view == "Official Monthly T-25":
         tab_official_monthly_t25()
@@ -2444,7 +2380,7 @@ def tab_year_end_smps_t35():
         options=["Official Monthly T-25 inverse points", "Weekly points model"],
         index=0,
         horizontal=True,
-        key="year_end_source_view",
+        key="year_end_source_view_fast_default_official",
     )
     if source_view == "Official Monthly T-25 inverse points":
         tab_official_year_end_t35()
@@ -6694,15 +6630,13 @@ def tab_admin():
 
     
 
-
     st.markdown("### Link Official T-25 raw titles to a T-10/grossing history")
     with st.expander("Map official T-25 titles to another show's history without renaming them", expanded=False):
         st.caption(
             "Use this when an official Monthly T-25 row has a historical/raw title, but its stats should use another show's "
-            "T-10 chart and grossing history. This saves a separate link rule. It does **not** update "
-            "`official_t25_entry.show_id`, so it avoids duplicate month/show_id conflicts and keeps the official raw title intact."
+            "T-10 chart and grossing history. This updates `official_t25_entry.show_id` only. It does **not** change "
+            "the official T-25 `raw_title`, the canonical show title, weekly T-10 rows, or gross bonus rows."
         )
-        _ensure_official_t25_history_link_schema()
 
         try:
             _official_tbl = sql_df("SELECT COUNT(*) AS rows FROM official_t25_entry")
@@ -6719,19 +6653,16 @@ def tab_admin():
                 """
                 SELECT
                   e.raw_title,
-                  COALESCE(s.canonical_title, '(missing show)') AS imported_history_show,
-                  COALESCE(linked.canonical_title, '') AS linked_history_show,
+                  e.show_id AS current_show_id,
+                  COALESCE(s.canonical_title, '(missing show)') AS current_history_show,
                   COUNT(*) AS rows,
                   MIN(e.month) AS first_month,
                   MAX(e.month) AS last_month
                 FROM official_t25_entry e
                 LEFT JOIN show s ON s.show_id = e.show_id
-                LEFT JOIN official_t25_raw_title_history_link l
-                  ON lower(trim(e.raw_title)) = l.raw_title_key
-                LEFT JOIN show linked ON linked.show_id = l.target_show_id
                 WHERE e.raw_title IS NOT NULL AND TRIM(e.raw_title) <> ''
-                GROUP BY e.raw_title, s.canonical_title, linked.canonical_title
-                ORDER BY lower(e.raw_title), first_month, imported_history_show
+                GROUP BY e.raw_title, e.show_id, s.canonical_title
+                ORDER BY lower(e.raw_title), first_month, current_history_show
                 """
             )
 
@@ -6750,8 +6681,8 @@ def tab_admin():
             st.dataframe(
                 show_raw_link_df.rename(columns={
                     "raw_title": "Official T-25 Raw Title",
-                    "imported_history_show": "Imported History Show",
-                    "linked_history_show": "Linked History Show",
+                    "current_show_id": "Current show_id",
+                    "current_history_show": "Current History Show",
                     "rows": "Rows",
                     "first_month": "First Month",
                     "last_month": "Last Month",
@@ -6762,10 +6693,10 @@ def tab_admin():
 
             raw_options = show_raw_link_df["raw_title"].astype(str).drop_duplicates().tolist()
             picked_raw_titles = st.multiselect(
-                "Official raw title(s) to link",
+                "Official raw title(s) to relink",
                 options=raw_options,
                 key="t25_raw_title_history_link_raw_titles",
-                help="Select exact official T-25 titles whose rows should use another show's T-10/grossing history.",
+                help="Select the exact official T-25 titles whose rows should use another show's T-10/grossing history.",
             )
             target_history = st.selectbox(
                 "Use T-10/grossing history from",
@@ -6783,8 +6714,8 @@ def tab_admin():
                       e.rank,
                       e.row_pos,
                       e.raw_title,
-                      e.show_id AS imported_show_id,
-                      COALESCE(s.canonical_title, '(missing show)') AS imported_history_show
+                      e.show_id AS current_show_id,
+                      COALESCE(s.canonical_title, '(missing show)') AS current_history_show
                     FROM official_t25_entry e
                     LEFT JOIN show s ON s.show_id = e.show_id
                     WHERE e.raw_title IN ({placeholders})
@@ -6792,120 +6723,62 @@ def tab_admin():
                     """,
                     tuple(picked_raw_titles),
                 )
-                st.markdown("**Preview rows affected by this link rule**")
+                st.markdown("**Preview rows to relink**")
                 st.dataframe(
                     preview_df.rename(columns={
                         "month": "Month",
                         "rank": "Rank",
                         "row_pos": "Row Pos",
                         "raw_title": "Official T-25 Raw Title",
-                        "imported_show_id": "Imported show_id",
-                        "imported_history_show": "Imported History Show",
+                        "current_show_id": "Current show_id",
+                        "current_history_show": "Current History Show",
                     }),
                     width='stretch',
                     hide_index=True,
                 )
-                st.caption(
-                    f"These rows will keep their official raw title, but monthly T-25 gross/history/records will use "
-                    f"**{target_history_id} — {target_history}** as the history show."
-                )
+                st.caption(f"These rows will keep their official raw title, but their history show_id will become **{target_history_id} — {target_history}**.")
 
             confirm_link = st.checkbox(
-                "I understand this saves a separate history-link rule and does not rewrite official_t25_entry.show_id.",
+                "I understand this only changes official T-25 history links, not the displayed raw title.",
                 value=False,
                 key="t25_raw_title_history_link_confirm",
             )
 
-            if st.button("Save official T-25 title/history link", type="primary", key="t25_raw_title_history_link_apply"):
+            if st.button("Relink selected official T-25 titles", type="primary", key="t25_raw_title_history_link_apply"):
                 if not picked_raw_titles:
-                    st.warning("Select at least one official raw title to link.")
+                    st.warning("Select at least one official raw title to relink.")
                 elif not confirm_link:
                     st.warning("Please check the confirmation box first.")
                 else:
+                    placeholders = ",".join(["?"] * len(picked_raw_titles))
                     con = get_con()
                     try:
                         cur = con.cursor()
                         cur.execute("BEGIN;")
-                        changed = 0
-                        for raw in picked_raw_titles:
-                            raw_str = str(raw).strip()
-                            if not raw_str:
-                                continue
-                            cur.execute(
-                                """
-                                INSERT INTO official_t25_raw_title_history_link
-                                  (raw_title_key, raw_title, target_show_id, note, updated_at)
-                                VALUES (?, ?, ?, ?, datetime('now'))
-                                ON CONFLICT(raw_title_key) DO UPDATE SET
-                                  raw_title = excluded.raw_title,
-                                  target_show_id = excluded.target_show_id,
-                                  note = excluded.note,
-                                  updated_at = datetime('now')
-                                """,
-                                (
-                                    _official_t25_raw_title_key(raw_str),
-                                    raw_str,
-                                    target_history_id,
-                                    "Admin title/history link",
-                                ),
-                            )
-                            changed += 1
+                        cur.execute(
+                            f"UPDATE official_t25_entry SET show_id = ? WHERE raw_title IN ({placeholders})",
+                            tuple([target_history_id] + picked_raw_titles),
+                        )
+                        changed = int(cur.rowcount if cur.rowcount is not None else 0)
                         con.commit()
                     finally:
                         con.close()
 
-                    _clear_official_t25_caches_after_history_link()
-                    st.success(f"Saved {changed:,} official T-25 title/history link rule(s) to {target_history}.")
-                    st.rerun()
-
-            existing_links = sql_df(
-                """
-                SELECT
-                  l.raw_title,
-                  l.target_show_id,
-                  COALESCE(s.canonical_title, '(missing show)') AS linked_history_show,
-                  l.updated_at
-                FROM official_t25_raw_title_history_link l
-                LEFT JOIN show s ON s.show_id = l.target_show_id
-                ORDER BY lower(l.raw_title)
-                """
-            )
-            if not existing_links.empty:
-                st.markdown("**Existing title/history links**")
-                st.dataframe(
-                    existing_links.rename(columns={
-                        "raw_title": "Official T-25 Raw Title",
-                        "target_show_id": "Linked show_id",
-                        "linked_history_show": "Linked History Show",
-                        "updated_at": "Updated",
-                    }),
-                    width='stretch',
-                    hide_index=True,
-                )
-                remove_titles = st.multiselect(
-                    "Remove existing link rule(s)",
-                    options=existing_links["raw_title"].astype(str).tolist(),
-                    key="t25_raw_title_history_link_remove",
-                )
-                if st.button("Remove selected title/history links", key="t25_raw_title_history_link_remove_apply"):
-                    if not remove_titles:
-                        st.warning("Select at least one existing link rule to remove.")
-                    else:
-                        con = get_con()
+                    for _cache_obj in (
+                        sql_df,
+                        load_lists,
+                        _load_official_t25_months,
+                        _load_official_t25_month_chart,
+                        _load_official_t25_years,
+                        _load_official_t25_year_end,
+                        _load_t25_records_base,
+                    ):
                         try:
-                            cur = con.cursor()
-                            cur.execute("BEGIN;")
-                            cur.executemany(
-                                "DELETE FROM official_t25_raw_title_history_link WHERE raw_title_key = ?",
-                                [(_official_t25_raw_title_key(x),) for x in remove_titles],
-                            )
-                            removed = int(cur.rowcount if cur.rowcount is not None else 0)
-                            con.commit()
-                        finally:
-                            con.close()
-                        _clear_official_t25_caches_after_history_link()
-                        st.success(f"Removed {removed:,} title/history link rule(s).")
-                        st.rerun()
+                            _cache_obj.clear()
+                        except Exception:
+                            pass
+                    st.success(f"Relinked {changed:,} official T-25 row(s) to {target_history} while preserving their raw titles.")
+                    st.rerun()
 
     st.markdown("### Merge imprint labels (relabel imprint_1 / imprint_2)")
     with st.expander("Merge/rename an imprint", expanded=False):
@@ -7470,14 +7343,10 @@ def _t25_records_table_exists(db_path: str, db_mtime: float) -> bool:
         return False
 
 
-
 @st.cache_data(show_spinner=False)
 def _load_t25_records_base(db_path: str, db_mtime: float) -> pd.DataFrame:
     # Load official Monthly T-25 rows for record calculations.
     # Uses rank-based inverse points so imported and generated rows are comparable.
-    # Raw-title history links are applied here so records aggregate under the linked
-    # T-10/grossing-history show while preserving raw titles in the monthly chart view.
-    _ensure_official_t25_history_link_schema()
     con = sqlite3.connect(db_path)
     try:
         cols = {str(r[1]) for r in con.execute("PRAGMA table_info(official_t25_entry)").fetchall()}
@@ -7491,36 +7360,30 @@ def _load_t25_records_base(db_path: str, db_mtime: float) -> pd.DataFrame:
             else ("NULLIF(e.month_key, '')" if "month_key" in cols else "NULLIF(e.month, '')")
         )
 
+        title_parts = []
+        for name in ("canonical_title", "show_title", "raw_title"):
+            if name in cols:
+                title_parts.append(f"NULLIF(TRIM(e.{name}), '')")
+        title_expr = "COALESCE(NULLIF(TRIM(s.canonical_title), ''), " + ", ".join(title_parts) + ", '(Unknown)')" if title_parts else "COALESCE(NULLIF(TRIM(s.canonical_title), ''), '(Unknown)')"
+
         rank_expr = col("rank", col("position", "NULL"))
         row_pos_expr = col("row_pos", col("position", rank_expr))
         source_expr = col("month_source", "'Official'")
         source_file_expr = col("source_file", "''")
 
         sql = f"""
-        WITH raw_links AS (
-          SELECT raw_title_key, target_show_id
-          FROM official_t25_raw_title_history_link
-        ),
-        entry_base AS (
-          SELECT
-            e.*,
-            COALESCE(rl.target_show_id, e.show_id) AS history_show_id
-          FROM official_t25_entry e
-          LEFT JOIN raw_links rl
-            ON lower(trim(e.raw_title)) = rl.raw_title_key
-        )
         SELECT
           {month_expr} AS month,
           CAST(substr({month_expr}, 1, 4) AS INTEGER) AS year,
           CAST(substr({month_expr}, 6, 2) AS INTEGER) AS month_num,
           {rank_expr} AS rank,
           {row_pos_expr} AS row_pos,
-          e.history_show_id AS show_id,
-          COALESCE(NULLIF(TRIM(s.canonical_title), ''), NULLIF(TRIM(e.raw_title), ''), '(Unknown)') AS canonical_title,
+          e.show_id,
+          {title_expr} AS canonical_title,
           {source_expr} AS month_source,
           {source_file_expr} AS source_file
-        FROM entry_base e
-        LEFT JOIN show s ON s.show_id = e.history_show_id
+        FROM official_t25_entry e
+        LEFT JOIN show s ON s.show_id = e.show_id
         WHERE {month_expr} IS NOT NULL
           AND {rank_expr} IS NOT NULL
         ORDER BY month ASC, row_pos ASC, rank ASC
@@ -7549,6 +7412,7 @@ def _load_t25_records_base(db_path: str, db_mtime: float) -> pd.DataFrame:
     df["is_top10"] = df["rank"].le(10)
     df["is_t25"] = df["rank"].le(25)
     return df
+
 
 def _t25_records_count_table(df: pd.DataFrame, mask_col: str, value_name: str) -> pd.DataFrame:
     if df.empty or mask_col not in df.columns:
@@ -7750,7 +7614,7 @@ def tab_records_achievements():
         options=["T-10 chart records", "T-25 chart records"],
         index=0,
         horizontal=True,
-        key="records_achievements_record_scope",
+        key="records_achievements_record_scope_fast_default_t10",
     )
     if record_scope == "T-25 chart records":
         _tab_records_achievements_t25()
