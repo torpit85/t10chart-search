@@ -2,6 +2,10 @@
 from __future__ import annotations
 
 import os
+# Best-effort fallback. The included .streamlit/config.toml is the reliable
+# per-project fix because Streamlit reads runner.magicEnabled before executing
+# the main app file.
+os.environ.setdefault("STREAMLIT_RUNNER_MAGIC_ENABLED", "false")
 import sqlite3
 import math
 import io
@@ -18,15 +22,6 @@ import altair as alt
 
 import streamlit as st
 import matplotlib.pyplot as plt
-
-# Belt-and-suspenders: the app uses explicit Streamlit calls everywhere, so
-# disable Streamlit magic when possible to prevent DeltaGenerator objects from
-# being echoed inside active containers.
-try:
-    from streamlit import config as _st_config
-    _st_config.set_option("runner.magicEnabled", False)
-except Exception:
-    pass
 
 from charts import chart_top_gross_weeks
 
@@ -10993,7 +10988,7 @@ def main():
 
 
 if __name__ == "__main__":
-    # Avoid Streamlit magic rendering the DeltaGenerator return values from app
-    # calls. Running main() through exec keeps the launcher call itself from
-    # becoming a displayable expression in the active tab/expander.
+    # runner.magicEnabled is pinned off in .streamlit/config.toml.
+    # exec() also keeps the launcher call from being parsed as a magic expression
+    # if someone runs this file outside the project folder by mistake.
     exec("main()", globals(), globals());
