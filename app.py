@@ -19,6 +19,15 @@ import altair as alt
 import streamlit as st
 import matplotlib.pyplot as plt
 
+# Belt-and-suspenders: the app uses explicit Streamlit calls everywhere, so
+# disable Streamlit magic when possible to prevent DeltaGenerator objects from
+# being echoed inside active containers.
+try:
+    from streamlit import config as _st_config
+    _st_config.set_option("runner.magicEnabled", False)
+except Exception:
+    pass
+
 from charts import chart_top_gross_weeks
 
 
@@ -9185,6 +9194,882 @@ def _hof_holiday_champions_from_winners(winners: pd.DataFrame) -> pd.DataFrame:
     return champs
 
 
+# ----------------------------
+# Hall of Fame — Official Monthly T-25 integration helpers
+# ----------------------------
+HOF_T25_INDUCT_MIN_MONTHS = 3
+HOF_T25_POINTS_MULTIPLIER = 15.0
+
+_HOF_BADGE_ORDER_T25_SHOW = [
+    "Year-End Monarch",
+    "Official #1 Legend",
+    "Monthly Mainstay",
+    "Top 10 Monthly Ironman",
+    "T-25 Hall Anchor",
+    "Monthly Peak Monster",
+    "Official Gatekeeper",
+    "Monthly Comeback",
+]
+
+_HOF_BADGE_ORDER_T25_COMPANY = [
+    "Monthly Points Empire",
+    "Monthly #1 Machine",
+    "Official Hit Factory",
+    "Official Dynasty Year",
+    "Deep Monthly Bench",
+    "Monthly Era Staple",
+]
+
+
+def _hof_t25_inverse_points(rank: float | int | None) -> float:
+    """Official Monthly T-25 inverse points: #1=25, #2=24, ... #25=1."""
+    if rank is None or pd.isna(rank):
+        return 0.0
+    try:
+        r = int(rank)
+    except Exception:
+        return 0.0
+    return float(max(0, 26 - r))
+
+
+@st.cache_data(show_spinner=False)
+def _load_hof_t25_base(db_path: str, db_mtime: float) -> pd.DataFrame:
+    """Load official Monthly T-25 rows for Hall of Fame calculations.
+
+    This intentionally computes inverse points from rank so imported official rows and
+    generated Feb 2025+ SMPS rows live on the same scoring scale.
+    """
+    con = sqlite3.connect(db_path)
+    try:
+        cols = {str(r[1]) for r in con.execute("PRAGMA table_info(official_t25_entry)").fetchall()}
+        if not cols:
+            return pd.DataFrame()
+
+        def col(name: str, fallback: str = "NULL") -> str:
+            return f"e.{name}" if name in cols else fallback
+
+        month_expr = (
+            "COALESCE(NULLIF(e.month_key, ''), NULLIF(e.month, ''))"
+            if "month_key" in cols and "month" in cols
+            else ("NULLIF(e.month_key, '')" if "month_key" in cols else "NULLIF(e.month, '')")
+        )
+
+        title_parts = []
+        for name in ("canonical_title", "show_title", "raw_title"):
+            if name in cols:
+                title_parts.append(f"NULLIF(TRIM(e.{name}), '')")
+        title_expr = (
+            "COALESCE(NULLIF(TRIM(s.canonical_title), ''), " + ", ".join(title_parts) + ", '(Unknown)')"
+            if title_parts
+            else "COALESCE(NULLIF(TRIM(s.canonical_title), ''), '(Unknown)')"
+        )
+
+        rank_expr = col("rank", col("position", "NULL"))
+        row_pos_expr = col("row_pos", col("position", rank_expr))
+        source_expr = col("month_source", "'Official'")
+        source_file_expr = col("source_file", "''")
+
+        imp1_expr = (
+            "COALESCE(NULLIF(TRIM(e.imprint_1), ''), lm.imprint_1, '')"
+            if "imprint_1" in cols else "COALESCE(lm.imprint_1, '')"
+        )
+        imp2_expr = (
+            "COALESCE(NULLIF(TRIM(e.imprint_2), ''), lm.imprint_2, '')"
+            if "imprint_2" in cols else "COALESCE(lm.imprint_2, '')"
+        )
+
+        sql = f"""
+        WITH latest_meta AS (
+          SELECT show_id, imprint_1, imprint_2
+          FROM (
+            SELECT
+              te.show_id,
+              COALESCE(NULLIF(TRIM(te.imprint_1), ''), '') AS imprint_1,
+              COALESCE(NULLIF(TRIM(te.imprint_2), ''), '') AS imprint_2,
+              ROW_NUMBER() OVER (
+                PARTITION BY te.show_id
+                ORDER BY date(te.week_ending) DESC, te.id DESC
+              ) AS rn
+            FROM t10_entry te
+            WHERE te.show_id IS NOT NULL
+          )
+          WHERE rn = 1
+        )
+        SELECT
+          {month_expr} AS month,
+          CAST(substr({month_expr}, 1, 4) AS INTEGER) AS year,
+          CAST(substr({month_expr}, 6, 2) AS INTEGER) AS month_num,
+          {rank_expr} AS rank,
+          {row_pos_expr} AS row_pos,
+          e.show_id,
+          {title_expr} AS canonical_title,
+          {imp1_expr} AS imprint_1,
+          {imp2_expr} AS imprint_2,
+          {source_expr} AS month_source,
+          {source_file_expr} AS source_file
+        FROM official_t25_entry e
+        LEFT JOIN show s ON s.show_id = e.show_id
+        LEFT JOIN latest_meta lm ON lm.show_id = e.show_id
+        WHERE {month_expr} IS NOT NULL
+          AND {rank_expr} IS NOT NULL
+          AND e.show_id IS NOT NULL
+        ORDER BY month ASC, row_pos ASC, rank ASC
+        """
+        df = pd.read_sql_query(sql, con)
+    finally:
+        con.close()
+
+    if df.empty:
+        return df
+
+    df["month"] = df["month"].astype(str)
+    df["year"] = pd.to_numeric(df["year"], errors="coerce").astype("Int64")
+    df["month_num"] = pd.to_numeric(df["month_num"], errors="coerce").astype("Int64")
+    df["rank"] = pd.to_numeric(df["rank"], errors="coerce")
+    df["row_pos"] = pd.to_numeric(df["row_pos"], errors="coerce")
+    df["show_id"] = pd.to_numeric(df["show_id"], errors="coerce").astype("Int64")
+    df["canonical_title"] = df["canonical_title"].astype("string").fillna("(Unknown)").astype(str)
+    df["imprint_1"] = df["imprint_1"].fillna("").astype("string")
+    df["imprint_2"] = df["imprint_2"].fillna("").astype("string")
+    df = df.dropna(subset=["month", "rank", "show_id", "year", "month_num"]).copy()
+
+    df["month_ord"] = (df["year"].astype("int64") * 12) + (df["month_num"].astype("int64") - 1)
+    df["inverse_points"] = df["rank"].apply(_hof_t25_inverse_points)
+    df["is_no1"] = df["rank"].eq(1)
+    df["is_top5"] = df["rank"].le(5)
+    df["is_top10"] = df["rank"].le(10)
+    df["is_t25"] = df["rank"].le(25)
+    return df
+
+
+def _hof_apply_t25_filters(df: pd.DataFrame, date_min: str | None, date_max: str | None, rank_min: int, rank_max: int) -> pd.DataFrame:
+    """Apply Hall of Fame sidebar filters to monthly T-25 rows.
+
+    Date fields are entered as YYYY-MM-DD in the shared HOF sidebar; for official
+    monthly charts, they are interpreted by their YYYY-MM month.
+    """
+    if df is None or df.empty:
+        return pd.DataFrame() if df is None else df.copy()
+    out = df.copy()
+    if date_min:
+        dmin = pd.to_datetime(date_min, errors="coerce")
+        if pd.notna(dmin):
+            out = out[out["month"] >= dmin.strftime("%Y-%m")]
+    if date_max:
+        dmax = pd.to_datetime(date_max, errors="coerce")
+        if pd.notna(dmax):
+            out = out[out["month"] <= dmax.strftime("%Y-%m")]
+    out = out[(pd.to_numeric(out["rank"], errors="coerce") >= int(rank_min)) & (pd.to_numeric(out["rank"], errors="coerce") <= int(rank_max))]
+    return out.copy()
+
+
+def _hof_t25_streak_map(df: pd.DataFrame, mask_col: str = "is_t25") -> dict[int, dict[str, Any]]:
+    if df is None or df.empty or mask_col not in df.columns:
+        return {}
+    sub = df[df[mask_col]].copy()
+    if sub.empty:
+        return {}
+    sub = sub.sort_values(["show_id", "month_ord", "rank", "row_pos"]).drop_duplicates(["show_id", "month_ord"])
+    out: dict[int, dict[str, Any]] = {}
+    for sid, g in sub.groupby("show_id", dropna=False):
+        if pd.isna(sid):
+            continue
+        g = g.sort_values("month_ord")
+        best_len = 0
+        best_start = None
+        best_end = None
+        cur_len = 0
+        cur_start = None
+        prev_ord = None
+        for r in g.itertuples(index=False):
+            mo = int(getattr(r, "month_ord"))
+            month = str(getattr(r, "month"))
+            if prev_ord is None or mo != prev_ord + 1:
+                cur_len = 1
+                cur_start = month
+            else:
+                cur_len += 1
+            if cur_len > best_len:
+                best_len = cur_len
+                best_start = cur_start
+                best_end = month
+            prev_ord = mo
+        out[int(sid)] = {"len": int(best_len), "start": best_start, "end": best_end}
+    return out
+
+
+def _hof_t25_show_year_end_titles(df: pd.DataFrame) -> dict[int, int]:
+    if df is None or df.empty:
+        return {}
+    tmp = df.dropna(subset=["year"]).copy()
+    if tmp.empty:
+        return {}
+    y = (
+        tmp.groupby(["year", "show_id", "canonical_title"], dropna=False)
+        .agg(points=("inverse_points", "sum"), months=("month", "nunique"), peak=("rank", "min"))
+        .reset_index()
+        .sort_values(["year", "points", "months", "peak", "canonical_title"], ascending=[True, False, False, True, True])
+    )
+    champs = y.groupby("year", as_index=False).first()
+    return champs.groupby("show_id")["year"].nunique().astype(int).to_dict()
+
+
+def _hof_t25_company_year_end_titles(df_company: pd.DataFrame) -> dict[str, int]:
+    if df_company is None or df_company.empty:
+        return {}
+    tmp = df_company.dropna(subset=["year"]).copy()
+    if tmp.empty:
+        return {}
+    y = (
+        tmp.groupby(["year", "company"], dropna=False)
+        .agg(points=("inverse_points", "sum"), unique_shows=("show_id", "nunique"), no1_months=("is_no1", "sum"))
+        .reset_index()
+        .sort_values(["year", "points", "unique_shows", "no1_months", "company"], ascending=[True, False, False, False, True])
+    )
+    champs = y.groupby("year", as_index=False).first()
+    return champs.groupby("company")["year"].nunique().astype(int).to_dict()
+
+
+def _hof_agg_t25_shows(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame()
+    sub = df[df["is_t25"]].copy()
+    if sub.empty:
+        return pd.DataFrame()
+
+    g = sub.groupby(["show_id", "canonical_title"], dropna=False)
+    out = g.agg(
+        t25_months=("month", "nunique"),
+        t25_months_at_1=("is_no1", lambda s: int(pd.to_numeric(s, errors="coerce").fillna(0).sum())),
+        t25_top5_months=("is_top5", lambda s: int(pd.to_numeric(s, errors="coerce").fillna(0).sum())),
+        t25_top10_months=("is_top10", lambda s: int(pd.to_numeric(s, errors="coerce").fillna(0).sum())),
+        t25_inverse_points=("inverse_points", lambda s: float(pd.to_numeric(s, errors="coerce").fillna(0).sum())),
+        t25_peak_rank=("rank", lambda s: int(pd.to_numeric(s, errors="coerce").min())),
+        t25_avg_rank=("rank", lambda s: float(pd.to_numeric(s, errors="coerce").mean())),
+        t25_median_rank=("rank", lambda s: float(pd.to_numeric(s, errors="coerce").median())),
+        first_month=("month", "min"),
+        last_month=("month", "max"),
+        t25_years=("year", "nunique"),
+    ).reset_index()
+
+    streak_t25 = _hof_t25_streak_map(sub, "is_t25")
+    streak_top10 = _hof_t25_streak_map(sub, "is_top10")
+    out["longest_t25_run"] = out["show_id"].map(lambda sid: streak_t25.get(int(sid), {}).get("len", 0)).astype(int)
+    out["longest_top10_run"] = out["show_id"].map(lambda sid: streak_top10.get(int(sid), {}).get("len", 0)).astype(int)
+    out["longest_t25_run_span"] = out["show_id"].map(lambda sid: _hof_t25_span_text(streak_t25.get(int(sid), {})))
+    out["longest_top10_run_span"] = out["show_id"].map(lambda sid: _hof_t25_span_text(streak_top10.get(int(sid), {})))
+
+    ytitles = _hof_t25_show_year_end_titles(sub)
+    out["official_year_end_titles"] = out["show_id"].map(lambda sid: int(ytitles.get(int(sid), 0))).astype(int)
+    out["official_t25_hof_score"] = (
+        out["t25_inverse_points"]
+        + out["t25_months_at_1"] * 25.0
+        + out["t25_top5_months"] * 5.0
+        + out["t25_top10_months"] * 2.0
+        + out["official_year_end_titles"] * 100.0
+    )
+    return out
+
+
+def _hof_t25_span_text(streak: dict[str, Any]) -> str:
+    if not streak:
+        return ""
+    start = streak.get("start")
+    end = streak.get("end")
+    if not start:
+        return ""
+    return str(start) if start == end else f"{start} → {end}"
+
+
+def _hof_agg_t25_companies(df_company: pd.DataFrame) -> pd.DataFrame:
+    if df_company is None or df_company.empty:
+        return pd.DataFrame()
+    sub = df_company[df_company.get("is_t25", False)].copy()
+    if sub.empty:
+        return pd.DataFrame()
+    g = sub.groupby("company", dropna=False)
+    out = g.agg(
+        entries=("month", "count"),
+        t25_months=("month", "nunique"),
+        unique_t25_shows=("show_id", "nunique"),
+        t25_months_at_1_sum=("is_no1", lambda s: int(pd.to_numeric(s, errors="coerce").fillna(0).sum())),
+        t25_top10_months_sum=("is_top10", lambda s: int(pd.to_numeric(s, errors="coerce").fillna(0).sum())),
+        t25_inverse_points=("inverse_points", lambda s: float(pd.to_numeric(s, errors="coerce").fillna(0).sum())),
+        first_month=("month", "min"),
+        last_month=("month", "max"),
+        t25_years=("year", "nunique"),
+    ).reset_index()
+    ytitles = _hof_t25_company_year_end_titles(sub)
+    out["official_year_end_titles"] = out["company"].map(lambda c: int(ytitles.get(str(c), 0))).astype(int)
+    out["official_t25_hof_score"] = (
+        out["t25_inverse_points"]
+        + out["t25_months_at_1_sum"] * 20.0
+        + out["t25_top10_months_sum"] * 2.0
+        + out["unique_t25_shows"] * 10.0
+        + out["official_year_end_titles"] * 100.0
+    )
+    return out
+
+
+def _hof_badge_pack_t25_show(row: dict[str, Any], flags: dict[str, bool]) -> list[tuple[str, str, str]]:
+    badges: list[tuple[str, str, str]] = []
+    months = float(row.get("t25_months", 0) or 0)
+    no1 = float(row.get("t25_months_at_1", 0) or 0)
+    top10 = float(row.get("t25_top10_months", 0) or 0)
+    points = float(row.get("t25_inverse_points", 0) or 0)
+    peak = int(row.get("t25_peak_rank", 999) or 999)
+    ytitles = float(row.get("official_year_end_titles", 0) or 0)
+
+    if ytitles >= 1:
+        badges.append(("🏆", "Year-End Monarch", f"Official Year-End titles: {int(ytitles)}"))
+    if no1 >= 6:
+        badges.append(("👑", "Official #1 Legend", f"Official T-25 months at #1: {int(no1)}"))
+    if months >= 24:
+        badges.append(("🗓️", "Monthly Mainstay", f"Official T-25 months: {int(months)}"))
+    if top10 >= 18:
+        badges.append(("🧱", "Top 10 Monthly Ironman", f"Official Top 10 months: {int(top10)}"))
+    if points >= 100:
+        badges.append(("🏛️", "T-25 Hall Anchor", f"Official inverse points: {points:,.0f}"))
+    if peak == 1 and months >= 12:
+        badges.append(("⚡", "Monthly Peak Monster", f"Peak #1 with {int(months)} months charting"))
+    if flags.get("gatekeeper", False):
+        badges.append(("🚪", "Official Gatekeeper", "Huge official Top 10 presence without reaching #1."))
+    if flags.get("comeback", False):
+        badges.append(("🔁", "Monthly Comeback", "Returned to the official T-25 after a long monthly gap."))
+    return badges
+
+
+def _hof_badge_pack_t25_company(row: dict[str, Any], flags: dict[str, bool]) -> list[tuple[str, str, str]]:
+    badges: list[tuple[str, str, str]] = []
+    points = float(row.get("t25_inverse_points", 0) or 0)
+    no1 = float(row.get("t25_months_at_1_sum", 0) or 0)
+    uniq = float(row.get("unique_t25_shows", 0) or 0)
+    years = float(row.get("t25_years", 0) or 0)
+    ytitles = float(row.get("official_year_end_titles", 0) or 0)
+
+    if points >= 1000:
+        badges.append(("📊", "Monthly Points Empire", f"Official inverse points: {points:,.0f}"))
+    if no1 >= 25:
+        badges.append(("🥇", "Monthly #1 Machine", f"Combined official #1 months: {int(no1)}"))
+    if uniq >= 20:
+        badges.append(("🏢", "Official Hit Factory", f"Unique official T-25 shows: {int(uniq)}"))
+    if ytitles >= 1 or flags.get("dynasty_year", False):
+        badges.append(("🏰", "Official Dynasty Year", f"Official company Year-End titles: {int(ytitles)}"))
+    if flags.get("deep_bench", False):
+        badges.append(("🧠", "Deep Monthly Bench", "Had a year with at least eight official T-25 shows."))
+    if years >= 10:
+        badges.append(("🗓️", "Monthly Era Staple", f"Official T-25 years: {int(years)}"))
+    return badges
+
+
+def _hof_t25_wing_gatekeepers(agg: pd.DataFrame) -> pd.DataFrame:
+    if agg is None or agg.empty:
+        return pd.DataFrame()
+    out = agg[(agg["t25_top10_months"] >= 20) & (agg["t25_months_at_1"] == 0) & (agg["t25_peak_rank"].isin([2, 3]))].copy()
+    if out.empty:
+        return out
+    out["gatekeeper"] = True
+    return out.sort_values(["t25_top10_months", "t25_months", "t25_inverse_points"], ascending=False)
+
+
+def _hof_t25_wing_comeback_kids(df: pd.DataFrame, gap_months: int = 6, min_runs: int = 2) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame()
+    sub = df[df["is_t25"]].sort_values(["show_id", "month_ord"]).drop_duplicates(["show_id", "month_ord"]).copy()
+    rows: list[dict[str, Any]] = []
+    for (sid, title), g in sub.groupby(["show_id", "canonical_title"], dropna=False):
+        g = g.sort_values("month_ord")
+        gaps = pd.to_numeric(g["month_ord"], errors="coerce").diff().fillna(1)
+        new_run = (gaps >= float(gap_months)).astype(int)
+        runs = int(new_run.cumsum().nunique())
+        max_gap = float(gaps.max()) if len(gaps) else 0.0
+        if runs >= min_runs and max_gap >= float(gap_months):
+            rows.append({
+                "show_id": sid,
+                "canonical_title": title,
+                "runs": runs,
+                "max_gap_months": int(max_gap),
+                "t25_months": int(g["month"].nunique()),
+                "first_month": str(g["month"].min()),
+                "last_month": str(g["month"].max()),
+                "comeback": True,
+            })
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return out
+    return out.sort_values(["max_gap_months", "runs", "t25_months"], ascending=False)
+
+
+def _hof_t25_company_deep_bench_flags(df_company: pd.DataFrame) -> dict[str, bool]:
+    if df_company is None or df_company.empty:
+        return {}
+    sub = df_company[df_company.get("is_t25", False)].dropna(subset=["year"]).copy()
+    if sub.empty:
+        return {}
+    cnt = sub.groupby(["company", "year"])["show_id"].nunique().reset_index(name="unique_shows")
+    best = cnt.groupby("company")["unique_shows"].max()
+    return {str(c): bool(v >= HOF_DEEP_BENCH_MIN_SHOWS) for c, v in best.items()}
+
+
+def _hof_t25_year_champion_streaks(df: pd.DataFrame, entity: str = "show") -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame()
+    if entity == "company":
+        base = _hof_company_universe(df)
+        grp = ["year", "company"]
+        label = "company"
+    else:
+        base = df
+        grp = ["year", "canonical_title"]
+        label = "canonical_title"
+    base = base.dropna(subset=["year"]).copy()
+    if base.empty:
+        return pd.DataFrame()
+    y = (
+        base.groupby(grp, dropna=False)
+        .agg(points=("inverse_points", "sum"), no1_months=("is_no1", "sum"))
+        .reset_index()
+        .sort_values(["year", "points", "no1_months", label], ascending=[True, False, False, True])
+    )
+    champs = y.groupby("year", as_index=False).first().sort_values("year")
+    if champs.empty:
+        return pd.DataFrame()
+    champs["prev_year"] = champs["year"].shift(1)
+    champs["prev_label"] = champs[label].shift(1)
+    champs["new_streak"] = (champs["year"] != (champs["prev_year"] + 1)) | (champs[label] != champs["prev_label"])
+    champs["streak_id"] = champs["new_streak"].cumsum()
+    out = (
+        champs.groupby(["streak_id", label], dropna=False)
+        .agg(start_year=("year", "min"), end_year=("year", "max"), years=("year", "count"))
+        .reset_index(drop=False)
+        .drop(columns=["streak_id"])
+        .sort_values(["years", "start_year", label], ascending=[False, True, True])
+    )
+    return out[out["years"] >= 2].copy()
+
+
+def _hof_weekly_show_score(df: pd.DataFrame) -> pd.Series:
+    if df is None or df.empty:
+        return pd.Series(dtype=float)
+    return (
+        pd.to_numeric(df.get("total_ye_points"), errors="coerce").fillna(0)
+        + pd.to_numeric(df.get("weeks_at_1"), errors="coerce").fillna(0) * 50.0
+        + pd.to_numeric(df.get("top10_weeks"), errors="coerce").fillna(0) * 5.0
+        + pd.to_numeric(df.get("total_gross_millions"), errors="coerce").fillna(0) * 0.10
+    )
+
+
+def _hof_weekly_company_score(df: pd.DataFrame) -> pd.Series:
+    if df is None or df.empty:
+        return pd.Series(dtype=float)
+    return (
+        pd.to_numeric(df.get("total_ye_points"), errors="coerce").fillna(0)
+        + pd.to_numeric(df.get("weeks_at_1_sum"), errors="coerce").fillna(0) * 25.0
+        + pd.to_numeric(df.get("unique_shows_charted"), errors="coerce").fillna(0) * 30.0
+        + pd.to_numeric(df.get("total_gross_millions"), errors="coerce").fillna(0) * 0.05
+    )
+
+
+def _hof_hybrid_show_table(weekly: pd.DataFrame, t25: pd.DataFrame) -> pd.DataFrame:
+    w = weekly.copy() if weekly is not None else pd.DataFrame()
+    t = t25.copy() if t25 is not None else pd.DataFrame()
+    if not w.empty:
+        w["weekly_hof_score"] = _hof_weekly_show_score(w)
+    if not t.empty:
+        if "official_t25_hof_score" not in t.columns:
+            t["official_t25_hof_score"] = 0.0
+        t["t25_equivalent_points"] = pd.to_numeric(t.get("t25_inverse_points"), errors="coerce").fillna(0) * HOF_T25_POINTS_MULTIPLIER
+    if w.empty:
+        out = t.copy()
+        out["weekly_hof_score"] = 0.0
+        out["t25_equivalent_points"] = pd.to_numeric(out.get("t25_inverse_points"), errors="coerce").fillna(0) * HOF_T25_POINTS_MULTIPLIER
+    elif t.empty:
+        out = w.copy()
+        out["official_t25_hof_score"] = 0.0
+        out["t25_equivalent_points"] = 0.0
+    else:
+        out = w.merge(t, on="show_id", how="outer", suffixes=("_weekly", "_t25"))
+        out["canonical_title"] = out.get("canonical_title_weekly").fillna(out.get("canonical_title_t25"))
+    if "canonical_title" not in out.columns:
+        out["canonical_title"] = out.get("canonical_title_weekly", out.get("canonical_title_t25", "(Unknown)"))
+    for col in [
+        "weekly_hof_score", "official_t25_hof_score", "t25_equivalent_points", "t25_inverse_points", "t25_months_at_1",
+        "official_year_end_titles", "total_ye_points", "weeks_at_1", "weeks_charting", "total_gross_millions", "t25_months", "t25_top10_months"
+    ]:
+        if col not in out.columns:
+            out[col] = 0
+        out[col] = pd.to_numeric(out[col], errors="coerce").fillna(0)
+    out["hybrid_hof_score"] = (
+        out["weekly_hof_score"]
+        + out["t25_equivalent_points"]
+        + out["t25_months_at_1"] * 100.0
+        + out["official_year_end_titles"] * 250.0
+    )
+    return out
+
+
+def _hof_hybrid_company_table(weekly: pd.DataFrame, t25: pd.DataFrame) -> pd.DataFrame:
+    w = weekly.copy() if weekly is not None else pd.DataFrame()
+    t = t25.copy() if t25 is not None else pd.DataFrame()
+    if not w.empty:
+        w["weekly_hof_score"] = _hof_weekly_company_score(w)
+    if not t.empty:
+        if "official_t25_hof_score" not in t.columns:
+            t["official_t25_hof_score"] = 0.0
+        t["t25_equivalent_points"] = pd.to_numeric(t.get("t25_inverse_points"), errors="coerce").fillna(0) * HOF_T25_POINTS_MULTIPLIER
+    if w.empty:
+        out = t.copy()
+        out["weekly_hof_score"] = 0.0
+    elif t.empty:
+        out = w.copy()
+        out["official_t25_hof_score"] = 0.0
+        out["t25_equivalent_points"] = 0.0
+    else:
+        out = w.merge(t, on="company", how="outer", suffixes=("_weekly", "_t25"))
+    for col in [
+        "weekly_hof_score", "official_t25_hof_score", "t25_equivalent_points", "t25_inverse_points", "t25_months_at_1_sum",
+        "official_year_end_titles", "unique_t25_shows", "total_ye_points", "weeks_at_1_sum", "unique_shows_charted", "total_gross_millions"
+    ]:
+        if col not in out.columns:
+            out[col] = 0
+        out[col] = pd.to_numeric(out[col], errors="coerce").fillna(0)
+    out["hybrid_hof_score"] = (
+        out["weekly_hof_score"]
+        + out["t25_equivalent_points"]
+        + out["t25_months_at_1_sum"] * 75.0
+        + out["official_year_end_titles"] * 250.0
+        + out["unique_t25_shows"] * 20.0
+    )
+    return out
+
+
+def _render_hof_t25_sections(
+    hof_section: str,
+    t25_base: pd.DataFrame,
+    t25_filt: pd.DataFrame,
+    top_n: int,
+    badge_scope: str,
+) -> None:
+    st.caption("Official Monthly T-25 Hall of Fame mode uses rank-normalized inverse points (#1 = 25 … #25 = 1).")
+    if t25_filt is None or t25_filt.empty:
+        st.info("No official Monthly T-25 rows match your current filters.")
+        return
+
+    t25_agg_life = _hof_agg_t25_shows(t25_base)
+    t25_agg_cur = _hof_agg_t25_shows(t25_filt)
+    t25_rows_life = _hof_company_universe(t25_base)
+    t25_rows_cur = _hof_company_universe(t25_filt)
+    t25_comp_life = _hof_agg_t25_companies(t25_rows_life)
+    t25_comp_cur = _hof_agg_t25_companies(t25_rows_cur)
+
+    agg_for_badges = t25_agg_life if badge_scope == "Lifetime" else t25_agg_cur
+    comp_for_badges = t25_comp_life if badge_scope == "Lifetime" else t25_comp_cur
+    gate = _hof_t25_wing_gatekeepers(t25_agg_cur)
+    comeback = _hof_t25_wing_comeback_kids(t25_filt)
+    gate_ids = set(gate["show_id"].dropna().astype(int).tolist()) if gate is not None and not gate.empty else set()
+    comeback_ids = set(comeback["show_id"].dropna().astype(int).tolist()) if comeback is not None and not comeback.empty else set()
+    deep_flags = _hof_t25_company_deep_bench_flags(t25_rows_cur if badge_scope == "Current filters" else t25_rows_life)
+    dyn_flags = _hof_t25_company_year_end_titles(t25_rows_cur if badge_scope == "Current filters" else t25_rows_life)
+
+    if hof_section == "Inductees":
+        st.markdown("### Official T-25 Inductees")
+        mode = st.radio("Inductees type", ["Shows", "Companies"], horizontal=True, index=0, key="hof_t25_ind_type")
+        if mode == "Shows":
+            a = t25_agg_cur.copy()
+            if a.empty:
+                st.info("No official T-25 shows match your current filters.")
+                return
+            a = a[a["t25_months"] >= HOF_T25_INDUCT_MIN_MONTHS].copy()
+            badges = []
+            for _, r in a.iterrows():
+                sid = int(r["show_id"])
+                ref = agg_for_badges[agg_for_badges["show_id"] == sid]
+                rr = ref.iloc[0].to_dict() if not ref.empty else r.to_dict()
+                btxt, _ = _hof_pick_badges_for_table(
+                    _hof_badge_pack_t25_show(rr, {"gatekeeper": sid in gate_ids, "comeback": sid in comeback_ids}),
+                    _HOF_BADGE_ORDER_T25_SHOW,
+                )
+                badges.append(btxt)
+            a["badges"] = badges
+            cols = [
+                "official_t25_hof_score", "canonical_title", "badges", "t25_inverse_points", "t25_months_at_1",
+                "t25_top10_months", "t25_months", "longest_t25_run", "official_year_end_titles", "t25_peak_rank", "first_month", "last_month"
+            ]
+            st.dataframe(a.sort_values(["official_t25_hof_score", "t25_inverse_points"], ascending=False).head(int(top_n))[cols], width="stretch", hide_index=True)
+        else:
+            c = t25_comp_cur.copy()
+            if c.empty:
+                st.info("No official T-25 companies match your current filters.")
+                return
+            badge_strs = []
+            for _, r in c.iterrows():
+                company = str(r["company"])
+                ref = comp_for_badges[comp_for_badges["company"] == company]
+                rr = ref.iloc[0].to_dict() if not ref.empty else r.to_dict()
+                btxt, _ = _hof_pick_badges_for_table(
+                    _hof_badge_pack_t25_company(rr, {"deep_bench": deep_flags.get(company, False), "dynasty_year": bool(dyn_flags.get(company, 0))}),
+                    _HOF_BADGE_ORDER_T25_COMPANY,
+                )
+                badge_strs.append(btxt)
+            c["badges"] = badge_strs
+            cols = [
+                "official_t25_hof_score", "company", "badges", "t25_inverse_points", "t25_months_at_1_sum",
+                "unique_t25_shows", "t25_top10_months_sum", "official_year_end_titles", "first_month", "last_month"
+            ]
+            st.dataframe(c.sort_values(["official_t25_hof_score", "t25_inverse_points"], ascending=False).head(int(top_n))[cols], width="stretch", hide_index=True)
+
+    if hof_section == "Leaderboards":
+        st.markdown("### Official T-25 Leaderboards")
+        a = t25_agg_cur.copy()
+        c = t25_comp_cur.copy()
+        col1, col2 = st.columns(2)
+        with col1:
+            st.markdown("**Shows — most official inverse points**")
+            st.dataframe(a.sort_values(["t25_inverse_points", "t25_months"], ascending=False).head(int(top_n))[["canonical_title", "t25_inverse_points", "t25_months", "t25_months_at_1", "t25_peak_rank"]], width="stretch", hide_index=True)
+            st.markdown("**Shows — most months at #1**")
+            st.dataframe(a.sort_values(["t25_months_at_1", "t25_inverse_points"], ascending=False).head(int(top_n))[["canonical_title", "t25_months_at_1", "t25_inverse_points", "t25_months"]], width="stretch", hide_index=True)
+            st.markdown("**Shows — longest official T-25 runs**")
+            st.dataframe(a.sort_values(["longest_t25_run", "t25_inverse_points"], ascending=False).head(int(top_n))[["canonical_title", "longest_t25_run", "longest_t25_run_span", "t25_months", "t25_inverse_points"]], width="stretch", hide_index=True)
+        with col2:
+            if c.empty:
+                st.info("No official T-25 company rows found after filtering out unknown/blank imprints.")
+            else:
+                st.markdown("**Companies — most official inverse points**")
+                st.dataframe(c.sort_values(["t25_inverse_points", "unique_t25_shows"], ascending=False).head(int(top_n))[["company", "t25_inverse_points", "unique_t25_shows", "t25_months_at_1_sum"]], width="stretch", hide_index=True)
+                st.markdown("**Companies — most #1 months**")
+                st.dataframe(c.sort_values(["t25_months_at_1_sum", "t25_inverse_points"], ascending=False).head(int(top_n))[["company", "t25_months_at_1_sum", "t25_inverse_points", "unique_t25_shows"]], width="stretch", hide_index=True)
+            st.markdown("**Shows — official Year-End titles**")
+            st.dataframe(a.sort_values(["official_year_end_titles", "t25_inverse_points"], ascending=False).head(int(top_n))[["canonical_title", "official_year_end_titles", "t25_inverse_points", "t25_months"]], width="stretch", hide_index=True)
+
+    if hof_section == "Wings":
+        st.markdown("### Official T-25 Wings")
+        with st.expander("Official Monthly Dynasties", expanded=True):
+            dsh = _hof_t25_year_champion_streaks(t25_filt, entity="show")
+            dco = _hof_t25_year_champion_streaks(t25_filt, entity="company")
+            st.markdown("**Show dynasty streaks**")
+            if dsh.empty:
+                st.info("No multi-year official show champion streaks in this filter range.")
+            else:
+                st.dataframe(dsh.head(int(top_n)), width="stretch", hide_index=True)
+            st.markdown("**Company dynasty streaks**")
+            if dco.empty:
+                st.info("No multi-year official company champion streaks in this filter range.")
+            else:
+                st.dataframe(dco.head(int(top_n)), width="stretch", hide_index=True)
+        with st.expander("Monthly Mainstays", expanded=False):
+            d = t25_agg_cur[t25_agg_cur["t25_months"] >= 24].sort_values(["t25_months", "t25_inverse_points"], ascending=False)
+            st.dataframe(d.head(int(top_n))[["canonical_title", "t25_months", "t25_inverse_points", "first_month", "last_month"]], width="stretch", hide_index=True) if not d.empty else st.info("No monthly mainstays found.")
+        with st.expander("Official Gatekeepers", expanded=False):
+            st.dataframe(gate.head(int(top_n))[["canonical_title", "t25_top10_months", "t25_months", "t25_peak_rank", "t25_inverse_points"]], width="stretch", hide_index=True) if gate is not None and not gate.empty else st.info("No official gatekeepers found.")
+        with st.expander("Monthly Comeback Kids", expanded=False):
+            st.dataframe(comeback.head(int(top_n))[["canonical_title", "runs", "max_gap_months", "t25_months", "first_month", "last_month"]], width="stretch", hide_index=True) if comeback is not None and not comeback.empty else st.info("No official comeback kids found.")
+        with st.expander("Official #1 Legends", expanded=False):
+            d = t25_agg_cur[t25_agg_cur["t25_months_at_1"] >= 1].sort_values(["t25_months_at_1", "t25_inverse_points"], ascending=False)
+            st.dataframe(d.head(int(top_n))[["canonical_title", "t25_months_at_1", "t25_inverse_points", "t25_months", "first_month", "last_month"]], width="stretch", hide_index=True) if not d.empty else st.info("No official #1 shows found.")
+
+    if hof_section == "Profiles":
+        st.markdown("### Official T-25 Profiles")
+        mode = st.radio("Profile type", ["Show", "Company"], horizontal=True, index=0, key="hof_t25_profile_type")
+        if mode == "Show":
+            titles = t25_agg_cur.sort_values("canonical_title")["canonical_title"].tolist()
+            if not titles:
+                st.info("No official T-25 shows match your current filters.")
+                return
+            pick = st.selectbox("Show", titles, key="hof_t25_profile_show")
+            row = t25_agg_cur[t25_agg_cur["canonical_title"] == pick].iloc[0].to_dict()
+            sid = int(row["show_id"])
+            ref = agg_for_badges[agg_for_badges["show_id"] == sid]
+            badge_row = ref.iloc[0].to_dict() if not ref.empty else row
+            badges = _hof_badge_pack_t25_show(badge_row, {"gatekeeper": sid in gate_ids, "comeback": sid in comeback_ids})
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("T-25 months", int(row.get("t25_months", 0)))
+            c2.metric("Months at #1", int(row.get("t25_months_at_1", 0)))
+            c3.metric("Peak", int(row.get("t25_peak_rank", 999)))
+            c4.metric("Inverse points", f"{float(row.get('t25_inverse_points', 0)):,.0f}")
+            st.write({
+                "Top 10 months": int(row.get("t25_top10_months", 0)),
+                "Top 5 months": int(row.get("t25_top5_months", 0)),
+                "Longest T-25 run": int(row.get("longest_t25_run", 0)),
+                "Official Year-End titles": int(row.get("official_year_end_titles", 0)),
+                "First month": row.get("first_month"),
+                "Last month": row.get("last_month"),
+            })
+            st.markdown("#### Official T-25 badges")
+            if badges:
+                for emo, lbl, how in sorted(badges, key=lambda t: _HOF_BADGE_ORDER_T25_SHOW.index(t[1]) if t[1] in _HOF_BADGE_ORDER_T25_SHOW else 999):
+                    st.write(f"{emo} **{lbl}** — {how}")
+            else:
+                st.caption("No official T-25 badges earned under this scope.")
+            with st.expander("Official monthly rows (current filters)", expanded=False):
+                led = t25_filt[t25_filt["show_id"].astype("Int64") == sid].sort_values("month", ascending=False)
+                st.dataframe(led[["month", "rank", "inverse_points", "month_source", "source_file", "imprint_1", "imprint_2"]], width="stretch", hide_index=True)
+        else:
+            comps = t25_comp_cur.sort_values("company")["company"].tolist()
+            if not comps:
+                st.info("No official T-25 companies match your current filters.")
+                return
+            pick = st.selectbox("Company", comps, key="hof_t25_profile_company")
+            row = t25_comp_cur[t25_comp_cur["company"] == pick].iloc[0].to_dict()
+            ref = comp_for_badges[comp_for_badges["company"] == pick]
+            badge_row = ref.iloc[0].to_dict() if not ref.empty else row
+            badges = _hof_badge_pack_t25_company(badge_row, {"deep_bench": deep_flags.get(pick, False), "dynasty_year": bool(dyn_flags.get(pick, 0))})
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Unique T-25 shows", int(row.get("unique_t25_shows", 0)))
+            c2.metric("#1 months", int(row.get("t25_months_at_1_sum", 0)))
+            c3.metric("Inverse points", f"{float(row.get('t25_inverse_points', 0)):,.0f}")
+            c4.metric("Year-End titles", int(row.get("official_year_end_titles", 0)))
+            st.write({"Entries": int(row.get("entries", 0)), "Top 10 months": int(row.get("t25_top10_months_sum", 0)), "First month": row.get("first_month"), "Last month": row.get("last_month")})
+            st.markdown("#### Official T-25 badges")
+            if badges:
+                for emo, lbl, how in sorted(badges, key=lambda t: _HOF_BADGE_ORDER_T25_COMPANY.index(t[1]) if t[1] in _HOF_BADGE_ORDER_T25_COMPANY else 999):
+                    st.write(f"{emo} **{lbl}** — {how}")
+            else:
+                st.caption("No official T-25 badges earned under this scope.")
+            with st.expander("Official company rows (current filters)", expanded=False):
+                led = t25_rows_cur[t25_rows_cur["company"] == pick].sort_values("month", ascending=False)
+                st.dataframe(led[["month", "canonical_title", "rank", "inverse_points", "month_source", "source_file"]], width="stretch", hide_index=True)
+
+    if hof_section == "Years & Seasons":
+        st.markdown("### Official T-25 Years & Seasons")
+        tmp = t25_filt.dropna(subset=["year"]).copy()
+        if tmp.empty:
+            st.info("Not enough official T-25 rows in this filter range.")
+            return
+        y = (
+            tmp.groupby(["year", "canonical_title"], dropna=False)
+            .agg(points=("inverse_points", "sum"), months=("month", "nunique"), peak=("rank", "min"))
+            .reset_index()
+            .sort_values(["year", "points", "months", "peak", "canonical_title"], ascending=[True, False, False, True, True])
+        )
+        champs = y.groupby("year", as_index=False).first().rename(columns={"canonical_title": "official_year_champ_show", "points": "champ_points"})
+        st.markdown("**Official Year champs (shows)**")
+        st.dataframe(champs.sort_values("year", ascending=False), width="stretch", hide_index=True)
+        st.divider()
+        yc = _hof_company_universe(tmp)
+        st.markdown("**Official Year champs (companies)**")
+        if yc.empty:
+            st.info("No official T-25 company rows found after filtering out unknown/blank imprints.")
+        else:
+            y2 = (
+                yc.groupby(["year", "company"], dropna=False)
+                .agg(points=("inverse_points", "sum"), unique_shows=("show_id", "nunique"))
+                .reset_index()
+                .sort_values(["year", "points", "unique_shows", "company"], ascending=[True, False, False, True])
+            )
+            champsc = y2.groupby("year", as_index=False).first().rename(columns={"company": "official_year_champ_company", "points": "champ_points"})
+            st.dataframe(champsc.sort_values("year", ascending=False), width="stretch", hide_index=True)
+        st.divider()
+        mo = (
+            tmp.groupby(["month_num", "canonical_title"], dropna=False)["inverse_points"]
+            .sum()
+            .reset_index(name="points")
+            .sort_values(["month_num", "points", "canonical_title"], ascending=[True, False, True])
+            .groupby("month_num", as_index=False)
+            .first()
+        )
+        st.markdown("**Calendar-month bosses (all years combined)**")
+        st.dataframe(mo.rename(columns={"month_num": "calendar_month", "canonical_title": "show"}), width="stretch", hide_index=True)
+
+
+def _render_hof_hybrid_sections(
+    hof_section: str,
+    weekly_agg_cur: pd.DataFrame,
+    comp_agg_cur: pd.DataFrame,
+    t25_base: pd.DataFrame,
+    t25_filt: pd.DataFrame,
+    top_n: int,
+    badge_scope: str,
+) -> None:
+    st.caption("Hybrid mode combines weekly/grossing Hall of Fame score with official Monthly T-25 résumé credit.")
+    if t25_filt is None or t25_filt.empty:
+        st.info("No official Monthly T-25 rows match your filters, so Hybrid mode cannot add the monthly layer.")
+        return
+
+    t25_agg_cur = _hof_agg_t25_shows(t25_filt)
+    t25_comp_cur = _hof_agg_t25_companies(_hof_company_universe(t25_filt))
+    hs = _hof_hybrid_show_table(weekly_agg_cur, t25_agg_cur)
+    hc = _hof_hybrid_company_table(comp_agg_cur, t25_comp_cur)
+
+    if hof_section == "Inductees":
+        st.markdown("### Hybrid Inductees")
+        mode = st.radio("Inductees type", ["Shows", "Companies"], horizontal=True, index=0, key="hof_hybrid_ind_type")
+        if mode == "Shows":
+            cols = ["hybrid_hof_score", "canonical_title", "weekly_hof_score", "t25_equivalent_points", "total_ye_points", "t25_inverse_points", "weeks_at_1", "t25_months_at_1", "weeks_charting", "t25_months"]
+            st.dataframe(hs.sort_values(["hybrid_hof_score", "weekly_hof_score"], ascending=False).head(int(top_n))[cols], width="stretch", hide_index=True)
+        else:
+            cols = ["hybrid_hof_score", "company", "weekly_hof_score", "t25_equivalent_points", "total_ye_points", "t25_inverse_points", "weeks_at_1_sum", "t25_months_at_1_sum", "unique_shows_charted", "unique_t25_shows"]
+            st.dataframe(hc.sort_values(["hybrid_hof_score", "weekly_hof_score"], ascending=False).head(int(top_n))[cols], width="stretch", hide_index=True)
+
+    if hof_section == "Leaderboards":
+        st.markdown("### Hybrid Leaderboards")
+        col1, col2 = st.columns(2)
+        with col1:
+            st.markdown("**Shows — strongest hybrid score**")
+            st.dataframe(hs.sort_values(["hybrid_hof_score"], ascending=False).head(int(top_n))[["canonical_title", "hybrid_hof_score", "weekly_hof_score", "t25_equivalent_points", "t25_inverse_points"]], width="stretch", hide_index=True)
+            st.markdown("**Shows — biggest Official T-25 boost**")
+            st.dataframe(hs.sort_values(["t25_equivalent_points", "t25_inverse_points"], ascending=False).head(int(top_n))[["canonical_title", "t25_equivalent_points", "t25_inverse_points", "t25_months", "t25_months_at_1"]], width="stretch", hide_index=True)
+        with col2:
+            st.markdown("**Companies — strongest hybrid score**")
+            st.dataframe(hc.sort_values(["hybrid_hof_score"], ascending=False).head(int(top_n))[["company", "hybrid_hof_score", "weekly_hof_score", "t25_equivalent_points", "t25_inverse_points"]], width="stretch", hide_index=True)
+            st.markdown("**Companies — biggest Official T-25 boost**")
+            st.dataframe(hc.sort_values(["t25_equivalent_points", "t25_inverse_points"], ascending=False).head(int(top_n))[["company", "t25_equivalent_points", "t25_inverse_points", "unique_t25_shows", "t25_months_at_1_sum"]], width="stretch", hide_index=True)
+
+    if hof_section == "Profiles":
+        st.markdown("### Hybrid Profiles")
+        mode = st.radio("Profile type", ["Show", "Company"], horizontal=True, index=0, key="hof_hybrid_profile_type")
+        if mode == "Show":
+            titles = hs.sort_values("canonical_title")["canonical_title"].dropna().astype(str).tolist()
+            if not titles:
+                st.info("No shows match your current filters.")
+                return
+            pick = st.selectbox("Show", titles, key="hof_hybrid_profile_show")
+            row = hs[hs["canonical_title"].astype(str) == pick].iloc[0].to_dict()
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Hybrid score", f"{float(row.get('hybrid_hof_score', 0)):,.0f}")
+            c2.metric("Weekly score", f"{float(row.get('weekly_hof_score', 0)):,.0f}")
+            c3.metric("T-25 equiv", f"{float(row.get('t25_equivalent_points', 0)):,.0f}")
+            c4.metric("T-25 pts", f"{float(row.get('t25_inverse_points', 0)):,.0f}")
+            st.write({
+                "Weekly weeks charting": int(row.get("weeks_charting", 0)),
+                "Weekly weeks at #1": int(row.get("weeks_at_1", 0)),
+                "Official T-25 months": int(row.get("t25_months", 0)),
+                "Official T-25 months at #1": int(row.get("t25_months_at_1", 0)),
+                "Official Year-End titles": int(row.get("official_year_end_titles", 0)),
+            })
+        else:
+            comps = hc.sort_values("company")["company"].dropna().astype(str).tolist()
+            if not comps:
+                st.info("No companies match your current filters.")
+                return
+            pick = st.selectbox("Company", comps, key="hof_hybrid_profile_company")
+            row = hc[hc["company"].astype(str) == pick].iloc[0].to_dict()
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Hybrid score", f"{float(row.get('hybrid_hof_score', 0)):,.0f}")
+            c2.metric("Weekly score", f"{float(row.get('weekly_hof_score', 0)):,.0f}")
+            c3.metric("T-25 equiv", f"{float(row.get('t25_equivalent_points', 0)):,.0f}")
+            c4.metric("T-25 pts", f"{float(row.get('t25_inverse_points', 0)):,.0f}")
+            st.write({
+                "Weekly unique shows": int(row.get("unique_shows_charted", 0)),
+                "Official unique T-25 shows": int(row.get("unique_t25_shows", 0)),
+                "Weekly #1 weeks sum": int(row.get("weeks_at_1_sum", 0)),
+                "Official #1 months sum": int(row.get("t25_months_at_1_sum", 0)),
+                "Official company Year-End titles": int(row.get("official_year_end_titles", 0)),
+            })
+
+    if hof_section == "Wings":
+        st.markdown("### Hybrid Wings")
+        st.info("Hybrid mode uses the weekly/grossing wings plus the Official T-25 wings. Switch to Weekly or Official mode for the full dedicated exhibit list.")
+        st.markdown("**Strongest hybrid shows**")
+        st.dataframe(hs.sort_values("hybrid_hof_score", ascending=False).head(int(top_n))[["canonical_title", "hybrid_hof_score", "weekly_hof_score", "t25_equivalent_points"]], width="stretch", hide_index=True)
+        st.markdown("**Strongest hybrid companies**")
+        st.dataframe(hc.sort_values("hybrid_hof_score", ascending=False).head(int(top_n))[["company", "hybrid_hof_score", "weekly_hof_score", "t25_equivalent_points"]], width="stretch", hide_index=True)
+
+    if hof_section == "Years & Seasons":
+        st.markdown("### Hybrid Years & Seasons")
+        st.info("For season/year breakdowns, Hybrid mode shows the official monthly year champions. Weekly year champions remain in Weekly mode.")
+        _render_hof_t25_sections("Years & Seasons", t25_base, t25_filt, top_n, badge_scope)
+
+
 def tab_hall_of_fame():
     st.subheader("Hall of Fame")
     st.caption("A narrative-first museum of dominance, longevity, and weird, fun chart lore — powered by your ye_points system.")
@@ -9208,10 +10093,42 @@ def tab_hall_of_fame():
         st.header("Hall of Fame filters")
         date_min = st.text_input("Start date (YYYY-MM-DD)", value="", key="hof_date_min")
         date_max = st.text_input("End date (YYYY-MM-DD)", value="", key="hof_date_max")
-        rank_min, rank_max = st.slider("Rank range (HOF)", 1, 17, (1, 10), key="hof_rank_range")
+        rank_min, rank_max = st.slider("Rank range (HOF / T-25)", 1, 25, (1, 10), key="hof_rank_range")
         top_n = st.slider("Top N (tables)", 10, 300, 50, step=10, key="hof_top_n")
         comeback_gap = st.selectbox("Comeback gap (weeks)", [13, 26], index=0, key="hof_comeback_gap")
         badge_scope = st.radio("Badges scope", ["Lifetime", "Current filters"], index=0, key="hof_badge_scope")
+
+    st.markdown("### Hall of Fame mode")
+    mode_col, section_col = st.columns([1.25, 1.0])
+    with mode_col:
+        hof_source = st.radio(
+            "Hall of Fame source",
+            ["Weekly T-10 / Grossing Era", "Official Monthly T-25", "Hybrid"],
+            index=0,
+            horizontal=True,
+            key="hof_source",
+            help="Weekly keeps the original Hall of Fame; Official uses imported Monthly T-25 rows; Hybrid combines both résumés.",
+        )
+    with section_col:
+        hof_section = st.selectbox(
+            "Hall of Fame section",
+            ["Inductees", "Leaderboards", "Wings", "Profiles", "Years & Seasons"],
+            index=0,
+            key="hof_section",
+        )
+
+    if hof_source == "Weekly T-10 / Grossing Era":
+        st.caption("Weekly mode is the original Hall of Fame view, based on T-10 weekly rows, gross, and ye_points.")
+    elif hof_source == "Official Monthly T-25":
+        st.caption("Official Monthly T-25 mode uses imported official monthly chart rows and inverse points (#1 = 25 … #25 = 1).")
+    else:
+        st.caption("Hybrid mode combines the original weekly/grossing résumé with the imported Official Monthly T-25 résumé.")
+
+    if hof_source in ("Official Monthly T-25", "Hybrid"):
+        if _official_t25_table_exists(db_path, db_mtime):
+            st.success("Official Monthly T-25 Hall of Fame data source detected.")
+        else:
+            st.warning("Official Monthly T-25 mode is installed, but no official_t25_entry rows were detected in this database.")
 
     hof_load = st.checkbox(
         "Load Hall of Fame results",
@@ -9220,7 +10137,7 @@ def tab_hall_of_fame():
         help="Hall of Fame is one of the heaviest sections in the app. Leave this off on mobile until you want to use it.",
     )
     if not hof_load:
-        st.info("Turn on 'Load Hall of Fame results' when you want to run Hall of Fame calculations.")
+        st.info(f"Turn on 'Load Hall of Fame results' when you want to run the {hof_source} / {hof_section} view.")
         return
 
     df_filt = _hof_apply_filters(
@@ -9269,12 +10186,28 @@ def tab_hall_of_fame():
     agg_for_badges = agg_life if badge_scope == "Lifetime" else agg_cur
     comp_for_badges = comp_agg_life if badge_scope == "Lifetime" else comp_agg_cur
 
-    hof_section = st.selectbox(
-        "Hall of Fame section",
-        ["Inductees", "Leaderboards", "Wings", "Profiles", "Years & Seasons"],
-        index=0,
-        key="hof_section",
-    )
+    # Optional Official Monthly T-25 / Hybrid source layers. These live beside the
+    # original weekly Hall of Fame instead of replacing it.
+    if hof_source in ("Official Monthly T-25", "Hybrid"):
+        if not _official_t25_table_exists(db_path, db_mtime):
+            st.info("No official Monthly T-25 rows found yet. Import official charts and/or generate Feb 2025+ SMPS official rows first.")
+            return
+        t25_base = _load_hof_t25_base(db_path, db_mtime)
+        if t25_base is None or t25_base.empty:
+            st.info("No official Monthly T-25 rows found yet.")
+            return
+        t25_filt = _hof_apply_t25_filters(
+            t25_base,
+            date_min.strip() or None,
+            date_max.strip() or None,
+            int(rank_min),
+            min(int(rank_max), 25),
+        )
+        if hof_source == "Official Monthly T-25":
+            _render_hof_t25_sections(hof_section, t25_base, t25_filt, int(top_n), badge_scope)
+            return
+        _render_hof_hybrid_sections(hof_section, agg_cur, comp_agg_cur, t25_base, t25_filt, int(top_n), badge_scope)
+        return
 
     # -------------------
     # Inductees
@@ -10060,4 +10993,7 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    # Avoid Streamlit magic rendering the DeltaGenerator return values from app
+    # calls. Running main() through exec keeps the launcher call itself from
+    # becoming a displayable expression in the active tab/expander.
+    exec("main()", globals(), globals());
