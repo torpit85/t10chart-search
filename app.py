@@ -1903,7 +1903,7 @@ def _load_official_t25_year_end(db_path: str, db_mtime: float, year: int) -> pd.
                 e.year,
                 e.show_id,
                 s.canonical_title,
-                SUM(e.points) AS year_end_points,
+                SUM(CASE WHEN e.rank BETWEEN 1 AND 25 THEN (26 - e.rank) ELSE 0 END) AS year_end_points,
                 COUNT(*) AS months_on_chart,
                 MIN(e.rank) AS peak_monthly_rank,
                 MIN(e.month) AS first_month,
@@ -2422,18 +2422,398 @@ def tab_monthly_smps_t25():
                 st.success("Backfill complete.")
 
 # ----------------------------
+# ----------------------------
 # New tab: Year-End (SMPS) — Top 35
 # ----------------------------
+@st.cache_data(show_spinner=False)
+def _load_year_end_weekly_base(db_path: str, db_mtime: float) -> pd.DataFrame:
+    """Weekly base rows for year-end charts (includes bonuses where present).
+
+    - Uses t10_entry ranks for all weeks.
+    - Grossing era (>= GROSS_TRACKING_START): uses (base + bonus) as weekly gross.
+    - Pre-grossing era: gross is not required; points come from inverse rank.
+    """
+    con = sqlite3.connect(db_path)
+    try:
+        df = pd.read_sql_query(
+            """
+            WITH bonus AS (
+              SELECT show_id, week_ending, SUM(COALESCE(bonus_millions, 0.0)) AS bonus_millions
+              FROM gross_bonus
+              GROUP BY show_id, week_ending
+            )
+            SELECT
+              date(e.week_ending) AS week_ending,
+              e.show_id AS show_id,
+              s.canonical_title AS canonical_title,
+              COALESCE(NULLIF(TRIM(e.imprint_1), ''), '') AS imprint_1,
+              COALESCE(NULLIF(TRIM(e.imprint_2), ''), '') AS imprint_2,
+              e.rank AS rank,
+              COALESCE(e.gross_millions, 0.0) AS base_gross_millions,
+              COALESCE(b.bonus_millions, 0.0) AS bonus_millions,
+              (COALESCE(e.gross_millions, 0.0) + COALESCE(b.bonus_millions, 0.0)) AS gross_millions
+            FROM t10_entry e
+            JOIN show s ON s.show_id = e.show_id
+            LEFT JOIN bonus b ON b.show_id = e.show_id AND b.week_ending = e.week_ending
+            WHERE e.rank BETWEEN 1 AND 10
+            ORDER BY date(e.week_ending) ASC, e.rank ASC
+            """,
+            con,
+        )
+    finally:
+        con.close()
+
+    if df.empty:
+        return df
+
+    df["week_ending"] = _as_date_str(df["week_ending"])
+    df["week_ending_dt"] = pd.to_datetime(df["week_ending"], errors="coerce")
+    df = df.dropna(subset=["week_ending_dt"]).copy()
+
+    df["rank"] = pd.to_numeric(df["rank"], errors="coerce")
+    df["gross_millions"] = pd.to_numeric(df["gross_millions"], errors="coerce").fillna(0.0)
+    df["year"] = df["week_ending_dt"].dt.year.astype(int)
+
+    pre_mask = df["week_ending_dt"].dt.date < GROSS_TRACKING_START
+
+    top1 = (
+        df.loc[~pre_mask & df["rank"].eq(1)]
+        .groupby("week_ending", as_index=False)["gross_millions"]
+        .max()
+        .rename(columns={"gross_millions": "top1_gross_millions"})
+    )
+    df = df.merge(top1, on="week_ending", how="left")
+    df["top1_gross_millions"] = pd.to_numeric(df["top1_gross_millions"], errors="coerce").fillna(0.0)
+
+    df["week_points"] = 0.0
+
+    # Pre-grossing era: inverse rank points (100, 90, 80, ...)
+    df.loc[pre_mask, "week_points"] = (110.0 - 10.0 * df.loc[pre_mask, "rank"]).clip(lower=0.0, upper=100.0)
+
+    # Grossing era: #1 = 100, others = gross/top1 * 100
+    post_mask = ~pre_mask
+    df.loc[post_mask & df["rank"].eq(1), "week_points"] = 100.0
+
+    other = post_mask & (~df["rank"].eq(1))
+    denom = df.loc[other, "top1_gross_millions"]
+    numer = df.loc[other, "gross_millions"]
+    df.loc[other, "week_points"] = np.where(denom > 0, (numer / denom) * 100.0, 0.0)
+
+    df["week_points"] = (
+        pd.to_numeric(df["week_points"], errors="coerce")
+        .fillna(0.0)
+        .clip(lower=0.0, upper=100.0)
+    )
+    return df
+
+
+def _aggregate_year_end_weekly_points(base: pd.DataFrame, year: int) -> pd.DataFrame:
+    """Aggregate weekly points for one calendar year."""
+    if base is None or base.empty:
+        return pd.DataFrame(
+            columns=[
+                "show_id", "canonical_title", "imprint_1", "imprint_2",
+                "weeks_charted", "best_rank", "total_gross_millions", "points_total",
+            ]
+        )
+
+    base_y = base[base["year"].eq(int(year))].copy()
+    if base_y.empty:
+        return pd.DataFrame(
+            columns=[
+                "show_id", "canonical_title", "imprint_1", "imprint_2",
+                "weeks_charted", "best_rank", "total_gross_millions", "points_total",
+            ]
+        )
+
+    group_cols = ["show_id", "canonical_title", "imprint_1", "imprint_2"]
+    agg = (
+        base_y.groupby(group_cols, as_index=False)
+        .agg(
+            weeks_charted=("week_ending", "nunique"),
+            best_rank=("rank", "min"),
+            total_gross_millions=("gross_millions", "sum"),
+            points_total=("week_points", "sum"),
+        )
+    )
+    agg["points_total"] = pd.to_numeric(agg["points_total"], errors="coerce").fillna(0.0)
+    agg["total_gross_millions"] = pd.to_numeric(agg["total_gross_millions"], errors="coerce").fillna(0.0)
+    return agg
+
+
+def _aggregate_year_end_official_inverse(year_df: pd.DataFrame) -> pd.DataFrame:
+    """Aggregate rank-normalized official Monthly T-25 inverse points for one year."""
+    if year_df is None or year_df.empty:
+        return pd.DataFrame(
+            columns=[
+                "show_id", "canonical_title", "imprint_1", "imprint_2",
+                "months_on_chart", "peak_monthly_rank", "inverse_points",
+            ]
+        )
+
+    out = year_df.copy()
+    out["rank"] = pd.to_numeric(out["rank"], errors="coerce")
+    out = out[out["rank"].between(1, 25)].copy()
+    if out.empty:
+        return pd.DataFrame(
+            columns=[
+                "show_id", "canonical_title", "imprint_1", "imprint_2",
+                "months_on_chart", "peak_monthly_rank", "inverse_points",
+            ]
+        )
+
+    out["inverse_points"] = (26.0 - out["rank"]).clip(lower=1.0, upper=25.0)
+    group_cols = ["show_id", "canonical_title", "imprint_1", "imprint_2"]
+    agg = (
+        out.groupby(group_cols, as_index=False)
+        .agg(
+            months_on_chart=("month", "nunique"),
+            peak_monthly_rank=("rank", "min"),
+            inverse_points=("inverse_points", "sum"),
+        )
+    )
+    agg["inverse_points"] = pd.to_numeric(agg["inverse_points"], errors="coerce").fillna(0.0)
+    return agg
+
+
+def _render_year_end_weekly_table(agg: pd.DataFrame, year: int) -> None:
+    out = (
+        agg.sort_values(
+            ["points_total", "total_gross_millions", "canonical_title"],
+            ascending=[False, False, True],
+        )
+        .reset_index(drop=True)
+    )
+    out.insert(0, "position", np.arange(1, len(out) + 1))
+    out = out.head(35).copy()
+
+    st.dataframe(out, width="stretch", hide_index=True)
+
+    csv = out.to_csv(index=False).encode("utf-8")
+    st.download_button(
+        "Download CSV",
+        data=csv,
+        file_name=f"year_end_weekly_points_top35_{year}.csv",
+        mime="text/csv",
+        key="year_end_weekly_points_download",
+    )
+
+
 def tab_year_end_smps_t35():
     source_view = st.radio(
         "Year-End source",
-        options=["Official Monthly T-25 inverse points", "Weekly points model"],
+        options=[
+            "Official Monthly T-25 inverse points",
+            "Weekly points model",
+            "Composite (Official + Weekly)",
+        ],
         index=0,
         horizontal=True,
         key="year_end_source_view_fast_default_official",
     )
+
     if source_view == "Official Monthly T-25 inverse points":
         tab_official_year_end_t35()
+        return
+
+    if not DB_PATH.exists():
+        st.error(f"Database not found at {DB_PATH}.")
+        return
+
+    db_mtime = DB_PATH.stat().st_mtime
+
+    if source_view == "Composite (Official + Weekly)":
+        st.subheader("Year-End (Composite)")
+        st.caption(
+            "The composite combines the Official Monthly T-25 inverse-point résumé and the Weekly points model. "
+            "Each model is normalized to the maximum points available for the selected year's chart months/weeks, "
+            "then the two normalized percentages are averaged 50/50. This keeps the weekly model from overwhelming "
+            "the monthly model simply because there are more weekly charts than monthly charts."
+        )
+
+        if not _official_t25_table_exists(str(DB_PATH), db_mtime):
+            st.info("No official Monthly T-25 data is available, so the composite Year-End view cannot be calculated.")
+            return
+
+        years_df = sql_df(
+            """
+            SELECT DISTINCT w.year
+            FROM (
+              SELECT CAST(substr(week_ending, 1, 4) AS INTEGER) AS year
+              FROM t10_entry
+              WHERE week_ending IS NOT NULL AND TRIM(week_ending) <> ''
+            ) w
+            INNER JOIN (
+              SELECT DISTINCT CAST(year AS INTEGER) AS year
+              FROM official_t25_entry
+              WHERE year IS NOT NULL
+            ) o ON o.year = w.year
+            ORDER BY w.year DESC
+            """
+        )
+        years = years_df["year"].dropna().astype(int).tolist() if not years_df.empty else []
+        if not years:
+            st.info("No years found in the database.")
+            return
+
+        year = int(st.selectbox("Year", options=years, index=0, key="year_end_composite_year"))
+        rows_to_show = int(
+            st.slider(
+                "Rows to show",
+                min_value=10,
+                max_value=100,
+                value=35,
+                step=5,
+                key="year_end_composite_rows",
+            )
+        )
+
+        weekly_base = _load_year_end_weekly_base(str(DB_PATH), db_mtime)
+        weekly = _aggregate_year_end_weekly_points(weekly_base, year)
+
+        official_raw = (
+            sql_df(
+                """
+                WITH latest_meta AS (
+                  SELECT show_id, imprint_1, imprint_2
+                  FROM (
+                    SELECT
+                      e.show_id,
+                      COALESCE(NULLIF(TRIM(e.imprint_1), ''), '') AS imprint_1,
+                      COALESCE(NULLIF(TRIM(e.imprint_2), ''), '') AS imprint_2,
+                      ROW_NUMBER() OVER (
+                        PARTITION BY e.show_id
+                        ORDER BY date(e.week_ending) DESC, e.id DESC
+                      ) AS rn
+                    FROM t10_entry e
+                  )
+                  WHERE rn = 1
+                )
+                SELECT
+                  e.month,
+                  e.show_id,
+                  s.canonical_title,
+                  COALESCE(lm.imprint_1, '') AS imprint_1,
+                  COALESCE(lm.imprint_2, '') AS imprint_2,
+                  e.rank
+                FROM official_t25_entry e
+                JOIN show s ON s.show_id = e.show_id
+                LEFT JOIN latest_meta lm ON lm.show_id = e.show_id
+                WHERE e.year = ?
+                ORDER BY e.month ASC, e.rank ASC
+                """,
+                (int(year),),
+            )
+            if _official_t25_table_exists(str(DB_PATH), db_mtime)
+            else pd.DataFrame()
+        )
+        official = _aggregate_year_end_official_inverse(official_raw)
+
+        weekly_max = int(weekly_base.loc[weekly_base["year"].eq(year), "week_ending"].nunique()) * 100.0 if not weekly_base.empty else 0.0
+        official_max = int(official_raw["month"].nunique()) * 25.0 if not official_raw.empty else 0.0
+
+        if weekly.empty and official.empty:
+            st.info(f"No chart rows found for {year}.")
+            return
+
+        if weekly.empty:
+            composite = official.copy()
+            composite["weekly_points"] = 0.0
+            composite["weekly_pct"] = 0.0
+        elif official.empty:
+            composite = weekly.copy()
+            composite["official_inverse_points"] = 0.0
+            composite["official_pct"] = 0.0
+        else:
+            composite = weekly.merge(
+                official,
+                on="show_id",
+                how="outer",
+                suffixes=("_weekly", "_official"),
+            )
+            # The shared descriptive fields are identical in normal cases; preserve either side on outer joins.
+            for col in ["canonical_title", "imprint_1", "imprint_2"]:
+                wcol = f"{col}_weekly"
+                ocol = f"{col}_official"
+                if wcol in composite.columns or ocol in composite.columns:
+                    composite[col] = (
+                        composite[wcol] if wcol in composite.columns else pd.Series(pd.NA, index=composite.index)
+                    )
+                    if ocol in composite.columns:
+                        composite[col] = composite[col].fillna(composite[ocol])
+                    composite.drop(columns=[c for c in [wcol, ocol] if c in composite.columns], inplace=True)
+
+        for col in [
+            "points_total", "total_gross_millions", "weeks_charted",
+            "inverse_points", "months_on_chart", "best_rank", "peak_monthly_rank",
+        ]:
+            if col not in composite.columns:
+                composite[col] = 0.0
+            composite[col] = pd.to_numeric(composite[col], errors="coerce").fillna(0.0)
+
+        if weekly.empty:
+            composite["weekly_pct"] = 0.0
+        else:
+            composite["weekly_pct"] = (composite["points_total"] / weekly_max * 100.0) if weekly_max > 0 else 0.0
+
+        if official.empty:
+            composite["official_pct"] = 0.0
+        else:
+            composite["official_pct"] = (composite["inverse_points"] / official_max * 100.0) if official_max > 0 else 0.0
+
+        composite["composite_score"] = (composite["official_pct"] + composite["weekly_pct"]) / 2.0
+        composite["composite_score"] = pd.to_numeric(composite["composite_score"], errors="coerce").fillna(0.0)
+        composite["official_pct"] = composite["official_pct"].clip(lower=0.0, upper=100.0)
+        composite["weekly_pct"] = composite["weekly_pct"].clip(lower=0.0, upper=100.0)
+
+        out = (
+            composite.sort_values(
+                ["composite_score", "official_pct", "weekly_pct", "canonical_title"],
+                ascending=[False, False, False, True],
+            )
+            .reset_index(drop=True)
+        )
+        out.insert(0, "position", np.arange(1, len(out) + 1))
+        out = out.head(rows_to_show).copy()
+
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Shows ranked", len(composite))
+        c2.metric("Chart months", int(official_raw["month"].nunique()) if not official_raw.empty else 0)
+        c3.metric("Chart weeks", int(weekly_base.loc[weekly_base["year"].eq(year), "week_ending"].nunique()) if not weekly_base.empty else 0)
+        c4.metric("Top composite", f"{float(out.iloc[0]['composite_score']):.2f}" if not out.empty else "0.00")
+
+        display_cols = [
+            "position", "canonical_title", "imprint_1", "imprint_2",
+            "composite_score", "inverse_points", "official_pct",
+            "points_total", "weekly_pct", "months_on_chart", "weeks_charted",
+        ]
+        rename_map = {
+            "position": "Rank",
+            "canonical_title": "Show",
+            "imprint_1": "Imprint 1",
+            "imprint_2": "Imprint 2",
+            "composite_score": "Composite",
+            "inverse_points": "Official Inv. Pts",
+            "official_pct": "Official %",
+            "points_total": "Weekly Points",
+            "weekly_pct": "Weekly %",
+            "months_on_chart": "Months",
+            "weeks_charted": "Weeks",
+        }
+        st.dataframe(
+            out[display_cols].rename(columns=rename_map),
+            width="stretch",
+            hide_index=True,
+        )
+
+        csv = out.to_csv(index=False).encode("utf-8")
+        st.download_button(
+            "Download composite Year-End CSV",
+            data=csv,
+            file_name=f"year_end_composite_top{rows_to_show}_{year}.csv",
+            mime="text/csv",
+            key="year_end_composite_download",
+        )
         return
 
     st.subheader("Year-End (Weekly Points)")
@@ -2442,10 +2822,6 @@ def tab_year_end_smps_t35():
         "Grossing era: the #1 show of each week gets 100 points; all other shows get (their weekly gross ÷ #1 gross) × 100. "
         "Pre-grossing era: inverse points by rank (100, 90, 80, ...). Returns the Top 35."
     )
-
-    if not DB_PATH.exists():
-        st.error(f"Database not found at {DB_PATH}.")
-        return
 
     years_df = sql_df(
         """
@@ -2461,136 +2837,17 @@ def tab_year_end_smps_t35():
         return
 
     year = int(st.selectbox("Year", options=years, index=0, key="year_end_weekly_points_year"))
-
     db_mtime = DB_PATH.stat().st_mtime
-
-    @st.cache_data(show_spinner=False)
-    def _load_year_end_weekly_base(db_path: str, db_mtime: float) -> pd.DataFrame:
-        """Weekly base rows for year-end charts (includes bonuses where present).
-
-        - Uses t10_entry ranks for all weeks.
-        - Grossing era (>= GROSS_TRACKING_START): uses (base + bonus) as weekly gross.
-        - Pre-grossing era: gross is not required; points come from inverse rank.
-        """
-        con = sqlite3.connect(db_path)
-        try:
-            df = pd.read_sql_query(
-                """
-                WITH bonus AS (
-                  SELECT show_id, week_ending, SUM(COALESCE(bonus_millions, 0.0)) AS bonus_millions
-                  FROM gross_bonus
-                  GROUP BY show_id, week_ending
-                )
-                SELECT
-                  date(e.week_ending) AS week_ending,
-                  e.show_id AS show_id,
-                  s.canonical_title AS canonical_title,
-                  COALESCE(NULLIF(TRIM(e.imprint_1), ''), '') AS imprint_1,
-                  COALESCE(NULLIF(TRIM(e.imprint_2), ''), '') AS imprint_2,
-                  e.rank AS rank,
-                  COALESCE(e.gross_millions, 0.0) AS base_gross_millions,
-                  COALESCE(b.bonus_millions, 0.0) AS bonus_millions,
-                  (COALESCE(e.gross_millions, 0.0) + COALESCE(b.bonus_millions, 0.0)) AS gross_millions
-                FROM t10_entry e
-                JOIN show s ON s.show_id = e.show_id
-                LEFT JOIN bonus b ON b.show_id = e.show_id AND b.week_ending = e.week_ending
-                WHERE e.rank BETWEEN 1 AND 10
-                ORDER BY date(e.week_ending) ASC, e.rank ASC
-                """,
-                con,
-            )
-        finally:
-            con.close()
-
-        if df.empty:
-            return df
-
-        df["week_ending"] = _as_date_str(df["week_ending"])
-        df["week_ending_dt"] = pd.to_datetime(df["week_ending"], errors="coerce")
-        df = df.dropna(subset=["week_ending_dt"]).copy()
-
-        df["rank"] = pd.to_numeric(df["rank"], errors="coerce")
-        df["gross_millions"] = pd.to_numeric(df["gross_millions"], errors="coerce").fillna(0.0)
-
-        df["year"] = df["week_ending_dt"].dt.year.astype(int)
-
-        # Determine grossing era vs pre-grossing era
-        pre_mask = df["week_ending_dt"].dt.date < GROSS_TRACKING_START
-
-        # Top-1 weekly gross (grossing era only)
-        top1 = (
-            df.loc[~pre_mask & df["rank"].eq(1)]
-            .groupby("week_ending", as_index=False)["gross_millions"]
-            .max()
-            .rename(columns={"gross_millions": "top1_gross_millions"})
-        )
-        df = df.merge(top1, on="week_ending", how="left")
-        df["top1_gross_millions"] = pd.to_numeric(df["top1_gross_millions"], errors="coerce").fillna(0.0)
-
-        # Weekly points
-        df["week_points"] = 0.0
-
-        # Pre-grossing era: inverse rank points (100, 90, 80, ...)
-        df.loc[pre_mask, "week_points"] = (110.0 - 10.0 * df.loc[pre_mask, "rank"]).clip(lower=0.0, upper=100.0)
-
-        # Grossing era: #1 = 100, others = gross/top1 * 100
-        post_mask = ~pre_mask
-        df.loc[post_mask & df["rank"].eq(1), "week_points"] = 100.0
-
-        other = post_mask & (~df["rank"].eq(1))
-        denom = df.loc[other, "top1_gross_millions"]
-        numer = df.loc[other, "gross_millions"]
-        df.loc[other, "week_points"] = np.where(denom > 0, (numer / denom) * 100.0, 0.0)
-
-        df["week_points"] = pd.to_numeric(df["week_points"], errors="coerce").fillna(0.0).clip(lower=0.0, upper=100.0)
-
-        return df
-
     base = _load_year_end_weekly_base(str(DB_PATH), db_mtime)
     if base.empty:
         st.info("No chart rows found for year-end computation.")
         return
 
-    base_y = base[base["year"].eq(int(year))].copy()
-    if base_y.empty:
+    agg = _aggregate_year_end_weekly_points(base, year)
+    if agg.empty:
         st.info(f"No chart weeks found for {year}.")
         return
-
-    group_cols = ["show_id", "canonical_title", "imprint_1", "imprint_2"]
-    agg = (
-        base_y.groupby(group_cols, as_index=False)
-        .agg(
-            weeks_charted=("week_ending", "nunique"),
-            best_rank=("rank", "min"),
-            total_gross_millions=("gross_millions", "sum"),
-            points_total=("week_points", "sum"),
-        )
-    )
-
-    agg["points_total"] = pd.to_numeric(agg["points_total"], errors="coerce").fillna(0.0)
-    agg["total_gross_millions"] = pd.to_numeric(agg["total_gross_millions"], errors="coerce").fillna(0.0)
-
-    out = (
-        agg.sort_values(
-            ["points_total", "total_gross_millions", "canonical_title"],
-            ascending=[False, False, True],
-        )
-        .reset_index(drop=True)
-    )
-
-    out.insert(0, "position", np.arange(1, len(out) + 1))
-    out = out.head(35).copy()
-
-    st.dataframe(out, width='stretch', hide_index=True)
-
-    csv = out.to_csv(index=False).encode("utf-8")
-    st.download_button(
-        "Download CSV",
-        data=csv,
-        file_name=f"year_end_weekly_points_top35_{year}.csv",
-        mime="text/csv",
-        key="year_end_weekly_points_download",
-    )
+    _render_year_end_weekly_table(agg, year)
 
 # ----------------------------
 # New tab: Grossing Milestones
