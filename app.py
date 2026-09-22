@@ -2526,9 +2526,11 @@ def _aggregate_year_end_weekly_points(base: pd.DataFrame, year: int) -> pd.DataF
             ]
         )
 
-    group_cols = ["show_id", "canonical_title", "imprint_1", "imprint_2"]
+    # Aggregate strictly by show_id so a show remains one Year-End entry even when
+    # its imprint metadata changes during the year. Keep the latest imprint metadata
+    # from that year's weekly chart appearances only for display.
     agg = (
-        base_y.groupby(group_cols, as_index=False)
+        base_y.groupby(["show_id", "canonical_title"], as_index=False)
         .agg(
             weeks_charted=("week_ending", "nunique"),
             best_rank=("rank", "min"),
@@ -2536,6 +2538,23 @@ def _aggregate_year_end_weekly_points(base: pd.DataFrame, year: int) -> pd.DataF
             points_total=("week_points", "sum"),
         )
     )
+
+    latest_meta = (
+        base_y.sort_values(["show_id", "week_ending_dt"], ascending=[True, False])
+        .drop_duplicates(subset=["show_id"])
+        [["show_id", "imprint_1", "imprint_2"]]
+        .copy()
+    )
+    agg = agg.merge(latest_meta, on="show_id", how="left")
+
+    # Keep a stable column order matching the existing Year-End views.
+    agg = agg[
+        [
+            "show_id", "canonical_title", "imprint_1", "imprint_2",
+            "weeks_charted", "best_rank", "total_gross_millions", "points_total",
+        ]
+    ]
+
     agg["points_total"] = pd.to_numeric(agg["points_total"], errors="coerce").fillna(0.0)
     agg["total_gross_millions"] = pd.to_numeric(agg["total_gross_millions"], errors="coerce").fillna(0.0)
     return agg
